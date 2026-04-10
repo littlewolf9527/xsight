@@ -1,0 +1,82 @@
+# Build outputs
+*.elf
+*.o
+xsight-agent
+xsight-controller
+
+# Go
+vendor/
+
+# Node.js
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (may contain secrets)
+config.yaml
+*.local.yaml
+
+# Keys / Certificates
+*.key
+*.pem
+*.crt
+*.cert
+*.p12
+*.pfx
+.env
+.env.*
+credentials*
+secrets*
+*_secret*
+*.token
+
+# Database
+*.db
+*.db-journal
+data/
+
+# Docs (internal, may contain credentials)
+docs/
+
+# Tools (internal test scripts, not for distribution)
+tools/
+
+# Internal audit files
+audit-*.md
+
+# Claude Code metadata
+.claude/
+
+# BPF generated (built on Linux server)
+node/internal/bpf/xsight_*.go
+node/internal/bpf/xsight_*.o
+node/bin/
+controller/bin/
+controller/cmd/
+node/cmd/
+
+# Logs
+*.log
+logs/
+
+# Vite template defaults (not used)
+controller/web/public/favicon.svg
+controller/web/public/icons.svg
+controller/web/src/assets/hero.png
+controller/web/src/assets/vite.svg
+controller/web/src/assets/vue.svg
+controller/web/src/components/HelloWorld.vue
+controller/web/src/style.css
+
+# Misc
+remove_bg.py
+*.bak
+check-oss-ready.sh

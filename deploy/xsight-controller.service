@@ -1,0 +1,44 @@
+# xSight Controller — systemd unit file
+#
+# Installation:
+#   sudo cp xsight-controller.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now xsight-controller
+#
+# Customize:
+#   - ExecStart: adjust -config path if config lives elsewhere
+#   - User: create a dedicated 'xsight' user, or change to your preferred user
+#   - After: remove postgresql.service if using a remote database
+
+[Unit]
+Description=xSight Controller — DDoS Detection System (Controller)
+Documentation=https://github.com/littlewolf9527/xsight
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xsight
+Group=xsight
+WorkingDirectory=/opt/xsight/controller
+ExecStart=/opt/xsight/controller/bin/xsight-controller -config /opt/xsight/controller/config.yaml
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+# File descriptor limit (connections + DB pool + gRPC streams)
+LimitNOFILE=65535
+
+# Logging — stdout/stderr go to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xsight-controller
+
+# Security hardening (controller does not need elevated privileges)
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/xsight/controller
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,48 @@
+# xSight Node configuration
+# Two modes: xdp (default, BPF/XDP mirror) and flow (sFlow/NetFlow/IPFIX receiver)
+
+# ============================================================
+# XDP Mode (default) — BPF/XDP packet capture from mirror port
+# ============================================================
+
+# mode: xdp                       # 'xdp' (default) | 'flow' — v3.0
+node_id: "my-node-01"
+
+interfaces:
+  - name: "eth1"
+    mode: "mirror"              # mirror | erspan
+    upstream_sample_rate: 1     # 1 = no sampling, 300 = upstream samples 1/300
+    sample_bytes: 128           # mirror mode: 128 is enough (range 128-512)
+  - name: "eth2"
+    mode: "erspan"              # XDP auto-detects Type I/II/III
+    upstream_sample_rate: 1
+    sample_bytes: 256           # ERSPAN outer headers need more bytes
+
+bpf:
+  max_entries: 1000000          # ip_stats map size (note: prealloc memory)
+
+controller:
+  address: "controller:50051"   # gRPC server address
+
+auth:
+  node_api_key: "CHANGE_ME"    # API key for gRPC auth. Generate with: openssl rand -hex 32
+
+# Performance tuning (optional, xdp mode only)
+# parse_workers: 4              # parallel packet parse workers (default = NumCPU/2, range 1-16)
+# pprof: false                  # enable pprof debug server on 127.0.0.1:6061
+
+
+# ============================================================
+# Flow Mode — sFlow/NetFlow/IPFIX receiver (v3.0)
+# ============================================================
+# Uncomment below and comment out the xdp config above to use flow mode.
+# Flow listeners and sources are configured via Web UI, not this file.
+#
+# mode: flow
+# node_id: "my-flow-node-01"
+#
+# controller:
+#   address: "controller:50051"
+#
+# auth:
+#   node_api_key: "CHANGE_ME"

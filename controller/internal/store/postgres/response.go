@@ -1,0 +1,182 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/littlewolf9527/xsight/controller/internal/store"
+)
+
+type responseRepo struct{ pool *pgxpool.Pool }
+
+// --- Response CRUD ---
+
+func (r *responseRepo) List(ctx context.Context) ([]store.Response, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT r.id, r.name, r.description, r.enabled, r.created_at,
+				COALESCE(ac.cnt, 0), COALESCE(tc.cnt, 0)
+		 FROM responses r
+		 LEFT JOIN (SELECT response_id, count(*) AS cnt FROM response_actions GROUP BY response_id) ac ON ac.response_id = r.id
+		 LEFT JOIN (SELECT response_id, count(*) AS cnt FROM threshold_templates WHERE response_id IS NOT NULL GROUP BY response_id) tc ON tc.response_id = r.id
+		 ORDER BY r.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []store.Response
+	for rows.Next() {
+		var resp store.Response
+		if err := rows.Scan(&resp.ID, &resp.Name, &resp.Description, &resp.Enabled, &resp.CreatedAt, &resp.ActionCount, &resp.BoundTemplateCount); err != nil {
+			return nil, err
+		}
+		list = append(list, resp)
+	}
+	return list, rows.Err()
+}
+
+func (r *responseRepo) Get(ctx context.Context, id int) (*store.Response, error) {
+	var resp store.Response
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, name, description, enabled, created_at FROM responses WHERE id=$1`, id).
+		Scan(&resp.ID, &resp.Name, &resp.Description, &resp.Enabled, &resp.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("response %d: %w", id, err)
+	}
+	return &resp, nil
+}
+
+func (r *responseRepo) Create(ctx context.Context, resp *store.Response) (int, error) {
+	var id int
+	err := r.pool.QueryRow(ctx,
+		`INSERT INTO responses (name, description, enabled) VALUES ($1, $2, $3) RETURNING id`,
+		resp.Name, resp.Description, resp.Enabled).Scan(&id)
+	return id, err
+}
+
+func (r *responseRepo) Update(ctx context.Context, resp *store.Response) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE responses SET name=$1, description=$2, enabled=$3 WHERE id=$4`,
+		resp.Name, resp.Description, resp.Enabled, resp.ID)
+	return err
+}
+
+func (r *responseRepo) Delete(ctx context.Context, id int) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM responses WHERE id=$1`, id)
+	return err
+}
+
+// --- ResponseAction CRUD ---
+
+func (r *responseRepo) ListActions(ctx context.Context, responseID int) ([]store.ResponseAction, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, response_id, action_type, execution_policy, priority,
+				config, preconditions, enabled,
+				trigger_phase, run_mode, period_seconds, execution,
+				webhook_connector_id, shell_connector_id,
+				xdrop_action, xdrop_custom_payload, shell_extra_args,
+				unblock_delay_minutes, bgp_connector_id, bgp_route_map
+		 FROM response_actions WHERE response_id=$1 ORDER BY trigger_phase, priority`, responseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []store.ResponseAction
+	for rows.Next() {
+		var a store.ResponseAction
+		if err := rows.Scan(&a.ID, &a.ResponseID, &a.ActionType, &a.ExecutionPolicy,
+			&a.Priority, &a.Config, &a.Preconditions, &a.Enabled,
+			&a.TriggerPhase, &a.RunMode, &a.PeriodSeconds, &a.Execution,
+			&a.WebhookConnectorID, &a.ShellConnectorID,
+			&a.XDropAction, &a.XDropCustomPayload, &a.ShellExtraArgs,
+			&a.UnblockDelayMinutes, &a.BGPConnectorID, &a.BGPRouteMap); err != nil {
+			return nil, err
+		}
+		list = append(list, a)
+	}
+	return list, rows.Err()
+}
+
+func (r *responseRepo) GetAction(ctx context.Context, id int) (*store.ResponseAction, error) {
+	var a store.ResponseAction
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, response_id, action_type, execution_policy, priority,
+				config, preconditions, enabled,
+				trigger_phase, run_mode, period_seconds, execution,
+				webhook_connector_id, shell_connector_id,
+				xdrop_action, xdrop_custom_payload, shell_extra_args,
+				unblock_delay_minutes, bgp_connector_id, bgp_route_map
+		 FROM response_actions WHERE id=$1`, id).
+		Scan(&a.ID, &a.ResponseID, &a.ActionType, &a.ExecutionPolicy,
+			&a.Priority, &a.Config, &a.Preconditions, &a.Enabled,
+			&a.TriggerPhase, &a.RunMode, &a.PeriodSeconds, &a.Execution,
+			&a.WebhookConnectorID, &a.ShellConnectorID,
+			&a.XDropAction, &a.XDropCustomPayload, &a.ShellExtraArgs,
+			&a.UnblockDelayMinutes, &a.BGPConnectorID, &a.BGPRouteMap)
+	if err != nil {
+		return nil, fmt.Errorf("response_action %d: %w", id, err)
+	}
+	return &a, nil
+}
+
+func (r *responseRepo) CreateAction(ctx context.Context, a *store.ResponseAction) (int, error) {
+	var id int
+	err := r.pool.QueryRow(ctx,
+		`INSERT INTO response_actions (response_id, action_type, execution_policy,
+			priority, config, preconditions, enabled,
+			trigger_phase, run_mode, period_seconds, execution,
+			webhook_connector_id, shell_connector_id,
+			xdrop_action, xdrop_custom_payload, shell_extra_args,
+			unblock_delay_minutes, bgp_connector_id, bgp_route_map)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
+		a.ResponseID, a.ActionType, a.ExecutionPolicy,
+		a.Priority, a.Config, a.Preconditions, a.Enabled,
+		a.TriggerPhase, a.RunMode, a.PeriodSeconds, a.Execution,
+		a.WebhookConnectorID, a.ShellConnectorID,
+		a.XDropAction, a.XDropCustomPayload, a.ShellExtraArgs,
+		a.UnblockDelayMinutes, a.BGPConnectorID, a.BGPRouteMap).Scan(&id)
+	return id, err
+}
+
+func (r *responseRepo) UpdateAction(ctx context.Context, a *store.ResponseAction) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE response_actions SET action_type=$1, execution_policy=$2,
+			priority=$3, config=$4, preconditions=$5, enabled=$6,
+			trigger_phase=$7, run_mode=$8, period_seconds=$9, execution=$10,
+			webhook_connector_id=$11, shell_connector_id=$12,
+			xdrop_action=$13, xdrop_custom_payload=$14, shell_extra_args=$15,
+			unblock_delay_minutes=$16, bgp_connector_id=$17, bgp_route_map=$18
+		 WHERE id=$19`,
+		a.ActionType, a.ExecutionPolicy, a.Priority,
+		a.Config, a.Preconditions, a.Enabled,
+		a.TriggerPhase, a.RunMode, a.PeriodSeconds, a.Execution,
+		a.WebhookConnectorID, a.ShellConnectorID,
+		a.XDropAction, a.XDropCustomPayload, a.ShellExtraArgs,
+		a.UnblockDelayMinutes, a.BGPConnectorID, a.BGPRouteMap, a.ID)
+	return err
+}
+
+func (r *responseRepo) DeleteAction(ctx context.Context, id int) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM response_actions WHERE id=$1`, id)
+	return err
+}
+
+func (r *responseRepo) CountActionsByWebhookConnector(ctx context.Context, connectorID int) (int, error) {
+	var count int
+	err := r.pool.QueryRow(ctx, `SELECT count(*) FROM response_actions WHERE webhook_connector_id=$1`, connectorID).Scan(&count)
+	return count, err
+}
+
+func (r *responseRepo) CountActionsByShellConnector(ctx context.Context, connectorID int) (int, error) {
+	var count int
+	err := r.pool.QueryRow(ctx, `SELECT count(*) FROM response_actions WHERE shell_connector_id=$1`, connectorID).Scan(&count)
+	return count, err
+}
+
+func (r *responseRepo) CountActionsByBGPConnector(ctx context.Context, connectorID int) (int, error) {
+	var count int
+	err := r.pool.QueryRow(ctx, `SELECT count(*) FROM response_actions WHERE bgp_connector_id=$1`, connectorID).Scan(&count)
+	return count, err
+}

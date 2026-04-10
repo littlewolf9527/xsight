@@ -1,0 +1,48 @@
+# xSight Controller configuration
+
+listen:
+  grpc: ":50051"           # Node gRPC ingestion
+  http: ":8080"            # Web UI + REST API
+
+database:
+  driver: "postgres"       # postgres | sqlite
+  # PostgreSQL (recommended for production)
+  dsn: "postgres://xsight:YOUR_DB_PASSWORD@localhost:5432/xsight?sslmode=disable"
+  # SQLite (lightweight alternative)
+  # driver: "sqlite"
+  # dsn: "./xsight.db"
+
+log:
+  level: "info"            # debug | info | warn | error
+
+auth:
+  api_key: "CHANGE_ME"    # REST API key (Header: X-API-Key). Generate with: openssl rand -hex 32
+
+detection:
+  hard_threshold_confirm_seconds: 3     # consecutive seconds before declaring attack
+  dynamic_threshold_confirm_seconds: 5
+  expiry_interval_seconds: 300          # seconds of no breach before attack expires
+  expiry_function: "static"             # "static" | "dynamic" — dynamic scales expiry by attack duration
+  expiry_scale_base_seconds: 300        # attack duration for 1x scale (dynamic only)
+  expiry_max_scale: 4.0                 # max multiplier (dynamic only)
+  max_active_attacks: 10000             # 0 = no limit
+  dry_run: false                        # true = detect but don't create attack records
+
+# Ring buffer — in-memory realtime detection store
+# Ring only serves realtime threshold detection (seconds). Long history uses ts_stats.
+ring:
+  max_points_per_ip: 120     # per-IP history depth (10-600, default 120 = 2min)
+  max_ips_per_prefix: 10000  # max tracked IPs per prefix (100-50000)
+  max_global_keys: 100000    # total tracked IPs globally (1000-500000)
+
+# Data retention — automatic cleanup of old data (0 = keep forever)
+# ts_stats compression/retention requires TimescaleDB; plain PostgreSQL uses cleaner.go
+retention:
+  ts_stats_days: 7           # raw ts_stats: drop chunks older than N days (high volume, 5s granularity)
+  ts_stats_compress_days: 1  # raw ts_stats: compress chunks older than N days (saves ~90% disk, TimescaleDB only)
+  ts_stats_cagg_days: 90     # aggregated ts_stats_5min: drop older than N days (5min granularity, low volume)
+  flow_logs_days: 7          # flow_logs: drop chunks older than N days (compressed, 7d default)
+  flow_logs_compress_days: 1 # flow_logs: compress chunks older than N days (saves ~90% disk)
+  attacks_days: 90           # ended attack records (active attacks are never deleted)
+  audit_log_days: 180        # configuration change audit trail
+  interval_hours: 24         # cleanup runs once per day

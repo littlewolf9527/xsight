@@ -1,0 +1,42 @@
+# xSight Node — systemd unit file
+#
+# Installation:
+#   sudo cp xsight-node.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now xsight-node
+#
+# Customize:
+#   - ExecStart: adjust -config path if config lives elsewhere
+#   - User: must be root for XDP attach (CAP_NET_ADMIN + CAP_BPF)
+#   - LimitMEMLOCK: required for BPF map allocation; infinity is typical
+
+[Unit]
+Description=xSight Node — DDoS Detection System (XDP/eBPF Node Agent)
+Documentation=https://github.com/littlewolf9527/xsight
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/xsight/node
+ExecStart=/opt/xsight/node/bin/xsight-node -config /opt/xsight/node/config.yaml
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+# File descriptor limit
+LimitNOFILE=65535
+
+# BPF maps require locked memory — must be unlimited
+LimitMEMLOCK=infinity
+
+# Logging — stdout/stderr go to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xsight-node
+
+[Install]
+WantedBy=multi-user.target
