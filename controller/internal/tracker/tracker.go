@@ -96,7 +96,7 @@ type AttackEvent struct {
 
 // Tracker manages the lifecycle of all tracked attacks.
 type Tracker struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	attacks  map[attackKey]*trackedAttack
 	cfg      Config
 	store    store.Store
@@ -489,6 +489,32 @@ func (t *Tracker) NotifyExpired(attack *store.Attack) {
 	if t.onAction != nil {
 		t.onAction(AttackEvent{Type: "expired", Attack: attack, DBID: attack.ID})
 	}
+}
+
+// ActiveTimers returns expiry timer info for all tracked attacks, keyed by DB ID.
+// Used by the API to show countdown timers on active attacks.
+type AttackTimer struct {
+	State     string  `json:"state"`      // "active" | "expiring"
+	ExpiresIn float64 `json:"expires_in"` // seconds until expiry (0 if active/not expiring)
+}
+
+func (t *Tracker) ActiveTimers() map[int]AttackTimer {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	now := time.Now()
+	result := make(map[int]AttackTimer, len(t.attacks))
+	for _, a := range t.attacks {
+		if a.DBID <= 0 {
+			continue
+		}
+		timer := AttackTimer{State: a.State}
+		if a.State == StateExpiring && a.ExpiresAt.After(now) {
+			timer.ExpiresIn = a.ExpiresAt.Sub(now).Seconds()
+		}
+		result[a.DBID] = timer
+	}
+	return result
 }
 
 // UpgradeType updates the attack type based on classifier results.

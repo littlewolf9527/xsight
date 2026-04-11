@@ -48,9 +48,13 @@
             <span :class="['xs-sev', `xs-sev-${row.severity}`]">{{ row.severity }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="peak_pps" :label="$t('attacks.peakPps')" width="110">
+        <el-table-column :label="$t('attacks.peak')" width="130">
           <template #default="{ row }">
-            <span style="font-weight: 600; font-family: 'SF Mono', monospace; font-size: 12px;">{{ formatPPS(row.peak_pps) }}</span>
+            <span style="font-weight: 600; font-family: 'SF Mono', monospace; font-size: 12px;">
+              <template v-if="row.peak_pps > 0">{{ formatPPS(row.peak_pps) }} <span style="font-weight: 400; color: var(--xs-text-secondary);">PPS</span></template>
+              <template v-else-if="row.peak_bps > 0">{{ formatBPS(row.peak_bps) }} <span style="font-weight: 400; color: var(--xs-text-secondary);">BPS</span></template>
+              <template v-else>—</template>
+            </span>
           </template>
         </el-table-column>
         <el-table-column :label="$t('attacks.triggerRule')" min-width="150">
@@ -67,6 +71,17 @@
         </el-table-column>
         <el-table-column prop="ended_at" :label="$t('attacks.endedAt')" width="170">
           <template #default="{ row }">{{ row.ended_at ? formatTime(row.ended_at) : '—' }}</template>
+        </el-table-column>
+        <el-table-column v-if="tab === 'active'" :label="$t('attacks.timer')" width="120">
+          <template #default="{ row }">
+            <template v-if="timers[row.id]">
+              <span v-if="timers[row.id].state === 'expiring'" style="font-family: 'SF Mono', monospace; font-size: 12px; color: var(--xs-warning);">
+                {{ formatTimer(timers[row.id].expires_in) }}
+              </span>
+              <el-tag v-else type="danger" size="small">{{ $t('attacks.breaching') }}</el-tag>
+            </template>
+            <span v-else style="color: var(--xs-text-secondary);">—</span>
+          </template>
         </el-table-column>
         <el-table-column :label="$t('common.actions')" width="130">
           <template #default="{ row }">
@@ -93,6 +108,7 @@ const attacks = ref([])
 const activeCount = ref(0)
 const totalCount = ref(0)
 const offset = ref(0)
+const timers = ref({})
 
 function formatTime(t) { return t ? new Date(t).toLocaleString() : '-' }
 
@@ -105,6 +121,7 @@ async function load() {
       const res = await getActiveAttacks()
       attacks.value = res.attacks || []
       activeCount.value = res.active_count || 0
+      timers.value = res.timers || {}
     } else {
       const res = await getAttacks({ limit: 50, offset: offset.value })
       attacks.value = res.attacks || []
@@ -127,6 +144,19 @@ async function handleExpire(row) {
 function formatPPS(v) {
   if (v >= 1000000) return (v / 1000000).toFixed(1) + 'M'
   if (v >= 1000) return (v / 1000).toFixed(0) + 'K'
+  return v
+}
+function formatTimer(seconds) {
+  if (!seconds || seconds <= 0) return '0s'
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return m > 0 ? `${m}m ${s}s` : `${s}s`
+}
+function formatBPS(v) {
+  if (v >= 1e12) return (v / 1e12).toFixed(1) + 'T'
+  if (v >= 1e9) return (v / 1e9).toFixed(1) + 'G'
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M'
+  if (v >= 1e3) return (v / 1e3).toFixed(0) + 'K'
   return v
 }
 

@@ -23,14 +23,17 @@
         <el-tag :type="severityType(attack.severity)">{{ attack.severity }}</el-tag>
       </el-descriptions-item>
       <el-descriptions-item :label="$t('attacks.confidence')">{{ (attack.confidence * 100).toFixed(0) }}%</el-descriptions-item>
-      <el-descriptions-item :label="$t('attacks.peakPps')">{{ attack.peak_pps?.toLocaleString() }}</el-descriptions-item>
-      <el-descriptions-item :label="$t('attacks.peakBps')">{{ attack.peak_bps?.toLocaleString() }}</el-descriptions-item>
+      <el-descriptions-item :label="$t('attacks.peakPps')">{{ attack.peak_pps > 0 ? attack.peak_pps.toLocaleString() : '—' }}</el-descriptions-item>
+      <el-descriptions-item :label="$t('attacks.peakBps')">{{ attack.peak_bps > 0 ? attack.peak_bps.toLocaleString() : '—' }}</el-descriptions-item>
       <el-descriptions-item :label="$t('attacks.startedAt')">{{ formatTime(attack.started_at) }}</el-descriptions-item>
       <el-descriptions-item :label="$t('attacks.endedAt')">
         <template v-if="attack.ended_at">{{ formatTime(attack.ended_at) }}</template>
         <template v-else>
-          Active
-          <el-button size="small" type="danger" plain style="margin-left: 12px;" @click="handleExpire">{{ $t('attacks.expire') || 'Expire' }}</el-button>
+          <el-tag v-if="timer && timer.state === 'expiring'" type="warning" size="small" style="margin-right: 8px;">
+            {{ $t('attacks.expiringIn') }} {{ formatTimer(timer.expires_in) }}
+          </el-tag>
+          <el-tag v-else type="danger" size="small" style="margin-right: 8px;">{{ $t('attacks.breaching') }}</el-tag>
+          <el-button size="small" type="danger" plain @click="handleExpire">{{ $t('attacks.expire') }}</el-button>
         </template>
       </el-descriptions-item>
       <el-descriptions-item :label="$t('attacks.nodeSources')">{{ (attack.node_sources || []).join(', ') }}</el-descriptions-item>
@@ -199,13 +202,14 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api, { getAttack, getAttackActionLog, getAttackSensorLogs } from '../api'
 
 const route = useRoute()
 const attack = ref(null)
+const timer = ref(null)
 const actionsLog = ref([])
 const actionLog = ref([])
 const activeTab = ref('actionsLog')
@@ -229,6 +233,12 @@ function severityType(s) {
   return { critical: 'danger', high: 'warning', medium: '', low: 'info' }[s] || 'info'
 }
 function formatTime(t) { return t ? new Date(t).toLocaleString() : '-' }
+function formatTimer(seconds) {
+  if (!seconds || seconds <= 0) return '0s'
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return m > 0 ? `${m}m ${s}s` : `${s}s`
+}
 
 async function handleExpire() {
   try {
@@ -304,11 +314,30 @@ const topSrcPorts = computed(() => aggregateTop(sensorLogs.value, 'src_port'))
 const topDstPorts = computed(() => aggregateTop(sensorLogs.value, 'dst_port'))
 const isGlobalAttack = computed(() => attack.value?.dst_ip === '0.0.0.0/0')
 
+let timerPoll = null
+
+async function refreshTimer() {
+  if (!attack.value || attack.value.ended_at) return
+  try {
+    const res = await getAttack(route.params.id)
+    attack.value = res.attack
+    timer.value = res.timer || null
+    actionsLog.value = res.actions_log || []
+  } catch {}
+}
+
 onMounted(async () => {
   const res = await getAttack(route.params.id)
   attack.value = res.attack
+  timer.value = res.timer || null
   actionsLog.value = res.actions_log || []
   loadActionLog()
   loadSensorLogs()
+  // Poll timer for active attacks (every 3s)
+  timerPoll = setInterval(refreshTimer, 3000)
+})
+
+onUnmounted(() => {
+  if (timerPoll) clearInterval(timerPoll)
 })
 </script>

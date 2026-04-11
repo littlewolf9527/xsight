@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/littlewolf9527/xsight/controller/internal/store"
+	"github.com/littlewolf9527/xsight/controller/internal/tracker"
 )
 
 func listAttacks(deps Dependencies) gin.HandlerFunc {
@@ -75,11 +76,20 @@ func listActiveAttacks(deps Dependencies) gin.HandlerFunc {
 			return
 		}
 		activeCount, _ := deps.Store.Attacks().CountActive(c)
+		// Only return timers for the attacks in this result set
+		allTimers := deps.Tracker.ActiveTimers()
+		resultTimers := make(map[int]tracker.AttackTimer, len(attacks))
+		for _, a := range attacks {
+			if t, ok := allTimers[a.ID]; ok {
+				resultTimers[a.ID] = t
+			}
+		}
 		ok(c, gin.H{
 			"attacks":       attacks,
 			"active_count":  activeCount,
 			"returned":      len(attacks),
 			"tracker_count": deps.Tracker.ActiveCount(),
+			"timers":        resultTimers,
 		})
 	}
 }
@@ -147,7 +157,15 @@ func getAttack(deps Dependencies) gin.HandlerFunc {
 			errResponse(c, http.StatusInternalServerError, "failed to load action logs: "+err.Error())
 			return
 		}
-		ok(c, gin.H{"attack": attack, "actions_log": logs})
+		resp := gin.H{"attack": attack, "actions_log": logs}
+		// Attach timer info for active attacks
+		if attack.EndedAt == nil {
+			timers := deps.Tracker.ActiveTimers()
+			if t, ok := timers[id]; ok {
+				resp["timer"] = t
+			}
+		}
+		ok(c, resp)
 	}
 }
 

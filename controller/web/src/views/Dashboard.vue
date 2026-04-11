@@ -59,9 +59,13 @@
             <span :class="['xs-severity', `xs-severity-${row.severity}`]">{{ row.severity }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="peak_pps" :label="$t('attacks.peakPps')" width="120">
+        <el-table-column :label="$t('attacks.peak')" width="130">
           <template #default="{ row }">
-            <span class="xs-mono">{{ formatPPS(row.peak_pps) }}</span>
+            <span class="xs-mono">
+              <template v-if="row.peak_pps > 0">{{ formatPPS(row.peak_pps) }} <span style="font-weight: 400; color: var(--xs-text-secondary);">PPS</span></template>
+              <template v-else-if="row.peak_bps > 0">{{ formatBPS(row.peak_bps) }} <span style="font-weight: 400; color: var(--xs-text-secondary);">BPS</span></template>
+              <template v-else>—</template>
+            </span>
           </template>
         </el-table-column>
         <el-table-column :label="$t('attacks.triggerRule')" width="160">
@@ -75,6 +79,17 @@
         </el-table-column>
         <el-table-column prop="started_at" :label="$t('attacks.startedAt')" width="180">
           <template #default="{ row }">{{ formatTime(row.started_at) }}</template>
+        </el-table-column>
+        <el-table-column :label="$t('attacks.timer')" width="120">
+          <template #default="{ row }">
+            <template v-if="timers[row.id]">
+              <span v-if="timers[row.id].state === 'expiring'" style="font-family: 'SF Mono', monospace; font-size: 12px; color: var(--xs-warning);">
+                {{ formatTimer(timers[row.id].expires_in) }}
+              </span>
+              <el-tag v-else type="danger" size="small">{{ $t('attacks.breaching') }}</el-tag>
+            </template>
+            <span v-else style="color: var(--xs-text-secondary);">—</span>
+          </template>
         </el-table-column>
         <el-table-column :label="$t('attacks.nodeSources')">
           <template #default="{ row }">
@@ -104,6 +119,7 @@ const TrafficChart = defineAsyncComponent(() => import('../components/TrafficCha
 
 const stats = ref({ activeAttacks: 0, totalNodes: 0, totalPrefixes: 0, totalThresholds: 0, onlineNodes: 0 })
 const topAttacks = ref([])
+const timers = ref({})
 let pollTimer = null
 let loading = false
 
@@ -111,6 +127,19 @@ function formatTime(t) { return t ? new Date(t).toLocaleString() : '-' }
 function formatPPS(v) {
   if (v >= 1000000) return (v / 1000000).toFixed(1) + 'M'
   if (v >= 1000) return (v / 1000).toFixed(0) + 'K'
+  return v
+}
+function formatTimer(seconds) {
+  if (!seconds || seconds <= 0) return '0s'
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return m > 0 ? `${m}m ${s}s` : `${s}s`
+}
+function formatBPS(v) {
+  if (v >= 1e12) return (v / 1e12).toFixed(1) + 'T'
+  if (v >= 1e9) return (v / 1e9).toFixed(1) + 'G'
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M'
+  if (v >= 1e3) return (v / 1e3).toFixed(0) + 'K'
   return v
 }
 
@@ -128,6 +157,7 @@ async function load() {
     }
     const atk = await api.get('/attacks/active?limit=10')
     topAttacks.value = atk.attacks || []
+    timers.value = atk.timers || {}
   } catch (e) { console.error(e) }
   finally { loading = false }
 }
