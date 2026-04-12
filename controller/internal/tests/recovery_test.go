@@ -87,7 +87,7 @@ func TestRecovery_ActiveAttack_NoPanic(t *testing.T) {
 
 	// on_detected success log — the route was injected when the attack started
 	ms.actionExecLog.logs = append(ms.actionExecLog.logs,
-		bgpOnDetectedLog(100, 1, conn.ID, 1, "10.100.0.1/32:RTBH", now.Add(-9*time.Minute)),
+		bgpOnDetectedLog(100, 1, conn.ID, 1, "10.100.0.1/32|RTBH", now.Add(-9*time.Minute)),
 	)
 
 	// Should not panic; vtysh will fail gracefully
@@ -125,7 +125,7 @@ func TestRecovery_ExpiredNoWithdraw_AttemptsCleanup(t *testing.T) {
 	ms.attacks.expiredAttacks = append(ms.attacks.expiredAttacks, atk)
 
 	ms.actionExecLog.logs = append(ms.actionExecLog.logs,
-		bgpOnDetectedLog(101, 2, conn.ID, 1, "10.101.0.1/32:RTBH", now.Add(-29*time.Minute)),
+		bgpOnDetectedLog(101, 2, conn.ID, 1, "10.101.0.1/32|RTBH", now.Add(-29*time.Minute)),
 	)
 	// No on_expired log — route is stale
 
@@ -169,7 +169,7 @@ func TestRecovery_ExpiredStale_AttemptsCleanup(t *testing.T) {
 
 	// on_detected success (injected 2 hours ago)
 	ms.actionExecLog.logs = append(ms.actionExecLog.logs,
-		bgpOnDetectedLog(102, 3, conn.ID, 1, "10.102.0.1/32:RTBH", now.Add(-2*time.Hour)),
+		bgpOnDetectedLog(102, 3, conn.ID, 1, "10.102.0.1/32|RTBH", now.Add(-2*time.Hour)),
 	)
 	// No on_expired log (route is stale; delay has long since elapsed)
 
@@ -207,9 +207,9 @@ func TestRecovery_AlreadyWithdrawn_Skips(t *testing.T) {
 
 	ms.actionExecLog.logs = append(ms.actionExecLog.logs,
 		// Route was injected
-		bgpOnDetectedLog(103, 4, conn.ID, 1, "10.103.0.1/32:RTBH", now.Add(-3*time.Hour)),
+		bgpOnDetectedLog(103, 4, conn.ID, 1, "10.103.0.1/32|RTBH", now.Add(-3*time.Hour)),
 		// Route was already withdrawn
-		bgpOnExpiredLog(103, 4, conn.ID, 2, "10.103.0.1/32:RTBH", now.Add(-2*time.Hour+1*time.Minute)),
+		bgpOnExpiredLog(103, 4, conn.ID, 2, "10.103.0.1/32|RTBH", now.Add(-2*time.Hour+1*time.Minute)),
 	)
 
 	logCountBefore := len(ms.actionExecLog.logs)
@@ -265,7 +265,7 @@ func TestRecovery_DisabledConnector_NoPanic(t *testing.T) {
 	ms.attacks.attacks = append(ms.attacks.attacks, atk)
 
 	ms.actionExecLog.logs = append(ms.actionExecLog.logs,
-		bgpOnDetectedLog(104, 5, conn.ID, 1, "10.104.0.1/32:RTBH", now.Add(-4*time.Minute)),
+		bgpOnDetectedLog(104, 5, conn.ID, 1, "10.104.0.1/32|RTBH", now.Add(-4*time.Minute)),
 	)
 
 	// Disabled connector: no vtysh call; function must not panic.
@@ -293,7 +293,7 @@ func TestRecovery_MultipleRoutes_NoPanic(t *testing.T) {
 	ms.attacks.attacks = append(ms.attacks.attacks, atk)
 
 	ms.actionExecLog.logs = append(ms.actionExecLog.logs,
-		bgpOnDetectedLog(105, 6, conn.ID, 1, "10.105.0.1/32:RTBH", now.Add(-14*time.Minute)),
+		bgpOnDetectedLog(105, 6, conn.ID, 1, "10.105.0.1/32|RTBH", now.Add(-14*time.Minute)),
 		bgpOnDetectedLog(105, 7, conn.ID, 2, "10.105.0.1/32:BLACKHOLE", now.Add(-13*time.Minute)),
 	)
 

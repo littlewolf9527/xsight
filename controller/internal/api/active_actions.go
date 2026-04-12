@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -156,11 +157,10 @@ func buildActiveActions(ctx *gin.Context, s store.Store, actionType string) ([]A
 
 			// Parse type-specific fields
 			if actionType == "bgp" {
-				parts := splitN(log.ExternalRuleID, ":", 2)
-				if len(parts) == 2 {
-					item.Prefix = parts[0]
-					item.RouteMap = parts[1]
-				}
+				// Split on "|" (v1.1.1+); fallback to last ":" for backward compat
+				prefix, routeMap := splitBGPRuleID(log.ExternalRuleID)
+				item.Prefix = prefix
+				item.RouteMap = routeMap
 			} else if actionType == "xdrop" {
 				item.DstIP = atk.DstIP
 				// Parse action/protocol from request_body if available
@@ -194,6 +194,20 @@ func splitN(s, sep string, n int) []string {
 	}
 	result = append(result, s)
 	return result
+}
+
+// splitBGPRuleID splits "{prefix}|{route_map}" or legacy "{prefix}:{route_map}".
+// Uses "|" first (v1.1.1+); falls back to last ":" for backward compat with IPv4 records.
+func splitBGPRuleID(ruleID string) (prefix, routeMap string) {
+	if idx := strings.LastIndex(ruleID, "|"); idx >= 0 {
+		return ruleID[:idx], ruleID[idx+1:]
+	}
+	// Backward compat: old records used ":" separator.
+	// Use LastIndex to handle IPv6 like "2001:db8::1/128:RTBH".
+	if idx := strings.LastIndex(ruleID, ":"); idx >= 0 {
+		return ruleID[:idx], ruleID[idx+1:]
+	}
+	return ruleID, ""
 }
 
 func parseXDropRequestBody(body string, item *ActiveResponseAction) {

@@ -749,7 +749,7 @@ var migrations = []string{
 		name            TEXT NOT NULL UNIQUE,
 		vtysh_path      TEXT NOT NULL DEFAULT '/usr/bin/vtysh',
 		bgp_asn         INT NOT NULL,
-		address_family  TEXT NOT NULL DEFAULT 'ipv4 unicast',
+		address_family  TEXT NOT NULL DEFAULT 'auto',
 		enabled         BOOLEAN DEFAULT true,
 		description     TEXT DEFAULT '',
 		created_at      TIMESTAMPTZ DEFAULT now(),

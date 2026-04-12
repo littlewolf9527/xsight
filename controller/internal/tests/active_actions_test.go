@@ -100,7 +100,7 @@ func TestListActiveBGPRoutes_ReturnsOnlyActive(t *testing.T) {
 		ActionType:     "bgp",
 		TriggerPhase:   "on_detected",
 		Status:         "success",
-		ExternalRuleID: "10.0.0.1/32:RTBH",
+		ExternalRuleID: "10.0.0.1/32|RTBH",
 		ConnectorID:    ip(connID),
 		ConnectorName:  "bgp-main",
 		ExecutedAt:     now.Add(-4 * time.Minute),
@@ -122,8 +122,8 @@ func TestListActiveBGPRoutes_ReturnsOnlyActive(t *testing.T) {
 	if got := item["status"]; got != "active" {
 		t.Errorf("expected status=active, got %v", got)
 	}
-	if got := item["external_rule_id"]; got != "10.0.0.1/32:RTBH" {
-		t.Errorf("expected external_rule_id=10.0.0.1/32:RTBH, got %v", got)
+	if got := item["external_rule_id"]; got != "10.0.0.1/32|RTBH" {
+		t.Errorf("expected external_rule_id=10.0.0.1/32|RTBH, got %v", got)
 	}
 	if got := item["action_type"]; got != "bgp" {
 		t.Errorf("expected action_type=bgp, got %v", got)
@@ -162,7 +162,7 @@ func TestListActiveBGPRoutes_ExcludesWithdrawn(t *testing.T) {
 			ActionType:     "bgp",
 			TriggerPhase:   "on_detected",
 			Status:         "success",
-			ExternalRuleID: "10.1.0.1/32:RTBH",
+			ExternalRuleID: "10.1.0.1/32|RTBH",
 			ConnectorID:    ip(connID),
 			ExecutedAt:     now.Add(-9 * time.Minute),
 		},
@@ -174,7 +174,7 @@ func TestListActiveBGPRoutes_ExcludesWithdrawn(t *testing.T) {
 			ActionType:     "bgp",
 			TriggerPhase:   "on_expired",
 			Status:         "success",
-			ExternalRuleID: "10.1.0.1/32:RTBH",
+			ExternalRuleID: "10.1.0.1/32|RTBH",
 			ConnectorID:    ip(connID),
 			ExecutedAt:     now.Add(-1 * time.Minute),
 		},
@@ -324,7 +324,7 @@ func TestListActive_MultiConnector_NoCrossContamination(t *testing.T) {
 			ActionType:     "bgp",
 			TriggerPhase:   "on_detected",
 			Status:         "success",
-			ExternalRuleID: "10.5.0.1/32:RTBH",
+			ExternalRuleID: "10.5.0.1/32|RTBH",
 			ConnectorID:    ip(conn3),
 			ConnectorName:  "bgp-connector-3",
 			ExecutedAt:     now.Add(-5 * time.Minute),
@@ -368,8 +368,8 @@ func TestListActive_MultiConnector_NoCrossContamination(t *testing.T) {
 	if _, ok := byConn[conn4]; !ok {
 		t.Errorf("expected entry with connector_id=%d", conn4)
 	}
-	if got := byConn[conn3]["external_rule_id"]; got != "10.5.0.1/32:RTBH" {
-		t.Errorf("connector 3: expected external_rule_id=10.5.0.1/32:RTBH, got %v", got)
+	if got := byConn[conn3]["external_rule_id"]; got != "10.5.0.1/32|RTBH" {
+		t.Errorf("connector 3: expected external_rule_id=10.5.0.1/32|RTBH, got %v", got)
 	}
 	if got := byConn[conn4]["external_rule_id"]; got != "10.5.0.1/32:BLACKHOLE" {
 		t.Errorf("connector 4: expected external_rule_id=10.5.0.1/32:BLACKHOLE, got %v", got)
@@ -425,7 +425,7 @@ func TestForceRemove_WritesExecutionLog(t *testing.T) {
 		"attack_id":        6,
 		"action_id":        actionID,
 		"connector_id":     7,
-		"external_rule_id": "10.6.0.1/32:RTBH",
+		"external_rule_id": "10.6.0.1/32|RTBH",
 	}
 	w := doPost(t, r, "/api/active-actions/force-remove", payload)
 
@@ -460,8 +460,8 @@ func TestForceRemove_WritesExecutionLog(t *testing.T) {
 	if found.ConnectorID == nil || *found.ConnectorID != 7 {
 		t.Errorf("expected connector_id=7, got %v", found.ConnectorID)
 	}
-	if found.ExternalRuleID != "10.6.0.1/32:RTBH" {
-		t.Errorf("expected external_rule_id=10.6.0.1/32:RTBH, got %s", found.ExternalRuleID)
+	if found.ExternalRuleID != "10.6.0.1/32|RTBH" {
+		t.Errorf("expected external_rule_id=10.6.0.1/32|RTBH, got %s", found.ExternalRuleID)
 	}
 	if found.Status != "failed" {
 		t.Errorf("expected status=failed (vtysh unavailable), got %s", found.Status)
@@ -493,7 +493,7 @@ func TestForceRemove_PreventsSubsequentAutoPairedExecution(t *testing.T) {
 			ActionType:     "bgp",
 			TriggerPhase:   "on_detected",
 			Status:         "success",
-			ExternalRuleID: "10.7.0.1/32:RTBH",
+			ExternalRuleID: "10.7.0.1/32|RTBH",
 			ConnectorID:    ip(connID),
 			ConnectorName:  "bgp-main",
 			ExecutedAt:     now.Add(-19 * time.Minute),
@@ -506,7 +506,7 @@ func TestForceRemove_PreventsSubsequentAutoPairedExecution(t *testing.T) {
 			ActionType:     "manual_override",
 			TriggerPhase:   "manual_override",
 			Status:         "success",
-			ExternalRuleID: "10.7.0.1/32:RTBH",
+			ExternalRuleID: "10.7.0.1/32|RTBH",
 			ConnectorID:    ip(connID),
 			ExecutedAt:     now.Add(-15 * time.Minute),
 		},
@@ -549,7 +549,7 @@ func TestListActive_BGPAndXDropDoNotInterfere(t *testing.T) {
 			ActionType:     "bgp",
 			TriggerPhase:   "on_detected",
 			Status:         "success",
-			ExternalRuleID: "10.8.0.1/32:RTBH",
+			ExternalRuleID: "10.8.0.1/32|RTBH",
 			ConnectorID:    ip(connID),
 			ExecutedAt:     now.Add(-4 * time.Minute),
 		},

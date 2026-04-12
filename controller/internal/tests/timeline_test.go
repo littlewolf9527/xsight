@@ -28,13 +28,13 @@ func TestTimelineAPI_ReturnsFilteredLogs(t *testing.T) {
 		store.ActionExecutionLog{
 			ID: 1, AttackID: 1, ActionID: 10, ActionType: "bgp",
 			TriggerPhase: "on_detected", Status: "success",
-			ExternalRuleID: "10.0.0.1/32:RTBH", ConnectorID: &connID,
+			ExternalRuleID: "10.0.0.1/32|RTBH", ConnectorID: &connID,
 			ExecutedAt: now.Add(-9 * time.Minute),
 		},
 		store.ActionExecutionLog{
 			ID: 2, AttackID: 1, ActionID: 10, ActionType: "bgp",
 			TriggerPhase: "on_expired", Status: "success",
-			ExternalRuleID: "10.0.0.1/32:RTBH", ConnectorID: &connID,
+			ExternalRuleID: "10.0.0.1/32|RTBH", ConnectorID: &connID,
 			ExecutedAt: now.Add(-5 * time.Minute),
 		},
 		store.ActionExecutionLog{
@@ -48,7 +48,7 @@ func TestTimelineAPI_ReturnsFilteredLogs(t *testing.T) {
 	r := setupRouter(ms)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET",
-		"/api/active-actions/timeline?attack_id=1&connector_id=3&external_rule_id=10.0.0.1/32:RTBH",
+		"/api/active-actions/timeline?attack_id=1&connector_id=3&external_rule_id=10.0.0.1/32|RTBH",
 		nil)
 	req.Header.Set("Authorization", "Bearer "+makeTestToken(t))
 	r.ServeHTTP(w, req)
@@ -62,12 +62,12 @@ func TestTimelineAPI_ReturnsFilteredLogs(t *testing.T) {
 	}
 	json.Unmarshal(w.Body.Bytes(), &result)
 
-	// Should only contain logs for "10.0.0.1/32:RTBH", not "rule-99"
+	// Should only contain logs for "10.0.0.1/32|RTBH", not "rule-99"
 	if len(result.Logs) != 2 {
 		t.Fatalf("expected 2 filtered logs, got %d", len(result.Logs))
 	}
 	for _, log := range result.Logs {
-		if log["external_rule_id"] != "10.0.0.1/32:RTBH" {
+		if log["external_rule_id"] != "10.0.0.1/32|RTBH" {
 			t.Errorf("unexpected external_rule_id: %v", log["external_rule_id"])
 		}
 	}
@@ -88,19 +88,19 @@ func TestTimelineAPI_ChronologicalOrder(t *testing.T) {
 		store.ActionExecutionLog{
 			ID: 10, AttackID: 2, ActionID: 30, ActionType: "bgp",
 			TriggerPhase: "on_expired", Status: "success",
-			ExternalRuleID: "10.1.0.1/32:RTBH", ConnectorID: &connID,
+			ExternalRuleID: "10.1.0.1/32|RTBH", ConnectorID: &connID,
 			ExecutedAt: now.Add(-5 * time.Minute),
 		},
 		store.ActionExecutionLog{
 			ID: 11, AttackID: 2, ActionID: 30, ActionType: "bgp",
 			TriggerPhase: "scheduled", Status: "scheduled",
-			ExternalRuleID: "10.1.0.1/32:RTBH", ConnectorID: &connID,
+			ExternalRuleID: "10.1.0.1/32|RTBH", ConnectorID: &connID,
 			ExecutedAt: now.Add(-10 * time.Minute),
 		},
 		store.ActionExecutionLog{
 			ID: 12, AttackID: 2, ActionID: 30, ActionType: "bgp",
 			TriggerPhase: "on_detected", Status: "success",
-			ExternalRuleID: "10.1.0.1/32:RTBH", ConnectorID: &connID,
+			ExternalRuleID: "10.1.0.1/32|RTBH", ConnectorID: &connID,
 			ExecutedAt: now.Add(-15 * time.Minute),
 		},
 	)
@@ -108,7 +108,7 @@ func TestTimelineAPI_ChronologicalOrder(t *testing.T) {
 	r := setupRouter(ms)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET",
-		"/api/active-actions/timeline?attack_id=2&connector_id=5&external_rule_id=10.1.0.1/32:RTBH",
+		"/api/active-actions/timeline?attack_id=2&connector_id=5&external_rule_id=10.1.0.1/32|RTBH",
 		nil)
 	req.Header.Set("Authorization", "Bearer "+makeTestToken(t))
 	r.ServeHTTP(w, req)
@@ -149,13 +149,13 @@ func TestTimelineAPI_IncludesManualOverride(t *testing.T) {
 		store.ActionExecutionLog{
 			ID: 20, AttackID: 3, ActionID: 40, ActionType: "bgp",
 			TriggerPhase: "on_detected", Status: "success",
-			ExternalRuleID: "10.2.0.1/32:RTBH", ConnectorID: &connID,
+			ExternalRuleID: "10.2.0.1/32|RTBH", ConnectorID: &connID,
 			ExecutedAt: now.Add(-9 * time.Minute),
 		},
 		store.ActionExecutionLog{
 			ID: 21, AttackID: 3, ActionID: 40, ActionType: "manual_override",
 			TriggerPhase: "manual_override", Status: "success",
-			ExternalRuleID: "10.2.0.1/32:RTBH", ConnectorID: &connID,
+			ExternalRuleID: "10.2.0.1/32|RTBH", ConnectorID: &connID,
 			ExecutedAt: now.Add(-3 * time.Minute),
 		},
 	)
@@ -163,7 +163,7 @@ func TestTimelineAPI_IncludesManualOverride(t *testing.T) {
 	r := setupRouter(ms)
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET",
-		"/api/active-actions/timeline?attack_id=3&connector_id=3&external_rule_id=10.2.0.1/32:RTBH",
+		"/api/active-actions/timeline?attack_id=3&connector_id=3&external_rule_id=10.2.0.1/32|RTBH",
 		nil)
 	req.Header.Set("Authorization", "Bearer "+makeTestToken(t))
 	r.ServeHTTP(w, req)

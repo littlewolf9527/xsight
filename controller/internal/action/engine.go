@@ -125,13 +125,14 @@ func (e *Engine) ForceRemove(ctx context.Context, attackID, actionID, connectorI
 		if err != nil {
 			return fmt.Errorf("bgp connector %d: %w", connectorID, err)
 		}
-		parts := strings.SplitN(externalRuleID, ":", 2)
+		parts := splitExternalRuleID(externalRuleID)
 		if len(parts) != 2 {
 			return fmt.Errorf("invalid external_rule_id: %s", externalRuleID)
 		}
 		prefix, routeMap := parts[0], parts[1]
+		af := addressFamilyForPrefix(prefix)
 		cmd := fmt.Sprintf("configure terminal\nrouter bgp %d\naddress-family %s\nno network %s route-map %s",
-			conn.BGPASN, conn.AddressFamily, prefix, routeMap)
+			conn.BGPASN, af, prefix, routeMap)
 		out, err := runVtysh(ctx, conn.VtyshPath, cmd)
 		if err != nil {
 			if strings.Contains(out, "Can't find") || strings.Contains(out, "no network") {
@@ -822,7 +823,7 @@ func (e *Engine) executeAction(ctx context.Context, event tracker.AttackEvent, a
 			// Compute external_rule_id for the scheduled log (same format as bgpAnnounce)
 			bgpDstIP := attack.DstIP
 			if !strings.Contains(bgpDstIP, "/") {
-				if strings.Contains(bgpDstIP, ":") {
+				if isIPv6(bgpDstIP) {
 					bgpDstIP += "/128"
 				} else {
 					bgpDstIP += "/32"
@@ -840,7 +841,7 @@ func (e *Engine) executeAction(ctx context.Context, event tracker.AttackEvent, a
 				}
 			}
 			if bgpExternalRuleID == "" {
-				bgpExternalRuleID = fmt.Sprintf("%s:%s", bgpDstIP, act.BGPRouteMap)
+				bgpExternalRuleID = fmt.Sprintf("%s|%s", bgpDstIP, act.BGPRouteMap)
 			}
 			bgpConnName := ""
 			if bgpConn, err := e.store.BGPConnectors().Get(ctx, *act.BGPConnectorID); err == nil {

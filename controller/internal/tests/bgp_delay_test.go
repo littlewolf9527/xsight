@@ -16,8 +16,8 @@ func TestDelayHelper_CompleteDoesNotCancel(t *testing.T) {
 	// CancelDelaysForAttack on empty map should be a no-op.
 	eng.CancelDelaysForAttack(1)
 
-	ctx := eng.ScheduleDelay(1, 2, 3, "10.0.0.1/32:RTBH")
-	eng.CompleteDelay(1, 2, 3, "10.0.0.1/32:RTBH")
+	ctx := eng.ScheduleDelay(1, 2, 3, "10.0.0.1/32|RTBH")
+	eng.CompleteDelay(1, 2, 3, "10.0.0.1/32|RTBH")
 	eng.CancelDelaysForAttack(1) // nothing to cancel after Complete
 
 	select {
@@ -33,7 +33,7 @@ func TestDelayHelper_ScheduleReturnsLiveContext(t *testing.T) {
 	ms := NewMockStore()
 	eng := action.NewEngine(ms, "auto")
 
-	ctx := eng.ScheduleDelay(1, 2, 3, "10.0.0.1/32:RTBH")
+	ctx := eng.ScheduleDelay(1, 2, 3, "10.0.0.1/32|RTBH")
 	if ctx == nil {
 		t.Fatal("ScheduleDelay returned nil context")
 	}
@@ -51,7 +51,7 @@ func TestDelayHelper_CancelDelaysForAttack(t *testing.T) {
 	ms := NewMockStore()
 	eng := action.NewEngine(ms, "auto")
 
-	ctx := eng.ScheduleDelay(1, 2, 3, "10.0.0.1/32:RTBH")
+	ctx := eng.ScheduleDelay(1, 2, 3, "10.0.0.1/32|RTBH")
 
 	eng.CancelDelaysForAttack(1)
 

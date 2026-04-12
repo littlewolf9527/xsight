@@ -4,12 +4,49 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/littlewolf9527/xsight/controller/internal/store"
 )
+
+// addressFamilyForPrefix returns the FRR address-family string based on the prefix's IP version.
+// Uses net.ParseCIDR / net.ParseIP for robust detection — not string heuristics.
+func addressFamilyForPrefix(prefix string) string {
+	if isIPv6(prefix) {
+		return "ipv6 unicast"
+	}
+	return "ipv4 unicast"
+}
+
+// isIPv6 determines whether a prefix or IP string is IPv6.
+// Handles both CIDR ("2001:db8::/32") and plain IP ("2001:db8::1") forms.
+func isIPv6(s string) bool {
+	if _, cidr, err := net.ParseCIDR(s); err == nil {
+		return cidr.IP.To4() == nil
+	}
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.To4() == nil
+	}
+	return false
+}
+
+// splitExternalRuleID splits "{prefix}|{route_map}" into (prefix, routeMap).
+// Uses "|" as separator to avoid collision with ":" in IPv6 addresses.
+// Falls back to ":" for backward compatibility with pre-v1.1.1 records.
+func splitExternalRuleID(ruleID string) []string {
+	if idx := strings.LastIndex(ruleID, "|"); idx >= 0 {
+		return []string{ruleID[:idx], ruleID[idx+1:]}
+	}
+	// Backward compat: old records used ":" separator.
+	// Use LastIndex to handle IPv6 addresses like "2001:db8::1/128:RTBH".
+	if idx := strings.LastIndex(ruleID, ":"); idx >= 0 {
+		return []string{ruleID[:idx], ruleID[idx+1:]}
+	}
+	return []string{ruleID}
+}
 
 // executeBGP runs a vtysh command to inject or withdraw a BGP route.
 // on_detected: "network {dst_ip} route-map {route_map}"
@@ -50,7 +87,7 @@ func executeBGP(ctx context.Context, s store.Store, act store.ResponseAction,
 	dstIP := attack.DstIP
 	// Ensure mask suffix for plain IPs (internal_ip domain): /32 for IPv4, /128 for IPv6
 	if !strings.Contains(dstIP, "/") {
-		if strings.Contains(dstIP, ":") {
+		if isIPv6(dstIP) {
 			dstIP = dstIP + "/128"
 		} else {
 			dstIP = dstIP + "/32"
@@ -81,14 +118,15 @@ func bgpAnnounce(ctx context.Context, conn *store.BGPConnector, act store.Respon
 	dstIP string, attackDBID int, responseName, triggerPhase string) (*store.ActionExecutionLog, error) {
 
 	routeMap := act.BGPRouteMap
+	af := addressFamilyForPrefix(dstIP)
 	cmd := fmt.Sprintf("configure terminal\nrouter bgp %d\naddress-family %s\nnetwork %s route-map %s",
-		conn.BGPASN, conn.AddressFamily, dstIP, routeMap)
+		conn.BGPASN, af, dstIP, routeMap)
 
 	t0 := time.Now()
 	out, err := runVtysh(ctx, conn.VtyshPath, cmd)
 	durationMs := int(time.Since(t0).Milliseconds())
 
-	externalRuleID := fmt.Sprintf("%s:%s", dstIP, routeMap)
+	externalRuleID := fmt.Sprintf("%s|%s", dstIP, routeMap)
 
 	if err != nil {
 		log.Printf("action: bgp announce failed: %v output=%s", err, out)
@@ -178,14 +216,15 @@ func bgpWithdraw(ctx context.Context, s store.Store, conn *store.BGPConnector, a
 			continue
 		}
 		// external_rule_id format: "{prefix}:{route_map}"
-		parts := strings.SplitN(logEntry.ExternalRuleID, ":", 2)
+		parts := splitExternalRuleID(logEntry.ExternalRuleID)
 		if len(parts) != 2 {
 			continue
 		}
 		prefix, routeMap := parts[0], parts[1]
 
+		waf := addressFamilyForPrefix(prefix)
 		cmd := fmt.Sprintf("configure terminal\nrouter bgp %d\naddress-family %s\nno network %s route-map %s",
-			conn.BGPASN, conn.AddressFamily, prefix, routeMap)
+			conn.BGPASN, waf, prefix, routeMap)
 
 		out, err := runVtysh(ctx, conn.VtyshPath, cmd)
 		if err != nil {
@@ -279,15 +318,16 @@ func RecoverBGPRoutes(ctx context.Context, s store.Store) {
 			if conn == nil || !conn.Enabled {
 				continue
 			}
-			parts := strings.SplitN(logEntry.ExternalRuleID, ":", 2)
+			parts := splitExternalRuleID(logEntry.ExternalRuleID)
 			if len(parts) != 2 {
 				continue
 			}
 			prefix, routeMap := parts[0], parts[1]
 
 			// Re-inject for active attacks
+			raf := addressFamilyForPrefix(prefix)
 			cmd := fmt.Sprintf("configure terminal\nrouter bgp %d\naddress-family %s\nnetwork %s route-map %s",
-				conn.BGPASN, conn.AddressFamily, prefix, routeMap)
+				conn.BGPASN, raf, prefix, routeMap)
 			if _, err := runVtysh(ctx, conn.VtyshPath, cmd); err != nil {
 				log.Printf("bgp recovery: re-inject %s route-map=%s failed: %v", prefix, routeMap, err)
 			} else {
@@ -332,13 +372,14 @@ func RecoverBGPRoutes(ctx context.Context, s store.Store) {
 				if conn == nil || !conn.Enabled {
 					continue
 				}
-				parts := strings.SplitN(logEntry.ExternalRuleID, ":", 2)
+				parts := splitExternalRuleID(logEntry.ExternalRuleID)
 				if len(parts) != 2 {
 					continue
 				}
 				prefix, routeMap := parts[0], parts[1]
+				caf := addressFamilyForPrefix(prefix)
 				cmd := fmt.Sprintf("configure terminal\nrouter bgp %d\naddress-family %s\nno network %s route-map %s",
-					conn.BGPASN, conn.AddressFamily, prefix, routeMap)
+					conn.BGPASN, caf, prefix, routeMap)
 				if _, err := runVtysh(ctx, conn.VtyshPath, cmd); err != nil {
 					// Ignore errors — route may already have been withdrawn normally
 					log.Printf("bgp recovery: cleanup stale %s route-map=%s (may already be gone): %v", prefix, routeMap, err)

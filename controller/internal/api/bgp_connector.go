@@ -51,12 +51,10 @@ func createBGPConnector(deps Dependencies) gin.HandlerFunc {
 		if req.VtyshPath == "" {
 			req.VtyshPath = "/usr/bin/vtysh"
 		}
+		// address_family is now auto-detected from the prefix at execution time.
+		// Field kept for backward compatibility but not enforced.
 		if req.AddressFamily == "" {
-			req.AddressFamily = "ipv4 unicast"
-		}
-		if req.AddressFamily != "ipv4 unicast" && req.AddressFamily != "ipv6 unicast" {
-			errResponse(c, http.StatusBadRequest, "address_family must be 'ipv4 unicast' or 'ipv6 unicast'")
-			return
+			req.AddressFamily = "auto"
 		}
 		enabled := true
 		if req.Enabled != nil {
@@ -112,10 +110,6 @@ func updateBGPConnector(deps Dependencies) gin.HandlerFunc {
 			conn.BGPASN = req.BGPASN
 		}
 		if req.AddressFamily != "" {
-			if req.AddressFamily != "ipv4 unicast" && req.AddressFamily != "ipv6 unicast" {
-				errResponse(c, http.StatusBadRequest, "address_family must be 'ipv4 unicast' or 'ipv6 unicast'")
-				return
-			}
 			conn.AddressFamily = req.AddressFamily
 		}
 		if req.Enabled != nil {
@@ -167,16 +161,24 @@ func listBGPRoutes(deps Dependencies) gin.HandlerFunc {
 			errResponse(c, http.StatusNotFound, "bgp connector not found")
 			return
 		}
-		af := "ipv4"
-		if strings.Contains(conn.AddressFamily, "ipv6") {
-			af = "ipv6"
-		}
-		out, err := exec.CommandContext(c, conn.VtyshPath, "-c", fmt.Sprintf("show ip bgp %s unicast", af)).CombinedOutput()
-		if err != nil {
-			errResponse(c, http.StatusBadGateway, fmt.Sprintf("vtysh failed: %v\n%s", err, strings.TrimSpace(string(out))))
+		// Show both IPv4 and IPv6 BGP RIB — partial success is OK
+		out4, err4 := exec.CommandContext(c, conn.VtyshPath, "-c", "show ip bgp ipv4 unicast").CombinedOutput()
+		out6, err6 := exec.CommandContext(c, conn.VtyshPath, "-c", "show ip bgp ipv6 unicast").CombinedOutput()
+		if err4 != nil && err6 != nil {
+			errResponse(c, http.StatusBadGateway, fmt.Sprintf("vtysh failed: ipv4=%v ipv6=%v", err4, err6))
 			return
 		}
-		ok(c, gin.H{"output": string(out)})
+		var combined string
+		if err4 == nil {
+			combined += string(out4)
+		}
+		if err6 == nil && len(out6) > 0 && !strings.Contains(string(out6), "No BGP prefixes displayed") {
+			if combined != "" {
+				combined += "\n--- IPv6 ---\n"
+			}
+			combined += string(out6)
+		}
+		ok(c, gin.H{"output": combined})
 	}
 }
 
