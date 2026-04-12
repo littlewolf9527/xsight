@@ -76,9 +76,8 @@ controller/web/src/assets/vue.svg
 controller/web/src/components/HelloWorld.vue
 controller/web/src/style.css
 
-# Tests (internal, not for distribution)
-controller/internal/tests/
-controller/**/*_test.go
+# Test artifacts (temporary scripts, not test code)
+controller/internal/tests/test-result/
 
 # Misc
 remove_bg.py
