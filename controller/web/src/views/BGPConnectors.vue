@@ -29,13 +29,13 @@
     <el-dialog v-model="showDialog" :title="isEdit ? $t('bgpConnectors.edit') : $t('bgpConnectors.add')" width="500px">
       <el-form :model="form" label-width="130px">
         <el-form-item :label="$t('common.name')">
-          <el-input v-model="form.name" placeholder="Main BGP" />
+          <el-input v-model="form.name" />
         </el-form-item>
         <el-form-item :label="$t('bgpConnectors.bgpAsn')">
           <el-input-number v-model="form.bgp_asn" :min="1" :max="4294967295" />
         </el-form-item>
         <el-form-item :label="$t('bgpConnectors.vtyshPath')">
-          <el-input v-model="form.vtysh_path" placeholder="/usr/bin/vtysh" />
+          <el-input v-model="form.vtysh_path" />
         </el-form-item>
         <el-form-item :label="$t('common.description')">
           <el-input v-model="form.description" />

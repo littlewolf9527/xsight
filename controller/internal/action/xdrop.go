@@ -236,7 +236,7 @@ func executeXDrop(
 				}
 			}
 
-			// Delete immediate rules now
+			// Delete immediate rules now — write per-rule exec log so Mitigations can match
 			deleted := 0
 			var lastErr string
 			for _, ruleID := range immediateRules {
@@ -259,6 +259,21 @@ func executeXDrop(
 				resp.Body.Close()
 				if resp.StatusCode < 400 {
 					deleted++
+					// Write per-rule on_expired success log with external_rule_id
+					ruleLog := &store.ActionExecutionLog{
+						AttackID:       attackDBID,
+						ActionID:       action.ID,
+						ActionType:     "xdrop",
+						ConnectorName:  conn.Name,
+						ConnectorID:    &connID,
+						TriggerPhase:   triggerPhase,
+						ExternalRuleID: ruleID,
+						Status:         "success",
+						ExecutedAt:     time.Now(),
+					}
+					if _, err := s.ActionExecLog().Create(ctx, ruleLog); err != nil {
+						log.Printf("action: create per-rule unblock log: %v", err)
+					}
 				} else {
 					lastErr = fmt.Sprintf("DELETE %s: HTTP %d", delURL, resp.StatusCode)
 				}
@@ -322,6 +337,25 @@ func executeXDrop(
 					}
 					resp.Body.Close()
 					log.Printf("action: delayed unblock rule %s completed (HTTP %d, attack=%d)", ruleID, resp.StatusCode, attackDBID)
+					// Write per-rule on_expired success log
+					if resp.StatusCode < 400 {
+						ruleLog := &store.ActionExecutionLog{
+							AttackID:       attackDBID,
+							ActionID:       action.ID,
+							ActionType:     "xdrop",
+							ConnectorName:  connCopy.Name,
+							ConnectorID:    &cID,
+							TriggerPhase:   triggerPhase,
+							ExternalRuleID: ruleID,
+							Status:         "success",
+							ExecutedAt:     time.Now(),
+						}
+						logCtx, lc := context.WithTimeout(context.Background(), 5*time.Second)
+						if _, err := s.ActionExecLog().Create(logCtx, ruleLog); err != nil {
+							log.Printf("action: create per-rule delayed unblock log: %v", err)
+						}
+						lc()
+					}
 				}(dr.ruleID, dr.delay, conn, connID)
 			}
 

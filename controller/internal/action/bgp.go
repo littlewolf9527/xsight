@@ -232,6 +232,22 @@ func bgpWithdraw(ctx context.Context, s store.Store, conn *store.BGPConnector, a
 		} else {
 			withdrawn = append(withdrawn, logEntry.ExternalRuleID)
 			log.Printf("action: bgp withdraw %s route-map=%s connector=%s", prefix, routeMap, conn.Name)
+			// Write per-route on_expired success log so Mitigations can match
+			cid := conn.ID
+			routeLog := &store.ActionExecutionLog{
+				AttackID:       attackDBID,
+				ActionID:       act.ID,
+				ActionType:     "bgp",
+				ConnectorName:  conn.Name,
+				ConnectorID:    &cid,
+				TriggerPhase:   triggerPhase,
+				ExternalRuleID: logEntry.ExternalRuleID,
+				Status:         "success",
+				ExecutedAt:     time.Now(),
+			}
+			if _, err := s.ActionExecLog().Create(ctx, routeLog); err != nil {
+				log.Printf("action: create per-route withdraw log: %v", err)
+			}
 		}
 	}
 
@@ -246,33 +262,21 @@ func bgpWithdraw(ctx context.Context, s store.Store, conn *store.BGPConnector, a
 		errMsg = strings.Join(errors, "; ")
 	}
 
-	// Build external_rule_id for the result log — use the first withdrawn/attempted route
-	// so that buildActiveActions can match on_expired with on_detected.
-	resultRuleID := ""
-	if len(withdrawn) > 0 {
-		resultRuleID = withdrawn[0]
-	} else if len(errors) > 0 {
-		// Parse from error string: "10.0.0.1/32:RTBH: exit status 1 (...)"
-		parts := strings.SplitN(errors[0], ":", 3)
-		if len(parts) >= 2 {
-			resultRuleID = parts[0] + ":" + parts[1]
-		}
-	}
-
+	// Per-route success logs are already written above.
+	// This summary log is for the overall connector-level result only.
 	connID := conn.ID
 	return &store.ActionExecutionLog{
-		AttackID:       attackDBID,
-		ActionID:       act.ID,
-		ActionType:     "bgp",
-		TriggerPhase:   triggerPhase,
-		ResponseName:   responseName,
-		ConnectorName:  conn.Name,
-		ConnectorID:    &connID,
-		ExternalRuleID: resultRuleID,
-		Status:         status,
-		ErrorMessage:   errMsg,
-		ResponseBody:   fmt.Sprintf("withdrawn: %v", withdrawn),
-		ExecutedAt:     time.Now(),
+		AttackID:      attackDBID,
+		ActionID:      act.ID,
+		ActionType:    "bgp",
+		TriggerPhase:  triggerPhase,
+		ResponseName:  responseName,
+		ConnectorName: conn.Name,
+		ConnectorID:   &connID,
+		Status:        status,
+		ErrorMessage:  errMsg,
+		ResponseBody:  fmt.Sprintf("withdrawn: %v", withdrawn),
+		ExecutedAt:    time.Now(),
 	}, nil
 }
 
