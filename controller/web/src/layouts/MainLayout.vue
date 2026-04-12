@@ -33,6 +33,10 @@
           <el-icon><WarnTriangleFilled /></el-icon>
           <template #title>{{ $t('nav.attacks') }}</template>
         </el-menu-item>
+        <el-menu-item index="/mitigations">
+          <el-icon><CircleCheck /></el-icon>
+          <template #title>{{ $t('nav.mitigations') }}</template>
+        </el-menu-item>
 
         <!-- Infrastructure -->
         <div class="xs-nav-group" v-show="!store.sidebarCollapsed">{{ $t('common.infrastructure') || 'INFRASTRUCTURE' }}</div>

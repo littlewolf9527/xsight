@@ -112,6 +112,13 @@ func updateThreshold(deps Dependencies) gin.HandlerFunc {
 
 // validateThreshold checks semantic constraints on threshold rules.
 func validateThreshold(t *store.Threshold) error {
+	// Decoder: must be a valid decoder family
+	validDecoders := map[string]bool{
+		"ip": true, "tcp": true, "tcp_syn": true, "udp": true, "icmp": true, "fragment": true,
+	}
+	if t.Decoder != "" && !validDecoders[t.Decoder] {
+		return fmt.Errorf("decoder must be one of: ip, tcp, tcp_syn, udp, icmp, fragment; got %q", t.Decoder)
+	}
 	// Direction: must be receives or sends
 	if t.Direction != "" && t.Direction != "receives" && t.Direction != "sends" {
 		return fmt.Errorf("direction must be 'receives' or 'sends', got %q", t.Direction)

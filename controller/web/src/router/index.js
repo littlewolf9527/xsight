@@ -21,6 +21,7 @@ const routes = [
       { path: 'responses', name: 'Responses', component: () => import('../views/Responses.vue') },
       { path: 'webhooks', name: 'Webhooks', component: () => import('../views/Webhooks.vue') },
       { path: 'attacks', name: 'Attacks', component: () => import('../views/Attacks.vue') },
+      { path: 'mitigations', name: 'Mitigations', component: () => import('../views/Mitigations.vue') },
       { path: 'attacks/:id', name: 'AttackDetail', component: () => import('../views/AttackDetail.vue') },
       { path: 'settings/webhook-connectors', name: 'WebhookConnectors', component: () => import('../views/WebhookConnectors.vue') },
       { path: 'settings/xdrop-connectors', name: 'XDropConnectors', component: () => import('../views/XDropConnectors.vue') },

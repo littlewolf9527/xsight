@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/littlewolf9527/xsight/controller/internal/store"
@@ -19,10 +21,151 @@ import (
 type Engine struct {
 	store store.Store
 	mode  string // "observe" | "auto"
+
+	// v1.1: Cancel channels for delayed unblock/withdraw goroutines.
+	// Key: "attack:{attackID}:action:{actionID}" → cancel function.
+	// When an attack re-breaches, all pending delays for that attack are cancelled.
+	delayMu      sync.Mutex
+	pendingDelay map[string]context.CancelFunc
 }
 
 func NewEngine(s store.Store, mode string) *Engine {
-	return &Engine{store: s, mode: mode}
+	return &Engine{store: s, mode: mode, pendingDelay: make(map[string]context.CancelFunc)}
+}
+
+// delayKey returns the map key for a pending delayed action (full business key).
+func delayKey(attackID, actionID, connectorID int, externalRuleID string) string {
+	return fmt.Sprintf("attack:%d:action:%d:conn:%d:rule:%s", attackID, actionID, connectorID, externalRuleID)
+}
+
+// ScheduleDelay registers a cancelable delayed action identified by full business key.
+// Returns a context that will be cancelled if the attack re-breaches or CancelDelay is called.
+func (e *Engine) ScheduleDelay(attackID, actionID, connectorID int, externalRuleID string) context.Context {
+	e.delayMu.Lock()
+	defer e.delayMu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	e.pendingDelay[delayKey(attackID, actionID, connectorID, externalRuleID)] = cancel
+	return ctx
+}
+
+// CompleteDelay removes a delay entry after it finishes (success or failure).
+func (e *Engine) CompleteDelay(attackID, actionID, connectorID int, externalRuleID string) {
+	e.delayMu.Lock()
+	defer e.delayMu.Unlock()
+	delete(e.pendingDelay, delayKey(attackID, actionID, connectorID, externalRuleID))
+}
+
+// CancelDelay cancels a specific pending delayed action (per-artifact, full business key).
+func (e *Engine) CancelDelay(attackID, actionID, connectorID int, externalRuleID string) {
+	e.delayMu.Lock()
+	defer e.delayMu.Unlock()
+	key := delayKey(attackID, actionID, connectorID, externalRuleID)
+	if cancel, ok := e.pendingDelay[key]; ok {
+		cancel()
+		delete(e.pendingDelay, key)
+		log.Printf("action: cancelled delayed action %s (force remove)", key)
+	}
+}
+
+// CancelDelaysForAttack cancels all pending delayed actions for a given attack.
+// Called when an attack re-breaches (Active→Expiring→Active transition).
+func (e *Engine) CancelDelaysForAttack(attackID int) {
+	e.delayMu.Lock()
+	defer e.delayMu.Unlock()
+	prefix := fmt.Sprintf("attack:%d:", attackID)
+	for key, cancel := range e.pendingDelay {
+		if strings.HasPrefix(key, prefix) {
+			cancel()
+			delete(e.pendingDelay, key)
+			log.Printf("action: cancelled delayed action %s (attack re-breached)", key)
+		}
+	}
+}
+
+// ForceRemove executes the actual xDrop rule deletion or BGP route withdrawal for a single artifact.
+func (e *Engine) ForceRemove(ctx context.Context, attackID, actionID, connectorID int, externalRuleID string) error {
+	act, err := e.store.Responses().GetAction(ctx, actionID)
+	if err != nil {
+		return fmt.Errorf("action %d not found: %w", actionID, err)
+	}
+
+	switch act.ActionType {
+	case "xdrop":
+		connectors, _ := e.store.XDropConnectors().ListEnabled(ctx)
+		for _, conn := range connectors {
+			if conn.ID != connectorID {
+				continue
+			}
+			delURL := strings.TrimRight(conn.APIURL, "/") + "/rules/" + externalRuleID
+			req, err := http.NewRequestWithContext(ctx, "DELETE", delURL, nil)
+			if err != nil {
+				return fmt.Errorf("create request: %w", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("User-Agent", "xsight-controller/1.0")
+			if conn.APIKey != "" {
+				req.Header.Set("X-API-Key", conn.APIKey)
+			}
+			client := &http.Client{Timeout: 10 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				return fmt.Errorf("DELETE %s: %w", delURL, err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				return fmt.Errorf("DELETE %s: HTTP %d", delURL, resp.StatusCode)
+			}
+			log.Printf("action: force-removed xdrop rule %s (connector=%s attack=%d)", externalRuleID, conn.Name, attackID)
+			return nil
+		}
+		return fmt.Errorf("xdrop connector %d not found or disabled", connectorID)
+
+	case "bgp":
+		conn, err := e.store.BGPConnectors().Get(ctx, connectorID)
+		if err != nil {
+			return fmt.Errorf("bgp connector %d: %w", connectorID, err)
+		}
+		parts := strings.SplitN(externalRuleID, ":", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid external_rule_id: %s", externalRuleID)
+		}
+		prefix, routeMap := parts[0], parts[1]
+		cmd := fmt.Sprintf("configure terminal\nrouter bgp %d\naddress-family %s\nno network %s route-map %s",
+			conn.BGPASN, conn.AddressFamily, prefix, routeMap)
+		out, err := runVtysh(ctx, conn.VtyshPath, cmd)
+		if err != nil {
+			if strings.Contains(out, "Can't find") || strings.Contains(out, "no network") {
+				return nil // already gone
+			}
+			return fmt.Errorf("vtysh: %v (%s)", err, out)
+		}
+		log.Printf("action: force-removed bgp route %s (connector=%s attack=%d)", externalRuleID, conn.Name, attackID)
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported action type for force remove: %s", act.ActionType)
+	}
+}
+
+// HasManualOverride checks if a specific artifact has been manually overridden.
+// Returns true if there's a manual_override success log matching the full business key.
+func (e *Engine) HasManualOverride(ctx context.Context, attackID, actionID int, connectorID int, externalRuleID string) bool {
+	logs, err := e.store.ActionExecLog().ListByAttack(ctx, attackID)
+	if err != nil {
+		return false
+	}
+	for _, l := range logs {
+		if l.ActionID == actionID && l.TriggerPhase == "manual_override" && l.Status == "success" {
+			cid := 0
+			if l.ConnectorID != nil {
+				cid = *l.ConnectorID
+			}
+			if cid == connectorID && l.ExternalRuleID == externalRuleID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // HandleEvent is the callback wired to AttackTracker.
@@ -135,6 +278,9 @@ func (e *Engine) HandleEvent(event tracker.AttackEvent) {
 					continue
 				}
 			}
+			// Manual override suppression: per-artifact checks happen inside
+			// executeXDrop/executeBGP, not here — allows partial suppress when
+			// only some artifacts were force-removed (P2-3).
 		} else {
 			// Legacy model
 			if !policyMatchesEvent(act.ExecutionPolicy, event.Type) {
@@ -624,7 +770,9 @@ func (e *Engine) executeAction(ctx context.Context, event tracker.AttackEvent, a
 			}
 			break
 		}
-		execLog, err := executeXDrop(ctx, e.store, act, attack, event.Type, prefixStr, responseName, triggerPhase, event.DBID, fa)
+		// Manual override suppression: per-artifact checks inside executeXDrop
+		// Delay scheduling: per-artifact inside executeXDrop (each rule gets its own cancel context)
+		execLog, err := executeXDrop(ctx, e.store, act, attack, event.Type, prefixStr, responseName, triggerPhase, event.DBID, fa, e)
 		if err != nil {
 			log.Printf("action: xdrop failed for attack %d: %v", event.DBID, err)
 		}
@@ -665,6 +813,83 @@ func (e *Engine) executeAction(ctx context.Context, event tracker.AttackEvent, a
 		}
 		if act.BGPConnectorID == nil {
 			log.Printf("action: bgp action %d has no connector_id, skipping", act.ID)
+			break
+		}
+		// BGP withdraw delay: if on_expired with delay > 0, schedule via cancelable goroutine
+		if triggerPhase == "on_expired" && act.BGPWithdrawDelayMinutes > 0 {
+			delay := time.Duration(act.BGPWithdrawDelayMinutes) * time.Minute
+			scheduledFor := time.Now().Add(delay)
+			// Compute external_rule_id for the scheduled log (same format as bgpAnnounce)
+			bgpDstIP := attack.DstIP
+			if !strings.Contains(bgpDstIP, "/") {
+				if strings.Contains(bgpDstIP, ":") {
+					bgpDstIP += "/128"
+				} else {
+					bgpDstIP += "/32"
+				}
+			}
+			// Look up actual external_rule_id from the on_detected execution log.
+			// The on_expired child action may not have BGPRouteMap set (auto-generated).
+			bgpExternalRuleID := ""
+			if prevLogs, err := e.store.ActionExecLog().ListByAttack(ctx, event.DBID); err == nil {
+				for _, pl := range prevLogs {
+					if pl.ActionType == "bgp" && pl.TriggerPhase == "on_detected" && pl.Status == "success" && pl.ExternalRuleID != "" {
+						bgpExternalRuleID = pl.ExternalRuleID
+						break
+					}
+				}
+			}
+			if bgpExternalRuleID == "" {
+				bgpExternalRuleID = fmt.Sprintf("%s:%s", bgpDstIP, act.BGPRouteMap)
+			}
+			bgpConnName := ""
+			if bgpConn, err := e.store.BGPConnectors().Get(ctx, *act.BGPConnectorID); err == nil {
+				bgpConnName = bgpConn.Name
+			}
+			// Write "scheduled" log entry with full business key
+			schedLog := &store.ActionExecutionLog{
+				AttackID:       event.DBID,
+				ActionID:       act.ID,
+				ActionType:     "bgp",
+				TriggerPhase:   triggerPhase,
+				ResponseName:   responseName,
+				ConnectorName:  bgpConnName,
+				ConnectorID:    act.BGPConnectorID,
+				ExternalRuleID: bgpExternalRuleID,
+				Status:         "scheduled",
+				ErrorMessage:   fmt.Sprintf("delayed withdraw in %v", delay),
+				ScheduledFor:   &scheduledFor,
+				ExecutedAt:     time.Now(),
+			}
+			if _, err := e.store.ActionExecLog().Create(ctx, schedLog); err != nil {
+				log.Printf("action: create scheduled log: %v", err)
+			}
+			bgpConnID := 0
+			if act.BGPConnectorID != nil {
+				bgpConnID = *act.BGPConnectorID
+			}
+			delayCtx := e.ScheduleDelay(event.DBID, act.ID, bgpConnID, bgpExternalRuleID)
+			go func(a store.ResponseAction, atk *store.Attack, dbID, cID int, extRuleID string) {
+				log.Printf("action: bgp withdraw scheduled in %v (attack=%d)", delay, dbID)
+				select {
+				case <-time.After(delay):
+					// Timer expired — execute withdraw
+					wCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					execLog, err := executeBGP(wCtx, e.store, a, atk, "expired", prefixStr, responseName, "on_expired", dbID, nil)
+					if err != nil {
+						log.Printf("action: bgp delayed withdraw failed attack=%d: %v", dbID, err)
+					}
+					if execLog != nil {
+						if _, err := e.store.ActionExecLog().Create(wCtx, execLog); err != nil {
+							log.Printf("action: create action_execution_log: %v", err)
+						}
+					}
+				case <-delayCtx.Done():
+					log.Printf("action: bgp delayed withdraw cancelled (re-breach) attack=%d", dbID)
+				}
+				e.CompleteDelay(dbID, a.ID, cID, extRuleID)
+			}(act, attack, event.DBID, bgpConnID, bgpExternalRuleID)
 			break
 		}
 		execLog, err := executeBGP(ctx, e.store, act, attack, event.Type, prefixStr, responseName, triggerPhase, event.DBID, nil)

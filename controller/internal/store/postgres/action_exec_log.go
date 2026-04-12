@@ -15,10 +15,12 @@ func (r *actionExecLogRepo) Create(ctx context.Context, l *store.ActionExecution
 	err := r.pool.QueryRow(ctx,
 		`INSERT INTO action_execution_log
 		 (attack_id, action_id, response_name, action_type, connector_name, trigger_phase,
-		  status, status_code, error_message, request_body, response_body, external_rule_id, connector_id, duration_ms)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id`,
+		  status, status_code, error_message, request_body, response_body, external_rule_id,
+		  connector_id, duration_ms, scheduled_for)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id`,
 		l.AttackID, l.ActionID, l.ResponseName, l.ActionType, l.ConnectorName, l.TriggerPhase,
-		l.Status, l.StatusCode, l.ErrorMessage, l.RequestBody, l.ResponseBody, l.ExternalRuleID, l.ConnectorID, l.DurationMs).
+		l.Status, l.StatusCode, l.ErrorMessage, l.RequestBody, l.ResponseBody, l.ExternalRuleID,
+		l.ConnectorID, l.DurationMs, l.ScheduledFor).
 		Scan(&id)
 	return id, err
 }
@@ -27,7 +29,7 @@ func (r *actionExecLogRepo) ListByAttack(ctx context.Context, attackID int) ([]s
 	rows, err := r.pool.Query(ctx,
 		`SELECT id, attack_id, action_id, response_name, action_type, connector_name, trigger_phase,
 		        status, status_code, error_message, request_body, response_body, external_rule_id,
-		        connector_id, duration_ms, executed_at
+		        connector_id, duration_ms, executed_at, scheduled_for
 		 FROM action_execution_log
 		 WHERE attack_id=$1 ORDER BY executed_at DESC`, attackID)
 	if err != nil {
@@ -40,7 +42,7 @@ func (r *actionExecLogRepo) ListByAttack(ctx context.Context, attackID int) ([]s
 		var l store.ActionExecutionLog
 		if err := rows.Scan(&l.ID, &l.AttackID, &l.ActionID, &l.ResponseName, &l.ActionType,
 			&l.ConnectorName, &l.TriggerPhase, &l.Status, &l.StatusCode, &l.ErrorMessage,
-			&l.RequestBody, &l.ResponseBody, &l.ExternalRuleID, &l.ConnectorID, &l.DurationMs, &l.ExecutedAt); err != nil {
+			&l.RequestBody, &l.ResponseBody, &l.ExternalRuleID, &l.ConnectorID, &l.DurationMs, &l.ExecutedAt, &l.ScheduledFor); err != nil {
 			return nil, err
 		}
 		list = append(list, l)
@@ -53,13 +55,13 @@ func (r *actionExecLogRepo) FindByAttackAndAction(ctx context.Context, attackID,
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, attack_id, action_id, response_name, action_type, connector_name, trigger_phase,
 		        status, status_code, error_message, request_body, response_body, external_rule_id,
-		        connector_id, duration_ms, executed_at
+		        connector_id, duration_ms, executed_at, scheduled_for
 		 FROM action_execution_log
 		 WHERE attack_id=$1 AND action_id=$2 AND trigger_phase=$3
 		 ORDER BY executed_at DESC LIMIT 1`, attackID, actionID, triggerPhase).
 		Scan(&l.ID, &l.AttackID, &l.ActionID, &l.ResponseName, &l.ActionType,
 			&l.ConnectorName, &l.TriggerPhase, &l.Status, &l.StatusCode, &l.ErrorMessage,
-			&l.RequestBody, &l.ResponseBody, &l.ExternalRuleID, &l.ConnectorID, &l.DurationMs, &l.ExecutedAt)
+			&l.RequestBody, &l.ResponseBody, &l.ExternalRuleID, &l.ConnectorID, &l.DurationMs, &l.ExecutedAt, &l.ScheduledFor)
 	if err != nil {
 		return nil, fmt.Errorf("action_execution_log attack=%d action=%d phase=%s: %w", attackID, actionID, triggerPhase, err)
 	}

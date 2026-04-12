@@ -216,6 +216,7 @@ func main() {
 	actionEngine := action.NewEngine(db, cfg.Action.Mode)
 
 	attackTracker := tracker.New(trackerCfg, db, rings, alertDedup, actionEngine.HandleEvent)
+	attackTracker.SetRebreachCallback(actionEngine.CancelDelaysForAttack)
 
 	// Crash recovery: rebuild active attacks from DB
 	if err := attackTracker.RecoverFromDB(ctx); err != nil {
@@ -372,6 +373,7 @@ func main() {
 		NodeState:     nodeState,
 		ThreshTree:    threshTree,
 		Tracker:       attackTracker,
+		ActionEngine:  actionEngine,
 		BaselineCalc:  baselineCalc,
 		ProfileEngine: profileEngine,
 		APIKey:        cfg.Auth.APIKey,

@@ -127,6 +127,7 @@ type ResponseRepo interface {
 	CreateAction(ctx context.Context, a *ResponseAction) (int, error)
 	UpdateAction(ctx context.Context, a *ResponseAction) error
 	DeleteAction(ctx context.Context, id int) error
+	SetPairedWith(ctx context.Context, actionID int, pairedID *int) error
 	// Connector usage checks (for safe deletion)
 	CountActionsByWebhookConnector(ctx context.Context, connectorID int) (int, error)
 	CountActionsByShellConnector(ctx context.Context, connectorID int) (int, error)

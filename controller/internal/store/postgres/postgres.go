@@ -773,6 +773,19 @@ var migrations = []string{
 	// Attacks: snapshot template_name and rule_summary at detection time
 	`DO $$ BEGIN ALTER TABLE attacks ADD COLUMN template_name TEXT; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
 	`DO $$ BEGIN ALTER TABLE attacks ADD COLUMN rule_summary TEXT; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+
+	// v1.1: Auto-paired actions — single-direction parent→child link
+	`DO $$ BEGIN ALTER TABLE response_actions ADD COLUMN paired_with INT REFERENCES response_actions(id) ON DELETE SET NULL; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+	`DO $$ BEGIN ALTER TABLE response_actions ADD COLUMN auto_generated BOOLEAN NOT NULL DEFAULT false; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+
+	// v1.1: BGP withdraw delay (same semantics as xDrop unblock_delay_minutes)
+	`DO $$ BEGIN ALTER TABLE response_actions ADD COLUMN bgp_withdraw_delay_minutes INT NOT NULL DEFAULT 0; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+	`DO $$ BEGIN
+		ALTER TABLE response_actions ADD CONSTRAINT bgp_withdraw_delay_range CHECK (bgp_withdraw_delay_minutes >= 0 AND bgp_withdraw_delay_minutes <= 1440);
+	EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
+
+	// v1.1: Delayed action scheduling timestamp for UI countdown + startup recovery
+	`DO $$ BEGIN ALTER TABLE action_execution_log ADD COLUMN scheduled_for TIMESTAMPTZ; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
 }
 
 // TimescaleDB-specific DDL — non-fatal if TimescaleDB is not available.

@@ -26,14 +26,19 @@ func createTemplate(deps Dependencies) gin.HandlerFunc {
 		var req struct {
 			Name        string `json:"name" binding:"required"`
 			Description string `json:"description"`
+			ResponseID  *int   `json:"response_id"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			errResponse(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		id, err := deps.Store.ThresholdTemplates().Create(c, &store.ThresholdTemplate{
+		tmpl := &store.ThresholdTemplate{
 			Name: req.Name, Description: req.Description,
-		})
+		}
+		if req.ResponseID != nil {
+			tmpl.ResponseID = req.ResponseID
+		}
+		id, err := deps.Store.ThresholdTemplates().Create(c, tmpl)
 		if err != nil {
 			errResponse(c, http.StatusInternalServerError, err.Error())
 			return

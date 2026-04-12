@@ -102,7 +102,8 @@ type Tracker struct {
 	store    store.Store
 	rings    *ring.RingStore
 	dedup    *dedup.Dedup
-	onAction ActionCallback
+	onAction   ActionCallback
+	onRebreach func(attackDBID int) // called when attack transitions Expiring→Active
 
 	// Periodic update tracking
 	lastPeriodicUpdate time.Time
@@ -123,6 +124,12 @@ func New(cfg Config, s store.Store, rings *ring.RingStore, d *dedup.Dedup, onAct
 		dedup:    d,
 		onAction: onAction,
 	}
+}
+
+// SetRebreachCallback sets a callback invoked when an attack transitions Expiring→Active.
+// Used by the action engine to cancel pending delayed unblocks/withdrawals.
+func (t *Tracker) SetRebreachCallback(fn func(attackDBID int)) {
+	t.onRebreach = fn
 }
 
 // Feed processes threshold exceeded events from the detection engine.
@@ -270,6 +277,10 @@ func (t *Tracker) tick(now time.Time) {
 				a.ExpiresAt = time.Time{}
 				log.Printf("tracker: attack %s/%s back to active (re-exceeded)",
 					a.Key.DstIP, a.Key.DecoderFamily)
+				// Cancel any pending delayed unblocks/withdrawals
+				if t.onRebreach != nil && a.DBID > 0 {
+					t.onRebreach(a.DBID)
+				}
 			} else if now.After(a.ExpiresAt) {
 				// Timer expired → archive
 				t.transitionToExpired(a, now)

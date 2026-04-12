@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
+	"github.com/littlewolf9527/xsight/controller/internal/action"
 	"github.com/littlewolf9527/xsight/controller/internal/configpub"
 	"github.com/littlewolf9527/xsight/controller/internal/engine/baseline"
 	"github.com/littlewolf9527/xsight/controller/internal/engine/threshold"
@@ -23,6 +24,7 @@ type Dependencies struct {
 	Tracker       *tracker.Tracker
 	BaselineCalc  *baseline.Calculator
 	ProfileEngine *baseline.ProfileEngine
+	ActionEngine  *action.Engine
 	APIKey        string
 	JWTSecret     string
 	FlowLogsDays  int // flow_logs retention days, exposed to API for expired hint
@@ -130,6 +132,12 @@ func NewRouter(deps Dependencies) *gin.Engine {
 		api.GET("/attacks/:id/action-log", getAttackActionLog(deps))
 		api.GET("/attacks/:id/sensor-logs", getAttackSensorLogs(deps))
 		api.POST("/attacks/:id/expire", expireAttack(deps))
+
+		// Active response actions (BGP routing + xDrop filtering view)
+		api.GET("/active-actions/bgp", listActiveBGPRoutes(deps))
+		api.GET("/active-actions/xdrop", listActiveXDropRules(deps))
+		api.GET("/active-actions/timeline", getArtifactTimeline(deps))
+		api.POST("/active-actions/force-remove", forceRemoveAction(deps))
 
 		// Audit log
 		api.GET("/audit-log", listAuditLog(deps))

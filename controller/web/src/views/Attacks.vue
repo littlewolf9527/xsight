@@ -3,17 +3,17 @@
     <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 20px;">
       <div>
         <h2 style="font-size: 22px;">{{ $t('attacks.title') }}</h2>
-        <span style="font-size: 13px; color: var(--xs-text-secondary);">Detection events and incident history</span>
+        <span style="font-size: 13px; color: var(--xs-text-secondary);">{{ $t('attacks.subtitle') }}</span>
       </div>
     </div>
 
-    <el-tabs v-model="tab" @tab-change="load">
+    <el-tabs v-model="tab" @tab-change="onTabChange">
       <el-tab-pane :label="$t('attacks.active')" name="active" />
       <el-tab-pane :label="$t('attacks.all')" name="all" />
     </el-tabs>
 
     <div v-if="tab === 'active' && activeCount > attacks.length" style="margin-bottom: 12px; font-size: 12px; color: var(--xs-text-secondary); font-weight: 500;">
-      Showing top {{ attacks.length }} by peak PPS · {{ activeCount.toLocaleString() }} total active
+      {{ $t('attacks.showingTop', { count: attacks.length }) }} · {{ activeCount.toLocaleString() }} {{ $t('attacks.totalActive') }}
     </div>
 
     <div style="background: var(--xs-card-bg); border: 1px solid var(--xs-card-border); border-radius: var(--xs-radius-lg); box-shadow: var(--xs-shadow); overflow: hidden;">
@@ -22,14 +22,14 @@
         <el-table-column prop="id" label="ID" width="60" />
         <el-table-column prop="dst_ip" :label="$t('attacks.dstIp')" width="160">
           <template #default="{ row }">
-            <span v-if="row.dst_ip === '0.0.0.0/0'" style="font-size: 11px; font-weight: 600; color: var(--xs-warning); background: rgba(245,158,11,0.1); padding: 2px 6px; border-radius: 3px;">GLOBAL</span>
+            <span v-if="row.dst_ip === '0.0.0.0/0'" style="font-size: 11px; font-weight: 600; color: var(--xs-warning); background: rgba(245,158,11,0.1); padding: 2px 6px; border-radius: 3px;">{{ $t('attacks.global') }}</span>
             <span v-else style="font-family: 'SF Mono', monospace; font-size: 12px;">{{ row.dst_ip }}</span>
           </template>
         </el-table-column>
         <el-table-column :label="$t('attacks.direction')" width="100">
           <template #default="{ row }">
             <span :style="{ fontSize: '11px', fontWeight: 600, color: row.direction === 'sends' ? 'var(--xs-warning)' : 'var(--xs-accent)' }">
-              {{ row.direction === 'sends' ? '↑ OUT' : '↓ IN' }}
+              {{ row.direction === 'sends' ? $t('attacks.outbound') : $t('attacks.inbound') }}
             </span>
           </template>
         </el-table-column>
@@ -69,7 +69,7 @@
         <el-table-column prop="started_at" :label="$t('attacks.startedAt')" width="170">
           <template #default="{ row }">{{ formatTime(row.started_at) }}</template>
         </el-table-column>
-        <el-table-column prop="ended_at" :label="$t('attacks.endedAt')" width="170">
+        <el-table-column prop="ended_at" :label="$t('attacks.endedAt')" min-width="170">
           <template #default="{ row }">{{ row.ended_at ? formatTime(row.ended_at) : '—' }}</template>
         </el-table-column>
         <el-table-column v-if="tab === 'active'" :label="$t('attacks.timer')" width="120">
@@ -95,13 +95,17 @@
 
     <el-pagination v-if="tab === 'all'" style="margin-top: 16px;" layout="prev, pager, next, total"
       :total="totalCount" :page-size="50" @current-change="p => { offset = (p-1)*50; load() }" />
+
   </div>
 </template>
 
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api, { getAttacks, getActiveAttacks } from '../api'
+
+const { t } = useI18n()
 
 const tab = ref('active')
 const attacks = ref([])
@@ -111,10 +115,9 @@ const offset = ref(0)
 const timers = ref({})
 
 function formatTime(t) { return t ? new Date(t).toLocaleString() : '-' }
-
 let loading = false
 async function load() {
-  if (loading) return // in-flight guard
+  if (loading) return
   loading = true
   try {
     if (tab.value === 'active') {
@@ -122,7 +125,7 @@ async function load() {
       attacks.value = res.attacks || []
       activeCount.value = res.active_count || 0
       timers.value = res.timers || {}
-    } else {
+    } else if (tab.value === 'all') {
       const res = await getAttacks({ limit: 50, offset: offset.value })
       attacks.value = res.attacks || []
       totalCount.value = res.total || 0
@@ -130,6 +133,9 @@ async function load() {
   } catch (e) { console.error(e) }
   finally { loading = false }
 }
+
+function onTabChange() { load() }
+
 async function handleExpire(row) {
   try {
     await ElMessageBox.confirm(`Expire attack #${row.id} (${row.dst_ip})?`, 'Confirm', { type: 'warning' })

@@ -42,6 +42,7 @@ func executeXDrop(
 	triggerPhase string,
 	attackDBID int,
 	fa *FlowAnalysis,
+	engine *Engine, // nil-safe: if non-nil, used to schedule per-artifact cancelable delays
 ) (*store.ActionExecutionLog, error) {
 	xdropAction := action.XDropAction
 	if xdropAction == "" {
@@ -183,6 +184,32 @@ func executeXDrop(
 				continue // no rules for this connector
 			}
 
+			// Per-artifact manual_override suppression: skip rules that were force-removed
+			overrideLogs, _ := s.ActionExecLog().ListByAttack(ctx, attackDBID)
+			overrideSet := make(map[string]bool) // "connID:ruleID" → true
+			for _, ol := range overrideLogs {
+				if ol.TriggerPhase == "manual_override" && ol.Status == "success" && ol.ExternalRuleID != "" {
+					cid := 0
+					if ol.ConnectorID != nil {
+						cid = *ol.ConnectorID
+					}
+					overrideSet[fmt.Sprintf("%d:%s", cid, ol.ExternalRuleID)] = true
+				}
+			}
+			var filteredRules []store.RuleWithAction
+			for _, ra := range rulesWithActions {
+				key := fmt.Sprintf("%d:%s", conn.ID, ra.RuleID)
+				if overrideSet[key] {
+					log.Printf("action: xdrop unblock skipping rule %s (manual override, attack=%d)", ra.RuleID, attackDBID)
+					continue
+				}
+				filteredRules = append(filteredRules, ra)
+			}
+			rulesWithActions = filteredRules
+			if len(rulesWithActions) == 0 {
+				continue // all rules on this connector were force-removed
+			}
+
 			// Build action ID → delay map by looking up the originating actions
 			actionDelays := make(map[int]int) // action_id → unblock_delay_minutes
 			for _, ra := range rulesWithActions {
@@ -237,12 +264,43 @@ func executeXDrop(
 				}
 			}
 
-			// Schedule delayed rule deletions
+			// Schedule delayed rule deletions — write "scheduled" log entries for Mitigations UI
 			for _, dr := range delayedRules {
+				scheduledFor := time.Now().Add(dr.delay)
+				schedLog := &store.ActionExecutionLog{
+					AttackID:       attackDBID,
+					ActionID:       action.ID,
+					ActionType:     "xdrop",
+					TriggerPhase:   triggerPhase,
+					ResponseName:   responseName,
+					ConnectorName:  conn.Name,
+					ConnectorID:    &connID,
+					ExternalRuleID: dr.ruleID,
+					Status:         "scheduled",
+					ErrorMessage:   fmt.Sprintf("delayed unblock in %v", dr.delay),
+					ScheduledFor:   &scheduledFor,
+					ExecutedAt:     time.Now(),
+				}
+				if _, err := s.ActionExecLog().Create(ctx, schedLog); err != nil {
+					log.Printf("action: create scheduled log for rule %s: %v", dr.ruleID, err)
+				}
 				log.Printf("action: scheduling delayed unblock rule %s in %v (attack=%d connector=%d)",
 					dr.ruleID, dr.delay, attackDBID, conn.ID)
-				go func(ruleID string, d time.Duration, connCopy store.XDropConnector) {
-					time.Sleep(d)
+				go func(ruleID string, d time.Duration, connCopy store.XDropConnector, cID int) {
+					// Per-artifact cancelable delay via Engine
+					if engine != nil {
+						cancelCtx := engine.ScheduleDelay(attackDBID, action.ID, cID, ruleID)
+						select {
+						case <-time.After(d):
+							// Timer expired — proceed with deletion
+						case <-cancelCtx.Done():
+							log.Printf("action: delayed unblock rule %s cancelled (re-breach) attack=%d", ruleID, attackDBID)
+							return
+						}
+						engine.CompleteDelay(attackDBID, action.ID, cID, ruleID)
+					} else {
+						time.Sleep(d) // legacy fallback
+					}
 					delCtx, delCancel := context.WithTimeout(context.Background(), 30*time.Second)
 					defer delCancel()
 					delURL := connCopy.APIURL + "/rules/" + ruleID
@@ -264,7 +322,7 @@ func executeXDrop(
 					}
 					resp.Body.Close()
 					log.Printf("action: delayed unblock rule %s completed (HTTP %d, attack=%d)", ruleID, resp.StatusCode, attackDBID)
-				}(dr.ruleID, dr.delay, conn)
+				}(dr.ruleID, dr.delay, conn, connID)
 			}
 
 			totalRules := len(immediateRules) + len(delayedRules)

@@ -49,8 +49,8 @@ func (r *templateRepo) Get(ctx context.Context, id int) (*store.ThresholdTemplat
 func (r *templateRepo) Create(ctx context.Context, t *store.ThresholdTemplate) (int, error) {
 	var id int
 	err := r.pool.QueryRow(ctx,
-		`INSERT INTO threshold_templates (name, description) VALUES ($1, $2) RETURNING id`,
-		t.Name, t.Description).Scan(&id)
+		`INSERT INTO threshold_templates (name, description, response_id) VALUES ($1, $2, $3) RETURNING id`,
+		t.Name, t.Description, t.ResponseID).Scan(&id)
 	return id, err
 }
 

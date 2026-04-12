@@ -142,9 +142,9 @@
         <el-form-item :label="$t('responses.actionType')">
           <el-select v-model="actionForm.action_type" @change="onActionTypeChange" style="width: 100%;">
             <el-option label="Webhook" value="webhook" />
-            <el-option label="xDrop" value="xdrop" />
+            <el-option v-if="actionEditorPhase !== 'on_expired'" label="xDrop" value="xdrop" />
             <el-option label="Shell" value="shell" />
-            <el-option label="BGP" value="bgp" />
+            <el-option v-if="actionEditorPhase !== 'on_expired'" label="BGP" value="bgp" />
           </el-select>
         </el-form-item>
         <!-- Connector selector: for webhook/shell/bgp (xDrop uses target nodes instead) -->
@@ -220,10 +220,16 @@
           <el-input v-model="actionForm.shell_extra_args" :placeholder="$t('responses.shellExtraArgsPlaceholder')" />
         </el-form-item>
 
-        <!-- Unblock delay: for on_detected xdrop filter/rate_limit actions (how long to keep the rule after attack expires) -->
+        <!-- Unblock delay: for on_detected xdrop filter/rate_limit actions -->
         <el-form-item v-if="actionForm.action_type === 'xdrop' && actionEditorPhase === 'on_detected' && (actionForm.xdrop_action === 'filter_l4' || actionForm.xdrop_action === 'rate_limit')" :label="$t('responses.unblockDelay')">
           <el-input-number v-model="actionForm.unblock_delay_minutes" :min="0" :max="1440" :step="5" />
           <div style="color: #909399; font-size: 12px; margin-top: 4px;">{{ $t('responses.unblockDelayHint') }}</div>
+        </el-form-item>
+
+        <!-- Withdraw delay: for on_detected bgp actions -->
+        <el-form-item v-if="actionForm.action_type === 'bgp' && actionEditorPhase === 'on_detected'" :label="$t('responses.withdrawDelay')">
+          <el-input-number v-model="actionForm.bgp_withdraw_delay_minutes" :min="0" :max="1440" :step="5" />
+          <div style="color: #909399; font-size: 12px; margin-top: 4px;">{{ $t('responses.withdrawDelayHint') }}</div>
         </el-form-item>
 
         <el-form-item :label="$t('common.enabled')">
@@ -315,7 +321,7 @@ function sortActions(actions) {
   })
 }
 const detectedActions = computed(() => sortActions(responseActions.value.filter(a => a.trigger_phase === 'on_detected')))
-const expiredActions = computed(() => sortActions(responseActions.value.filter(a => a.trigger_phase === 'on_expired')))
+const expiredActions = computed(() => sortActions(responseActions.value.filter(a => a.trigger_phase === 'on_expired' && !a.auto_generated)))
 
 // Action editor
 const showActionEditor = ref(false)
@@ -335,6 +341,7 @@ const actionForm = reactive({
   target_node_ids: [],
   shell_extra_args: '',
   bgp_route_map: '',
+  bgp_withdraw_delay_minutes: 0,
   unblock_delay_minutes: 0,
   enabled: true,
   preconditions: [],
@@ -429,6 +436,7 @@ function resetActionForm() {
     xdrop_rate_limit: 100000,
     target_node_ids: [],
     shell_extra_args: '',
+    bgp_withdraw_delay_minutes: 0,
     unblock_delay_minutes: 0,
     enabled: true,
   })
@@ -467,6 +475,7 @@ async function openEditAction(action) {
     target_node_ids: action.target_node_ids || [],
     shell_extra_args: action.shell_extra_args || '',
     bgp_route_map: action.bgp_route_map || '',
+    bgp_withdraw_delay_minutes: action.bgp_withdraw_delay_minutes || 0,
     unblock_delay_minutes: action.unblock_delay_minutes || 0,
     enabled: action.enabled !== false,
     preconditions: preconditions.map(p => ({ attribute: p.attribute, operator: p.operator, value: p.value })),
