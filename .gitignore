@@ -43,8 +43,8 @@ secrets*
 *.db-journal
 data/
 
-# Docs (internal, may contain credentials)
-docs/
+# Docs (public documentation is tracked in docs/)
+# Internal docs excluded below
 
 # Tools (internal test scripts, not for distribution)
 tools/
@@ -83,3 +83,6 @@ controller/internal/tests/test-result/
 remove_bg.py
 *.bak
 check-oss-ready.sh
+
+# Internal documentation (not for distribution)
+internal_docs/
