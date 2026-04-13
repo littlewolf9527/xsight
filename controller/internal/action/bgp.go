@@ -227,13 +227,50 @@ func bgpWithdraw(ctx context.Context, s store.Store, conn *store.BGPConnector, a
 			conn.BGPASN, waf, prefix, routeMap)
 
 		out, err := runVtysh(ctx, conn.VtyshPath, cmd)
+		cid := conn.ID
 		if err != nil {
-			errors = append(errors, fmt.Sprintf("%s: %v (%s)", logEntry.ExternalRuleID, err, out))
+			outStr := strings.TrimSpace(out)
+			if strings.Contains(outStr, "Can't find") || strings.Contains(outStr, "No such") || strings.Contains(outStr, "does not exist") {
+				// Route already gone — treat as idempotent success
+				withdrawn = append(withdrawn, logEntry.ExternalRuleID)
+				log.Printf("action: bgp withdraw %s already gone (idempotent success, attack=%d)", logEntry.ExternalRuleID, attackDBID)
+				routeLog := &store.ActionExecutionLog{
+					AttackID:       attackDBID,
+					ActionID:       act.ID,
+					ActionType:     "bgp",
+					ConnectorName:  conn.Name,
+					ConnectorID:    &cid,
+					TriggerPhase:   triggerPhase,
+					ExternalRuleID: logEntry.ExternalRuleID,
+					Status:         "success",
+					ErrorMessage:   "idempotent: route already withdrawn",
+					ExecutedAt:     time.Now(),
+				}
+				if _, err2 := s.ActionExecLog().Create(ctx, routeLog); err2 != nil {
+					log.Printf("action: create per-route withdraw log: %v", err2)
+				}
+			} else {
+				// Real failure — write per-route failed log with full business key
+				errors = append(errors, fmt.Sprintf("%s: %v (%s)", logEntry.ExternalRuleID, err, out))
+				failLog := &store.ActionExecutionLog{
+					AttackID:       attackDBID,
+					ActionID:       act.ID,
+					ActionType:     "bgp",
+					ConnectorName:  conn.Name,
+					ConnectorID:    &cid,
+					TriggerPhase:   triggerPhase,
+					ExternalRuleID: logEntry.ExternalRuleID,
+					Status:         "failed",
+					ErrorMessage:   fmt.Sprintf("%v (%s)", err, outStr),
+					ExecutedAt:     time.Now(),
+				}
+				if _, err2 := s.ActionExecLog().Create(ctx, failLog); err2 != nil {
+					log.Printf("action: create per-route failed log: %v", err2)
+				}
+			}
 		} else {
 			withdrawn = append(withdrawn, logEntry.ExternalRuleID)
 			log.Printf("action: bgp withdraw %s route-map=%s connector=%s", prefix, routeMap, conn.Name)
-			// Write per-route on_expired success log so Mitigations can match
-			cid := conn.ID
 			routeLog := &store.ActionExecutionLog{
 				AttackID:       attackDBID,
 				ActionID:       act.ID,

@@ -244,6 +244,11 @@ func executeXDrop(
 				req, err := http.NewRequestWithContext(ctx, "DELETE", delURL, nil)
 				if err != nil {
 					lastErr = fmt.Sprintf("create request: %v", err)
+					s.ActionExecLog().Create(ctx, &store.ActionExecutionLog{
+						AttackID: attackDBID, ActionID: action.ID, ActionType: "xdrop",
+						ConnectorName: conn.Name, ConnectorID: &connID, TriggerPhase: triggerPhase,
+						ExternalRuleID: ruleID, Status: "failed", ErrorMessage: lastErr, ExecutedAt: time.Now(),
+					})
 					continue
 				}
 				req.Header.Set("Content-Type", "application/json")
@@ -254,12 +259,23 @@ func executeXDrop(
 				resp, err := client.Do(req)
 				if err != nil {
 					lastErr = fmt.Sprintf("DELETE %s: %v", delURL, err)
+					s.ActionExecLog().Create(ctx, &store.ActionExecutionLog{
+						AttackID: attackDBID, ActionID: action.ID, ActionType: "xdrop",
+						ConnectorName: conn.Name, ConnectorID: &connID, TriggerPhase: triggerPhase,
+						ExternalRuleID: ruleID, Status: "failed", ErrorMessage: lastErr, ExecutedAt: time.Now(),
+					})
 					continue
 				}
 				resp.Body.Close()
-				if resp.StatusCode < 400 {
+				if resp.StatusCode < 400 || resp.StatusCode == 404 {
+					// Success or 404 (rule already gone) — treat as idempotent success
 					deleted++
-					// Write per-rule on_expired success log with external_rule_id
+					status := "success"
+					errMsg := ""
+					if resp.StatusCode == 404 {
+						errMsg = "idempotent: rule already deleted"
+						log.Printf("action: xdrop unblock rule %s already gone (404, attack=%d)", ruleID, attackDBID)
+					}
 					ruleLog := &store.ActionExecutionLog{
 						AttackID:       attackDBID,
 						ActionID:       action.ID,
@@ -268,7 +284,8 @@ func executeXDrop(
 						ConnectorID:    &connID,
 						TriggerPhase:   triggerPhase,
 						ExternalRuleID: ruleID,
-						Status:         "success",
+						Status:         status,
+						ErrorMessage:   errMsg,
 						ExecutedAt:     time.Now(),
 					}
 					if _, err := s.ActionExecLog().Create(ctx, ruleLog); err != nil {
@@ -276,6 +293,22 @@ func executeXDrop(
 					}
 				} else {
 					lastErr = fmt.Sprintf("DELETE %s: HTTP %d", delURL, resp.StatusCode)
+					// Write per-rule failed log with full business key
+					failLog := &store.ActionExecutionLog{
+						AttackID:       attackDBID,
+						ActionID:       action.ID,
+						ActionType:     "xdrop",
+						ConnectorName:  conn.Name,
+						ConnectorID:    &connID,
+						TriggerPhase:   triggerPhase,
+						ExternalRuleID: ruleID,
+						Status:         "failed",
+						ErrorMessage:   fmt.Sprintf("HTTP %d", resp.StatusCode),
+						ExecutedAt:     time.Now(),
+					}
+					if _, err := s.ActionExecLog().Create(ctx, failLog); err != nil {
+						log.Printf("action: create per-rule failed log: %v", err)
+					}
 				}
 			}
 
@@ -322,6 +355,13 @@ func executeXDrop(
 					req, err := http.NewRequestWithContext(delCtx, "DELETE", delURL, nil)
 					if err != nil {
 						log.Printf("action: delayed unblock rule %s failed: %v", ruleID, err)
+						errCtx, ec := context.WithTimeout(context.Background(), 5*time.Second)
+						s.ActionExecLog().Create(errCtx, &store.ActionExecutionLog{
+							AttackID: attackDBID, ActionID: action.ID, ActionType: "xdrop",
+							ConnectorName: connCopy.Name, ConnectorID: &cID, TriggerPhase: triggerPhase,
+							ExternalRuleID: ruleID, Status: "failed", ErrorMessage: fmt.Sprintf("create request: %v", err), ExecutedAt: time.Now(),
+						})
+						ec()
 						return
 					}
 					req.Header.Set("Content-Type", "application/json")
@@ -333,12 +373,26 @@ func executeXDrop(
 					resp, err := cl.Do(req)
 					if err != nil {
 						log.Printf("action: delayed unblock rule %s failed: %v", ruleID, err)
+						errCtx2, ec2 := context.WithTimeout(context.Background(), 5*time.Second)
+						s.ActionExecLog().Create(errCtx2, &store.ActionExecutionLog{
+							AttackID: attackDBID, ActionID: action.ID, ActionType: "xdrop",
+							ConnectorName: connCopy.Name, ConnectorID: &cID, TriggerPhase: triggerPhase,
+							ExternalRuleID: ruleID, Status: "failed", ErrorMessage: fmt.Sprintf("DELETE: %v", err), ExecutedAt: time.Now(),
+						})
+						ec2()
 						return
 					}
 					resp.Body.Close()
 					log.Printf("action: delayed unblock rule %s completed (HTTP %d, attack=%d)", ruleID, resp.StatusCode, attackDBID)
-					// Write per-rule on_expired success log
-					if resp.StatusCode < 400 {
+					if resp.StatusCode < 400 || resp.StatusCode == 404 {
+						// Success or 404 (already gone) — idempotent success
+						logStatus := "success"
+						logErr := ""
+						if resp.StatusCode == 404 {
+							logStatus = "success"
+							logErr = "idempotent: rule already deleted"
+							log.Printf("action: delayed unblock rule %s already gone (404, attack=%d)", ruleID, attackDBID)
+						}
 						ruleLog := &store.ActionExecutionLog{
 							AttackID:       attackDBID,
 							ActionID:       action.ID,
@@ -347,7 +401,8 @@ func executeXDrop(
 							ConnectorID:    &cID,
 							TriggerPhase:   triggerPhase,
 							ExternalRuleID: ruleID,
-							Status:         "success",
+							Status:         logStatus,
+							ErrorMessage:   logErr,
 							ExecutedAt:     time.Now(),
 						}
 						logCtx, lc := context.WithTimeout(context.Background(), 5*time.Second)
@@ -355,6 +410,25 @@ func executeXDrop(
 							log.Printf("action: create per-rule delayed unblock log: %v", err)
 						}
 						lc()
+					} else {
+						// Real failure — write per-rule failed log
+						failLog := &store.ActionExecutionLog{
+							AttackID:       attackDBID,
+							ActionID:       action.ID,
+							ActionType:     "xdrop",
+							ConnectorName:  connCopy.Name,
+							ConnectorID:    &cID,
+							TriggerPhase:   triggerPhase,
+							ExternalRuleID: ruleID,
+							Status:         "failed",
+							ErrorMessage:   fmt.Sprintf("HTTP %d", resp.StatusCode),
+							ExecutedAt:     time.Now(),
+						}
+						logCtx2, lc2 := context.WithTimeout(context.Background(), 5*time.Second)
+						if _, err := s.ActionExecLog().Create(logCtx2, failLog); err != nil {
+							log.Printf("action: create per-rule delayed failed log: %v", err)
+						}
+						lc2()
 					}
 				}(dr.ruleID, dr.delay, conn, connID)
 			}
