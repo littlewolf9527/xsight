@@ -413,11 +413,7 @@ func evaluateStructuredPrecondition(p store.ActionPrecondition, attack *store.At
 	case "node":
 		return matchStringInSlice(p.Operator, p.Value, attack.NodeSources)
 	case "domain":
-		domain := "internal_ip"
-		if strings.Contains(attack.DstIP, "/") {
-			domain = "subnet"
-		}
-		return matchStringOp(p.Operator, p.Value, domain)
+		return matchStringOp(p.Operator, p.Value, attackDomain(attack.DstIP))
 	case "dominant_src_port":
 		fa := getFA()
 		if fa == nil {
@@ -457,6 +453,31 @@ func evaluateStructuredPrecondition(p store.ActionPrecondition, attack *store.At
 		log.Printf("action: unknown precondition attribute %q, blocking (fail closed)", p.Attribute)
 		return false
 	}
+}
+
+// attackDomain returns "internal_ip" for single-IP attacks (/32 IPv4, /128 IPv6, or bare IP)
+// and "subnet" for CIDR attacks. Handles both in-memory format ("10.0.0.1") and
+// DB-read format ("10.0.0.1/32") from postgres inet::TEXT.
+func attackDomain(dstIP string) string {
+	if idx := strings.IndexByte(dstIP, '/'); idx >= 0 {
+		pl, err := strconv.ParseInt(dstIP[idx+1:], 10, 64)
+		if err != nil {
+			return "internal_ip"
+		}
+		host := dstIP[:idx]
+		if strings.Contains(host, ":") {
+			// IPv6: single IP = /128
+			if pl != 128 {
+				return "subnet"
+			}
+		} else {
+			// IPv4: single IP = /32
+			if pl != 32 {
+				return "subnet"
+			}
+		}
+	}
+	return "internal_ip"
 }
 
 // matchStringOp handles eq/neq/in/not_in operators for string values.
@@ -567,12 +588,7 @@ func checkCondition(field, expr string, attack *store.Attack, prefixStr string) 
 	case "attack_type":
 		return attack.AttackType == expr
 	case "domain":
-		// domain = internal_ip | subnet (not direction)
-		// Infer from attack: if dst_ip contains "/", it's subnet-level (carpet bomb)
-		if strings.Contains(attack.DstIP, "/") {
-			return expr == "subnet"
-		}
-		return expr == "internal_ip"
+		return attackDomain(attack.DstIP) == expr
 	case "prefix_len":
 		return comparePrefixLen(expr, prefixStr)
 	case "duration":

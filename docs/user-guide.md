@@ -61,8 +61,11 @@ auth:
   api_key: "YOUR_API_KEY"
 
 action_engine:
-  mode: "auto"         # "observe" (log only) | "auto" (execute actions)
+  mode: "auto"         # IMPORTANT: default is "observe" (detect only, NO actions executed)
+                       # Set to "auto" to enable xDrop blocking and BGP announcements
 ```
+
+> **Warning:** If `action_engine.mode` is omitted or set to `"observe"`, xDrop and BGP response actions will NOT execute — attacks are detected and logged but no mitigation is performed. You must explicitly set `mode: "auto"` to enable automated response.
 
 See `config.example.yaml` for the full parameter reference.
 

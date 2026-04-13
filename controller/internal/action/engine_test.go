@@ -235,6 +235,64 @@ func TestStructuredPrecondition_Domain(t *testing.T) {
 	if evaluateStructuredPrecondition(p, attack, "", noFA) {
 		t.Error("domain eq internal_ip should NOT match CIDR")
 	}
+	// /32 suffix from postgres inet::TEXT — must still be internal_ip (bug fix: #492)
+	attack.DstIP = "198.51.100.5/32"
+	p.Value = "internal_ip"
+	if !evaluateStructuredPrecondition(p, attack, "", noFA) {
+		t.Error("domain eq internal_ip should match /32 (single IP from DB)")
+	}
+	p.Value = "subnet"
+	if evaluateStructuredPrecondition(p, attack, "", noFA) {
+		t.Error("domain eq subnet should NOT match /32")
+	}
+	// /128 IPv6 single IP
+	attack.DstIP = "2001:db8::1/128"
+	p.Value = "internal_ip"
+	if !evaluateStructuredPrecondition(p, attack, "", noFA) {
+		t.Error("domain eq internal_ip should match /128 (IPv6 single IP)")
+	}
+}
+
+func TestAttackDomain(t *testing.T) {
+	tests := []struct {
+		dstIP string
+		want  string
+	}{
+		{"10.0.0.1", "internal_ip"},            // bare IP (in-memory)
+		{"198.51.100.5/32", "internal_ip"},      // postgres inet::TEXT IPv4
+		{"2001:db8::1/128", "internal_ip"},      // postgres inet::TEXT IPv6
+		{"10.0.0.0/24", "subnet"},               // subnet attack
+		{"2001:db8::/32", "subnet"},             // IPv6 subnet
+		{"192.168.0.0/16", "subnet"},            // large CIDR
+	}
+	for _, tt := range tests {
+		if got := attackDomain(tt.dstIP); got != tt.want {
+			t.Errorf("attackDomain(%q) = %q, want %q", tt.dstIP, got, tt.want)
+		}
+	}
+}
+
+func TestLegacyCheckCondition_Domain(t *testing.T) {
+	// Legacy path: checkCondition("domain", expr, attack, prefix)
+	// Must handle /32 from DB the same way as structured precondition
+	attack := &store.Attack{DstIP: "198.51.100.5/32"}
+	if !checkCondition("domain", "internal_ip", attack, "") {
+		t.Error("legacy: /32 should be internal_ip")
+	}
+	if checkCondition("domain", "subnet", attack, "") {
+		t.Error("legacy: /32 should NOT be subnet")
+	}
+	attack.DstIP = "2001:db8::1/128"
+	if !checkCondition("domain", "internal_ip", attack, "") {
+		t.Error("legacy: /128 should be internal_ip")
+	}
+	attack.DstIP = "10.0.0.0/24"
+	if !checkCondition("domain", "subnet", attack, "") {
+		t.Error("legacy: /24 should be subnet")
+	}
+	if checkCondition("domain", "internal_ip", attack, "") {
+		t.Error("legacy: /24 should NOT be internal_ip")
+	}
 }
 
 func TestStructuredPrecondition_NodeIn(t *testing.T) {
