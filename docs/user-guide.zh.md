@@ -61,11 +61,12 @@ auth:
   api_key: "YOUR_API_KEY"
 
 action_engine:
-  mode: "auto"         # 重要：默认为 "observe"（仅检测，不执行任何动作）
-                       # 设为 "auto" 才会启用 xDrop 封锁和 BGP 路由宣告
+  mode: "auto"         # 重要：默认为 "observe" — xDrop 动作会被跳过
+                       # 设为 "auto" 才会启用 xDrop 封锁
+                       # （BGP、Webhook、Shell 动作不受 mode 控制，始终执行）
 ```
 
-> **注意：** 如果 `action_engine.mode` 未配置或设为 `"observe"`，xDrop 和 BGP 响应动作将不会执行——攻击会被检测和记录，但不会执行任何缓解措施。必须显式设置 `mode: "auto"` 才能启用自动响应。
+> **注意：** 如果 `action_engine.mode` 未配置或设为 `"observe"`，**xDrop 响应动作将不会执行**——引擎记录攻击但跳过所有 xDrop 动作。BGP、Webhook、Shell 动作不受此配置影响，仍然正常执行。必须显式设置 `mode: "auto"` 才能启用自动 xDrop 封锁。
 
 完整参数说明请参阅 `config.example.yaml`。
 

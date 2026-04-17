@@ -172,7 +172,7 @@ const showSources = ref(false)
 const showAddSource = ref(false)
 const editingSourceId = ref(null)
 
-const listenerForm = reactive({ listen_address: ':2055', protocol_mode: 'auto', description: '' })
+const listenerForm = reactive({ listen_address: ':2055', protocol_mode: 'auto', description: '', enabled: true })
 
 // Match source row to its runtime status from Node health report
 function getSourceStatus(row) {
@@ -206,7 +206,7 @@ function formatUptime(seconds) {
   if (m > 0) return `${m}m`
   return `${seconds}s`
 }
-const sourceForm = reactive({ name: '', device_ip: '', sample_mode: 'auto', sample_rate: 1000, description: '' })
+const sourceForm = reactive({ name: '', device_ip: '', sample_mode: 'auto', sample_rate: 1000, description: '', enabled: true })
 
 async function loadNodeStatus() {
   try {
@@ -246,6 +246,7 @@ function openEditListener(row) {
     listen_address: row.listen_address,
     protocol_mode: row.protocol_mode,
     description: row.description || '',
+    enabled: row.enabled,
   })
   showAddListener.value = true
 }
@@ -313,6 +314,7 @@ function openEditSource(row) {
     sample_mode: row.sample_mode,
     sample_rate: row.sample_rate || 1000,
     description: row.description || '',
+    enabled: row.enabled,
   })
   showAddSource.value = true
 }

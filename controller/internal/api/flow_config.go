@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -93,10 +95,17 @@ func updateFlowListener(deps Dependencies) gin.HandlerFunc {
 			errResponse(c, http.StatusNotFound, "flow listener not found")
 			return
 		}
+		body, _ := io.ReadAll(c.Request.Body)
 		var req store.FlowListener
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := json.Unmarshal(body, &req); err != nil {
 			errResponse(c, http.StatusBadRequest, err.Error())
 			return
+		}
+		// Preserve fields not present in request body (defense against partial updates)
+		var raw map[string]json.RawMessage
+		_ = json.Unmarshal(body, &raw)
+		if _, ok := raw["enabled"]; !ok {
+			req.Enabled = old.Enabled
 		}
 		req.ID = id
 		req.NodeID = old.NodeID // node_id is immutable
@@ -194,10 +203,17 @@ func updateFlowSource(deps Dependencies) gin.HandlerFunc {
 			errResponse(c, http.StatusNotFound, "flow source not found")
 			return
 		}
+		body, _ := io.ReadAll(c.Request.Body)
 		var req store.FlowSource
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := json.Unmarshal(body, &req); err != nil {
 			errResponse(c, http.StatusBadRequest, err.Error())
 			return
+		}
+		// Preserve fields not present in request body (defense against partial updates)
+		var raw map[string]json.RawMessage
+		_ = json.Unmarshal(body, &raw)
+		if _, ok := raw["enabled"]; !ok {
+			req.Enabled = old.Enabled
 		}
 		req.ID = id
 		req.ListenerID = old.ListenerID // listener_id is immutable

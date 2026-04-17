@@ -61,11 +61,12 @@ auth:
   api_key: "YOUR_API_KEY"
 
 action_engine:
-  mode: "auto"         # IMPORTANT: default is "observe" (detect only, NO actions executed)
-                       # Set to "auto" to enable xDrop blocking and BGP announcements
+  mode: "auto"         # IMPORTANT: default is "observe" — xDrop actions will be SKIPPED
+                       # Set to "auto" to enable xDrop blocking
+                       # (BGP, webhook, shell actions are NOT gated by mode — they always run)
 ```
 
-> **Warning:** If `action_engine.mode` is omitted or set to `"observe"`, xDrop and BGP response actions will NOT execute — attacks are detected and logged but no mitigation is performed. You must explicitly set `mode: "auto"` to enable automated response.
+> **Warning:** If `action_engine.mode` is omitted or set to `"observe"`, **xDrop response actions will NOT execute** — the engine logs the attack and skips all xDrop actions. BGP, webhook, and shell actions are not gated by this setting and continue to execute normally. Set `mode: "auto"` to enable automated xDrop blocking.
 
 See `config.example.yaml` for the full parameter reference.
 
