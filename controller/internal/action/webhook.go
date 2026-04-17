@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -46,7 +47,9 @@ func postWebhook(ctx context.Context, url string, headersJSON json.RawMessage, a
 func postWebhookWithFA(ctx context.Context, url string, headersJSON json.RawMessage, attack *store.Attack, eventType string, fa *FlowAnalysis) (string, error) {
 	var headers map[string]string
 	if len(headersJSON) > 0 {
-		_ = json.Unmarshal(headersJSON, &headers)
+		if err := json.Unmarshal(headersJSON, &headers); err != nil {
+			log.Printf("webhook: malformed headers JSON for %s: %v — sending without custom headers", url, err)
+		}
 	}
 	return postWebhookWithConfig(ctx, url, "POST", headers, attack, eventType, fa)
 }

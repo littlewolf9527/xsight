@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -83,20 +84,28 @@ func analyzeFlows(ctx context.Context, s store.Store, attack *store.Attack) *Flo
 		a.TopSrcIPs = append(a.TopSrcIPs, v.Key)
 	}
 	for _, v := range topSrcPorts {
-		p, _ := strconv.Atoi(v.Key)
+		p, err := strconv.Atoi(v.Key)
+		if err != nil {
+			log.Printf("flow_analysis: skip non-numeric src_port %q: %v", v.Key, err)
+			continue
+		}
 		a.TopSrcPorts = append(a.TopSrcPorts, p)
 	}
 	for _, v := range topDstPorts {
-		p, _ := strconv.Atoi(v.Key)
+		p, err := strconv.Atoi(v.Key)
+		if err != nil {
+			log.Printf("flow_analysis: skip non-numeric dst_port %q: %v", v.Key, err)
+			continue
+		}
 		a.TopDstPorts = append(a.TopDstPorts, p)
 	}
 
-	if len(topSrcPorts) > 0 && totalPackets > 0 {
-		a.DominantSrcPort, _ = strconv.Atoi(topSrcPorts[0].Key)
+	if len(a.TopSrcPorts) > 0 && totalPackets > 0 {
+		a.DominantSrcPort = a.TopSrcPorts[0]
 		a.DominantSrcPortPct = int(topSrcPorts[0].Count * 100 / totalPackets)
 	}
-	if len(topDstPorts) > 0 && totalPackets > 0 {
-		a.DominantDstPort, _ = strconv.Atoi(topDstPorts[0].Key)
+	if len(a.TopDstPorts) > 0 && totalPackets > 0 {
+		a.DominantDstPort = a.TopDstPorts[0]
 		a.DominantDstPortPct = int(topDstPorts[0].Count * 100 / totalPackets)
 	}
 

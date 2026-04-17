@@ -351,7 +351,7 @@ func executeXDrop(
 					}
 					delCtx, delCancel := context.WithTimeout(context.Background(), 30*time.Second)
 					defer delCancel()
-					delURL := connCopy.APIURL + "/rules/" + ruleID
+					delURL := strings.TrimRight(connCopy.APIURL, "/") + "/rules/" + ruleID
 					req, err := http.NewRequestWithContext(delCtx, "DELETE", delURL, nil)
 					if err != nil {
 						log.Printf("action: delayed unblock rule %s failed: %v", ruleID, err)
