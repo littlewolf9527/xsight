@@ -236,6 +236,139 @@ type ActionExecutionLog struct {
 	DurationMs     int        `json:"duration_ms"`
 	ExecutedAt     time.Time  `json:"executed_at"`
 	ScheduledFor   *time.Time `json:"scheduled_for,omitempty"` // v1.1: when delayed action will fire
+	Detail         string     `json:"detail,omitempty"`        // v1.2: human-readable annotation (e.g. BGP attach/detach semantics)
+	SkipReason     string     `json:"skip_reason,omitempty"`   // v1.2: structured cause when status='skipped'
+}
+
+// v1.2 PR-5: BGPAnnouncement is the refcount-managed lifecycle record for a
+// single BGP route (prefix + route_map + connector). Replaces per-attack BGP
+// withdraw with shared announcement: multiple attacks can attach to the same
+// announcement, and only the last attack detaching triggers vtysh withdraw.
+type BGPAnnouncement struct {
+	ID             int        `json:"id"`
+	Prefix         string     `json:"prefix"`
+	RouteMap       string     `json:"route_map"`
+	ConnectorID    int        `json:"connector_id"`
+	FirstActionID  *int       `json:"first_action_id,omitempty"`
+	Status         string     `json:"status"`
+	Refcount       int        `json:"refcount"`
+	AnnouncedAt    time.Time  `json:"announced_at"`
+	DelayStartedAt *time.Time `json:"delay_started_at,omitempty"`
+	DelayMinutes   int        `json:"delay_minutes"`
+	WithdrawnAt    *time.Time `json:"withdrawn_at,omitempty"`
+	ErrorMessage   string     `json:"error_message,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+}
+
+// v1.2 PR-5: BGPAnnouncementAttack is an attack→announcement attachment.
+// detach_at=NULL means "still attached" (contributes to refcount and MAX(delay_minutes)).
+type BGPAnnouncementAttack struct {
+	AnnouncementID int        `json:"announcement_id"`
+	AttackID       int        `json:"attack_id"`
+	ActionID       *int       `json:"action_id,omitempty"`
+	ResponseName   string     `json:"response_name"`
+	DelayMinutes   int        `json:"delay_minutes"`
+	AttachedAt     time.Time  `json:"attached_at"`
+	DetachedAt     *time.Time `json:"detached_at,omitempty"`
+}
+
+// v1.2 PR-5: BGPAnnouncementEvent is a timeline entry for the Mitigations
+// Detail Drawer. Append-only audit of lifecycle transitions.
+type BGPAnnouncementEvent struct {
+	ID             int       `json:"id"`
+	AnnouncementID int       `json:"announcement_id"`
+	EventType      string    `json:"event_type"`
+	AttackID       *int      `json:"attack_id,omitempty"`
+	Detail         string    `json:"detail,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// v1.2 PR-5: Event type constants.
+const (
+	BGPEventAnnounced       = "announced"
+	BGPEventAttackAttached  = "attack_attached"
+	BGPEventAttackDetached  = "attack_detached"
+	BGPEventDelayStarted    = "delay_started"
+	BGPEventDelayCancelled  = "delay_cancelled"
+	BGPEventWithdrawn       = "withdrawn"
+	BGPEventWithdrawFailed  = "withdraw_failed"
+	BGPEventAnnounceFailed  = "announce_failed"
+	BGPEventOrphanDetected  = "orphan_detected"
+	BGPEventDismissed       = "dismissed"
+	BGPEventUndismissed     = "undismissed"
+)
+
+// v1.2 PR-4: XDropActiveRule is the authoritative state for a single xDrop
+// filter rule. Replaces the v1.1 log-derivation in buildActiveActions.
+//
+// Status transitions:
+//   active      — rule created successfully, in effect on the xDrop node
+//   delayed     — on_expired queued with unblock_delay_minutes
+//   withdrawing — DELETE in flight (crash recovery landmark: on startup,
+//                 controller re-issues DELETE; 404 treated as idempotent success)
+//   withdrawn   — unblock completed; kept for audit, filtered from Mitigations
+//   failed      — create or unblock failed; surfaced in Mitigations
+//
+// Business key (attack_id, action_id, connector_id, external_rule_id)
+// matches the other v1.2 tables (manual_overrides, scheduled_actions).
+type XDropActiveRule struct {
+	ID             int        `json:"id"`
+	AttackID       int        `json:"attack_id"`
+	ActionID       int        `json:"action_id"`
+	ConnectorID    int        `json:"connector_id"`
+	ExternalRuleID string     `json:"external_rule_id"`
+	Status         string     `json:"status"`
+	DelayStartedAt *time.Time `json:"delay_started_at,omitempty"`
+	DelayMinutes   int        `json:"delay_minutes"`
+	ErrorMessage   string     `json:"error_message,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	WithdrawnAt    *time.Time `json:"withdrawn_at,omitempty"`
+}
+
+// v1.2 PR-3: ScheduledAction persists a pending delayed withdraw/unblock so
+// the controller can re-arm timers after a restart. Replaces the v1.1
+// in-memory pendingDelay map, which silently lost tasks on crash/restart.
+//
+// Status lifecycle:
+//   pending  — timer armed (in memory + DB row)
+//   executing — timer fired, action is running (DB set before side effect)
+//   completed — action finished successfully
+//   failed    — action finished with error (ErrorMessage populated)
+//   cancelled — re-breach or manual cancellation (CancelReason populated)
+//
+// announcement_id is reserved for v1.2 PR-5 (BGP Announcement Manager).
+// PR-3 always leaves it NULL and identifies tasks by the per-artifact key
+// (attack_id, action_id, connector_id, external_rule_id).
+type ScheduledAction struct {
+	ID             int        `json:"id"`
+	ActionType     string     `json:"action_type"` // xdrop_unblock | bgp_withdraw
+	AttackID       int        `json:"attack_id"`
+	ActionID       int        `json:"action_id"`
+	ConnectorID    int        `json:"connector_id"`
+	ExternalRuleID string     `json:"external_rule_id"`
+	AnnouncementID *int       `json:"announcement_id,omitempty"` // v1.2 PR-5 reserved
+	ScheduledFor   time.Time  `json:"scheduled_for"`
+	Status         string     `json:"status"`
+	CancelReason   string     `json:"cancel_reason,omitempty"`
+	ErrorMessage   string     `json:"error_message,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+}
+
+// v1.2 PR-2: ActionManualOverride records that an operator force-removed a
+// specific artifact (BGP route / xDrop rule), so the engine should not
+// auto-execute the paired on_expired action for that same artifact.
+// Business key (attack_id, action_id, connector_id, external_rule_id) is
+// enforced by a UNIQUE index — `Exists()` is O(1) via that index, replacing
+// the old linear scan of action_execution_log.
+type ActionManualOverride struct {
+	ID             int       `json:"id"`
+	AttackID       int       `json:"attack_id"`
+	ActionID       int       `json:"action_id"`
+	ConnectorID    int       `json:"connector_id"`
+	ExternalRuleID string    `json:"external_rule_id"`
+	CreatedAt      time.Time `json:"created_at"`
+	CreatedBy      string    `json:"created_by"`
 }
 
 // ActionPrecondition is a structured condition for filtering action execution.

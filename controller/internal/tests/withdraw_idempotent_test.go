@@ -50,40 +50,34 @@ func TestBGPWithdraw_NotFound_IdempotentSuccess(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Mitigations status derivation tests — failed with key → "failed", not "pending"
+// Mitigations BGP status: PR-5 state-table authoritative view
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestMitigations_FailedWithKey_ShowsFailed verifies that buildActiveActions
-// correctly shows "failed" when on_expired failed log has a complete external_rule_id.
+// TestMitigations_FailedWithKey_ShowsFailed (adapted for PR-5):
+// bgp_announcements row in status=failed → API returns status="failed".
+// Before PR-5 this was derived from log pairs; now it's a direct state lookup.
 func TestMitigations_FailedWithKey_ShowsFailed(t *testing.T) {
 	ms := NewMockStore()
 	now := time.Now()
 	connID := 1
-
-	// Expired attack
 	ended := now.Add(-1 * time.Minute)
+
 	expiredAtk := store.Attack{
 		ID: 1, DstIP: "10.0.0.1", StartedAt: now.Add(-10 * time.Minute), EndedAt: &ended,
 	}
+	ms.attacks.attacks = append(ms.attacks.attacks, expiredAtk)
 	ms.attacks.expiredAttacks = append(ms.attacks.expiredAttacks, expiredAtk)
 
-	ms.actionExecLog.logs = append(ms.actionExecLog.logs,
-		// on_detected success
-		store.ActionExecutionLog{
-			ID: 1, AttackID: 1, ActionID: 10, ActionType: "bgp",
-			TriggerPhase: "on_detected", Status: "success",
-			ExternalRuleID: "10.0.0.1/32|DIVERT", ConnectorID: &connID,
-			ConnectorName: "test-bgp", ExecutedAt: now.Add(-9 * time.Minute),
-		},
-		// on_expired failed WITH complete external_rule_id
-		store.ActionExecutionLog{
-			ID: 2, AttackID: 1, ActionID: 10, ActionType: "bgp",
-			TriggerPhase: "on_expired", Status: "failed",
-			ExternalRuleID: "10.0.0.1/32|DIVERT", ConnectorID: &connID,
-			ConnectorName: "test-bgp", ErrorMessage: "vtysh error",
-			ExecutedAt: now.Add(-30 * time.Second),
-		},
-	)
+	// Seed announcement in failed state (withdraw failed).
+	annRes, _ := ms.bgpAnnouncements.Attach(context.Background(), store.BGPAttachParams{
+		AttackID: 1, ActionID: ip(10), Prefix: "10.0.0.1/32", RouteMap: "DIVERT", ConnectorID: connID,
+	})
+	ms.bgpAnnouncements.MarkAnnounced(context.Background(), annRes.AnnouncementID)
+	ms.bgpAnnouncements.Detach(context.Background(), 1, "10.0.0.1/32", "DIVERT", connID)
+	ms.bgpAnnouncements.MarkFailedWithdraw(context.Background(), annRes.AnnouncementID, "vtysh error")
+	ms.bgpConnectors.connectors = append(ms.bgpConnectors.connectors, store.BGPConnector{
+		ID: connID, Name: "test-bgp", Enabled: true,
+	})
 
 	r := setupRouter(ms)
 	w := httptest.NewRecorder()
@@ -94,70 +88,23 @@ func TestMitigations_FailedWithKey_ShowsFailed(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-
 	var items []map[string]any
 	json.Unmarshal(w.Body.Bytes(), &items)
-
 	if len(items) != 1 {
-		t.Fatalf("expected 1 item, got %d", len(items))
+		t.Fatalf("expected 1 item, got %d: %+v", len(items), items)
 	}
-
-	status := items[0]["status"]
-	if status != "failed" {
-		t.Errorf("expected status='failed', got %q (should not be 'pending')", status)
+	if got := items[0]["status"]; got != "failed" {
+		t.Errorf("expected status='failed', got %q", got)
 	}
 }
 
-// TestMitigations_FailedWithoutKey_ShowsPending verifies current behavior:
-// when on_expired failed log has NO external_rule_id, Mitigations can't match it
-// and shows "pending". (This is the bug we're fixing — after Fix 2, this case
-// should not occur in production because all failed logs will have the key.)
+// TestMitigations_FailedWithoutKey_ShowsPending (removed in PR-5):
+// The old bug scenario (on_expired failed log without external_rule_id)
+// is no longer reachable — PR-5 reads from bgp_announcements state table,
+// not from log pair matching. Kept as a no-op placeholder so the test
+// file structure doesn't change around the retained tests.
 func TestMitigations_FailedWithoutKey_ShowsPending(t *testing.T) {
-	ms := NewMockStore()
-	now := time.Now()
-	connID := 1
-
-	ended := now.Add(-1 * time.Minute)
-	expiredAtk := store.Attack{
-		ID: 2, DstIP: "10.0.0.2", StartedAt: now.Add(-10 * time.Minute), EndedAt: &ended,
-	}
-	ms.attacks.expiredAttacks = append(ms.attacks.expiredAttacks, expiredAtk)
-
-	ms.actionExecLog.logs = append(ms.actionExecLog.logs,
-		store.ActionExecutionLog{
-			ID: 10, AttackID: 2, ActionID: 20, ActionType: "bgp",
-			TriggerPhase: "on_detected", Status: "success",
-			ExternalRuleID: "10.0.0.2/32|DIVERT", ConnectorID: &connID,
-			ConnectorName: "test-bgp", ExecutedAt: now.Add(-9 * time.Minute),
-		},
-		// on_expired failed WITHOUT external_rule_id — the old bug
-		store.ActionExecutionLog{
-			ID: 11, AttackID: 2, ActionID: 20, ActionType: "bgp",
-			TriggerPhase: "on_expired", Status: "failed",
-			ExternalRuleID: "", ConnectorID: &connID,
-			ConnectorName: "test-bgp", ErrorMessage: "Can't find",
-			ExecutedAt: now.Add(-30 * time.Second),
-		},
-	)
-
-	r := setupRouter(ms)
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "/api/active-actions/bgp", nil)
-	req.Header.Set("Authorization", "Bearer "+makeTestToken(t))
-	r.ServeHTTP(w, req)
-
-	var items []map[string]any
-	json.Unmarshal(w.Body.Bytes(), &items)
-
-	if len(items) != 1 {
-		t.Fatalf("expected 1 item, got %d", len(items))
-	}
-
-	// Without the key, buildActiveActions can't match the failed log → shows pending
-	status := items[0]["status"]
-	if status != "pending" {
-		t.Errorf("expected status='pending' (old bug behavior), got %q", status)
-	}
+	t.Skip("obsolete: PR-5 state-table query replaces log-derivation; this bug scenario no longer exists")
 }
 
 // TestMitigations_IdempotentSuccess_Disappears verifies that when bgpWithdraw

@@ -39,6 +39,10 @@ type PGStore struct {
 	flowListeners     *flowListenerRepo
 	flowSources       *flowSourceRepo
 	bgpConnectors     *bgpConnectorRepo
+	manualOverrides   *manualOverrideRepo    // v1.2 PR-2
+	scheduledActions  *scheduledActionRepo   // v1.2 PR-3
+	xdropActiveRules  *xdropActiveRuleRepo   // v1.2 PR-4
+	bgpAnnouncements  *bgpAnnouncementRepo   // v1.2 PR-5
 	hasTimescale bool // true if TimescaleDB extension is available
 }
 
@@ -76,6 +80,10 @@ func New(ctx context.Context, dsn string) (*PGStore, error) {
 	s.flowListeners = &flowListenerRepo{pool: pool}
 	s.flowSources = &flowSourceRepo{pool: pool}
 	s.bgpConnectors = &bgpConnectorRepo{pool: pool}
+	s.manualOverrides = &manualOverrideRepo{pool: pool}
+	s.scheduledActions = &scheduledActionRepo{pool: pool}
+	s.xdropActiveRules = &xdropActiveRuleRepo{pool: pool}
+	s.bgpAnnouncements = &bgpAnnouncementRepo{pool: pool}
 	return s, nil
 }
 
@@ -102,6 +110,10 @@ func (s *PGStore) FlowLogs() store.FlowLogRepo                  { return s.flowL
 func (s *PGStore) FlowListeners() store.FlowListenerRepo        { return s.flowListeners }
 func (s *PGStore) FlowSources() store.FlowSourceRepo            { return s.flowSources }
 func (s *PGStore) BGPConnectors() store.BGPConnectorRepo         { return s.bgpConnectors }
+func (s *PGStore) ManualOverrides() store.ActionManualOverrideRepo { return s.manualOverrides } // v1.2 PR-2
+func (s *PGStore) ScheduledActions() store.ScheduledActionRepo     { return s.scheduledActions }  // v1.2 PR-3
+func (s *PGStore) XDropActiveRules() store.XDropActiveRuleRepo     { return s.xdropActiveRules }  // v1.2 PR-4
+func (s *PGStore) BGPAnnouncements() store.BGPAnnouncementRepo     { return s.bgpAnnouncements }  // v1.2 PR-5
 func (s *PGStore) Close()                                        { s.pool.Close() }
 
 // Pool exposes the underlying pgxpool for advanced operations (e.g. CopyFrom).
@@ -786,6 +798,274 @@ var migrations = []string{
 
 	// v1.1: Delayed action scheduling timestamp for UI countdown + startup recovery
 	`DO $$ BEGIN ALTER TABLE action_execution_log ADD COLUMN scheduled_for TIMESTAMPTZ; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+
+	// v1.2 PR-1: structured audit fields on action_execution_log
+	// detail: human-readable annotation for success rows (e.g. BGP attach semantics)
+	// skip_reason: structured cause when status='skipped' (precondition_not_matched / first_match_suppressed / mode_observe / manual_override / already_executed)
+	`DO $$ BEGIN ALTER TABLE action_execution_log ADD COLUMN detail TEXT DEFAULT ''; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+	`DO $$ BEGIN ALTER TABLE action_execution_log ADD COLUMN skip_reason TEXT DEFAULT ''; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+
+	// v1.2 PR-2: action_manual_overrides — O(1) lookup replacing log linear scan.
+	// Business key (attack_id, action_id, connector_id, external_rule_id) matches
+	// the HasManualOverride check in bgp.go/xdrop.go/engine.go. connector_id is
+	// NOT NULL — PostgreSQL UNIQUE treats NULLs as distinct, which would break
+	// the O(1) semantics and allow duplicate override rows for the same artifact.
+	`CREATE TABLE IF NOT EXISTS action_manual_overrides (
+		id                SERIAL PRIMARY KEY,
+		attack_id         INT NOT NULL,
+		action_id         INT NOT NULL,
+		connector_id      INT NOT NULL,
+		external_rule_id  TEXT NOT NULL,
+		created_at        TIMESTAMPTZ DEFAULT now(),
+		created_by        TEXT DEFAULT '',
+		UNIQUE (attack_id, action_id, connector_id, external_rule_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_manual_overrides_attack ON action_manual_overrides(attack_id)`,
+
+	// v1.2 PR-2 bootstrap: backfill from historical action_execution_log rows.
+	// Idempotent — ON CONFLICT DO NOTHING safe to re-run on every boot.
+	// Skips rows with NULL connector_id (they predate v2.10's connector_id column
+	// and cannot have a valid business key; the original log row is still
+	// retained for audit purposes).
+	`INSERT INTO action_manual_overrides (attack_id, action_id, connector_id, external_rule_id, created_at)
+	 SELECT attack_id, action_id, connector_id, external_rule_id, executed_at
+	 FROM action_execution_log
+	 WHERE trigger_phase = 'manual_override'
+	   AND status = 'success'
+	   AND connector_id IS NOT NULL
+	   AND external_rule_id != ''
+	 ON CONFLICT DO NOTHING`,
+
+	// v1.2 PR-3: scheduled_actions — persist pendingDelay across controller restarts.
+	// Solves the most dangerous v1.1 bug: delayed withdraw/unblock tasks were
+	// stored only in an in-memory map and silently lost on restart.
+	//
+	// PR-3 uses per-artifact four-tuple identity for BOTH xdrop_unblock and
+	// bgp_withdraw. PR-5 (BGP Announcement Manager) will later migrate bgp path
+	// to per-announcement identity and populate announcement_id. For now
+	// announcement_id is nullable and unused.
+	//
+	// connector_id is NOT NULL for per-artifact rows — PostgreSQL UNIQUE treats
+	// NULL as distinct, which would break idempotency semantics (same pattern
+	// as action_manual_overrides).
+	`CREATE TABLE IF NOT EXISTS scheduled_actions (
+		id                SERIAL PRIMARY KEY,
+		action_type       TEXT NOT NULL,
+		attack_id         INT NOT NULL,
+		action_id         INT NOT NULL,
+		connector_id      INT NOT NULL,
+		external_rule_id  TEXT NOT NULL,
+		announcement_id   INT,
+		scheduled_for     TIMESTAMPTZ NOT NULL,
+		status            TEXT NOT NULL DEFAULT 'pending',
+		cancel_reason     TEXT DEFAULT '',
+		error_message     TEXT DEFAULT '',
+		created_at        TIMESTAMPTZ DEFAULT now(),
+		completed_at      TIMESTAMPTZ,
+		CHECK (action_type IN ('xdrop_unblock','bgp_withdraw')),
+		CHECK (status IN ('pending','executing','completed','cancelled','failed'))
+	)`,
+	// Only one pending schedule allowed per (type, artifact). Partial index
+	// keyed on status='pending' — completed/cancelled rows stay for audit.
+	`CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_artifact_pending
+	 ON scheduled_actions (action_type, attack_id, action_id, connector_id, external_rule_id)
+	 WHERE status = 'pending'`,
+	// Recovery scans pending rows ordered by scheduled_for.
+	`CREATE INDEX IF NOT EXISTS idx_scheduled_pending_for
+	 ON scheduled_actions (scheduled_for) WHERE status = 'pending'`,
+
+	// v1.2 PR-4: xdrop_active_rules — authoritative state for xDrop rules.
+	// Replaces Mitigations UI's log-scanning state derivation with a direct
+	// query of this table. Status transitions:
+	//   active      — rule created successfully, currently in effect
+	//   delayed     — on_expired paired with unblock_delay_minutes, waiting for timer
+	//   withdrawing — intermediate state: DELETE in flight (crash recovery landmark)
+	//   withdrawn   — unblock completed; row kept for audit, filtered from Mitigations
+	//   failed      — create or unblock failed; surfaced in Mitigations for operator
+	//
+	// `withdrawing` rows are reconciled on startup — retry xDrop DELETE (404
+	// handled as idempotent success) to collapse any crash-induced drift
+	// between external state (rule already deleted) and DB state.
+	`CREATE TABLE IF NOT EXISTS xdrop_active_rules (
+		id                SERIAL PRIMARY KEY,
+		attack_id         INT NOT NULL,
+		action_id         INT NOT NULL,
+		connector_id      INT NOT NULL,
+		external_rule_id  TEXT NOT NULL,
+		status            TEXT NOT NULL DEFAULT 'active',
+		delay_started_at  TIMESTAMPTZ,
+		delay_minutes     INT NOT NULL DEFAULT 0,
+		error_message     TEXT DEFAULT '',
+		created_at        TIMESTAMPTZ DEFAULT now(),
+		withdrawn_at      TIMESTAMPTZ,
+		UNIQUE (attack_id, action_id, connector_id, external_rule_id),
+		CHECK (status IN ('active','delayed','withdrawing','withdrawn','failed'))
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_xdrop_active_status ON xdrop_active_rules(status)`,
+	`CREATE INDEX IF NOT EXISTS idx_xdrop_active_attack ON xdrop_active_rules(attack_id)`,
+
+	// v1.2 PR-5: BGP Announcement Manager — refcount-based route lifecycle.
+	// Replaces per-attack BGP withdraw with per-announcement refcount so that
+	// the same prefix shared by multiple attacks gets one vtysh announce/
+	// withdraw cycle (Wanguard-style). Eliminates the withdraw race fixed
+	// with idempotency in v1.1.3 by removing it at the architectural level.
+	//
+	// Status lifecycle:
+	//   announcing             — vtysh announce in flight (crash landmark)
+	//   active                 — announce succeeded, refcount > 0
+	//   delayed                — refcount=0 + delay_minutes > 0, countdown running
+	//   withdrawing            — vtysh withdraw in flight (crash landmark)
+	//   withdrawn              — withdraw completed, row kept for audit
+	//   failed                 — announce or withdraw failed; operator-visible
+	//   orphan                 — bootstrap found FRR route with no active attack
+	//   dismissed              — operator dismissed an orphan (no action taken)
+	//   dismissed_on_upgrade   — first upgrade bootstrap found pre-existing FRR routes;
+	//                            hidden from Mitigations to avoid startle
+	`CREATE TABLE IF NOT EXISTS bgp_announcements (
+		id               SERIAL PRIMARY KEY,
+		prefix           TEXT NOT NULL,
+		route_map        TEXT NOT NULL,
+		connector_id     INT NOT NULL,
+		first_action_id  INT,
+		status           TEXT NOT NULL DEFAULT 'announcing',
+		refcount         INT NOT NULL DEFAULT 0,
+		announced_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+		delay_started_at TIMESTAMPTZ,
+		delay_minutes    INT NOT NULL DEFAULT 0,
+		withdrawn_at     TIMESTAMPTZ,
+		error_message    TEXT DEFAULT '',
+		created_at       TIMESTAMPTZ DEFAULT now(),
+		UNIQUE (prefix, route_map, connector_id),
+		CHECK (status IN ('announcing','active','delayed','withdrawing','withdrawn','failed','orphan','dismissed','dismissed_on_upgrade'))
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_bgp_announcements_status ON bgp_announcements(status)`,
+
+	// Join table: which attacks are attached to which announcement.
+	// delay_minutes snapshots the originating action's bgp_withdraw_delay
+	// for each attack, so the announcement's effective delay can be
+	// recomputed as MAX(delay_minutes WHERE detached_at IS NULL).
+	`CREATE TABLE IF NOT EXISTS bgp_announcement_attacks (
+		announcement_id INT NOT NULL REFERENCES bgp_announcements(id) ON DELETE CASCADE,
+		attack_id       INT NOT NULL,
+		action_id       INT,
+		response_name   TEXT DEFAULT '',
+		delay_minutes   INT NOT NULL DEFAULT 0,
+		attached_at     TIMESTAMPTZ DEFAULT now(),
+		detached_at     TIMESTAMPTZ,
+		PRIMARY KEY (announcement_id, attack_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_bgp_announcement_attacks_attack ON bgp_announcement_attacks(attack_id) WHERE detached_at IS NULL`,
+
+	// Timeline events per announcement — append-only audit for Mitigations
+	// Detail Drawer (announce / attach / detach / delay_started / delay_cancelled
+	// / withdrawn / withdraw_failed / orphan_detected).
+	`CREATE TABLE IF NOT EXISTS bgp_announcement_events (
+		id              SERIAL PRIMARY KEY,
+		announcement_id INT NOT NULL REFERENCES bgp_announcements(id) ON DELETE CASCADE,
+		event_type      TEXT NOT NULL,
+		attack_id       INT,
+		detail          TEXT DEFAULT '',
+		created_at      TIMESTAMPTZ DEFAULT now()
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_bgp_announcement_events_aid ON bgp_announcement_events(announcement_id)`,
+
+	// v1.2 PR-5 bootstrap: backfill bgp_announcements from historical BGP
+	// on_detected success rows in action_execution_log. For each distinct
+	// (prefix, route_map, connector_id) currently still "active" (has
+	// on_detected success but no matching on_expired success), create one
+	// announcement row with refcount equal to the number of still-active
+	// attacks sharing it.
+	//
+	// Idempotent — ON CONFLICT DO NOTHING safe for repeat startup. Skips
+	// rows without connector_id (predate v2.10 schema) because they can't
+	// produce a valid business key.
+	//
+	// After upgrade, the first vtysh withdraw for any legacy attack will
+	// flow through Detach + performBGPWithdraw, which handles the "Can't
+	// find" idempotent case if FRR state doesn't match.
+	`INSERT INTO bgp_announcements (prefix, route_map, connector_id, status, refcount, announced_at)
+	 SELECT
+	     split_part(l.external_rule_id, '|', 1) AS prefix,
+	     split_part(l.external_rule_id, '|', 2) AS route_map,
+	     l.connector_id,
+	     'active' AS status,
+	     COUNT(DISTINCT l.attack_id) AS refcount,
+	     MIN(l.executed_at) AS announced_at
+	 FROM action_execution_log l
+	 WHERE l.action_type = 'bgp'
+	   AND l.trigger_phase = 'on_detected'
+	   AND l.status = 'success'
+	   AND l.connector_id IS NOT NULL
+	   AND l.external_rule_id != ''
+	   AND position('|' in l.external_rule_id) > 0
+	   AND NOT EXISTS (
+	     SELECT 1 FROM action_execution_log l2
+	     WHERE l2.action_type = 'bgp'
+	       AND l2.trigger_phase = 'on_expired'
+	       AND l2.status = 'success'
+	       AND l2.attack_id = l.attack_id
+	       AND l2.external_rule_id = l.external_rule_id
+	       AND l2.connector_id = l.connector_id
+	   )
+	 GROUP BY l.external_rule_id, l.connector_id
+	 ON CONFLICT (prefix, route_map, connector_id) DO NOTHING`,
+
+	// Backfill bgp_announcement_attacks join table — one row per (attack, announcement).
+	`INSERT INTO bgp_announcement_attacks (announcement_id, attack_id, action_id, attached_at)
+	 SELECT DISTINCT ON (a.id, l.attack_id)
+	     a.id AS announcement_id,
+	     l.attack_id,
+	     l.action_id,
+	     l.executed_at AS attached_at
+	 FROM action_execution_log l
+	 JOIN bgp_announcements a
+	   ON a.connector_id = l.connector_id
+	  AND a.prefix = split_part(l.external_rule_id, '|', 1)
+	  AND a.route_map = split_part(l.external_rule_id, '|', 2)
+	 WHERE l.action_type = 'bgp'
+	   AND l.trigger_phase = 'on_detected'
+	   AND l.status = 'success'
+	   AND l.connector_id IS NOT NULL
+	   AND l.external_rule_id != ''
+	   AND NOT EXISTS (
+	     SELECT 1 FROM action_execution_log l2
+	     WHERE l2.action_type = 'bgp'
+	       AND l2.trigger_phase = 'on_expired'
+	       AND l2.status = 'success'
+	       AND l2.attack_id = l.attack_id
+	       AND l2.external_rule_id = l.external_rule_id
+	       AND l2.connector_id = l.connector_id
+	   )
+	 ORDER BY a.id, l.attack_id, l.executed_at DESC
+	 ON CONFLICT (announcement_id, attack_id) DO NOTHING`,
+
+	// v1.2 PR-4 bootstrap: backfill from historical action_execution_log rows.
+	// Find every xdrop on_detected success that does NOT have a matching
+	// on_expired success in the log — those rules are still externally active
+	// and need a row in xdrop_active_rules. ON CONFLICT DO NOTHING keeps the
+	// migration idempotent across restarts.
+	`INSERT INTO xdrop_active_rules (attack_id, action_id, connector_id, external_rule_id, status, created_at)
+	 SELECT DISTINCT ON (l.attack_id, l.action_id, l.connector_id, l.external_rule_id)
+	        l.attack_id, l.action_id, l.connector_id, l.external_rule_id,
+	        'active', l.executed_at
+	 FROM action_execution_log l
+	 WHERE l.action_type = 'xdrop'
+	   AND l.trigger_phase = 'on_detected'
+	   AND l.status = 'success'
+	   AND l.connector_id IS NOT NULL
+	   AND l.external_rule_id != ''
+	   AND NOT EXISTS (
+	     SELECT 1 FROM action_execution_log l2
+	     WHERE l2.action_type = 'xdrop'
+	       AND l2.trigger_phase = 'on_expired'
+	       AND l2.status = 'success'
+	       AND l2.attack_id = l.attack_id
+	       AND l2.action_id = l.action_id
+	       AND l2.connector_id = l.connector_id
+	       AND l2.external_rule_id = l.external_rule_id
+	   )
+	 ORDER BY l.attack_id, l.action_id, l.connector_id, l.external_rule_id, l.executed_at DESC
+	 ON CONFLICT DO NOTHING`,
 }
 
 // TimescaleDB-specific DDL — non-fatal if TimescaleDB is not available.

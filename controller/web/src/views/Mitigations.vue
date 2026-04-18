@@ -12,9 +12,46 @@
       <el-tab-pane :label="$t('attacks.xdropFiltering')" name="xdrop" />
     </el-tabs>
 
+    <!-- BGP Orphan banner (v1.2 PR-5): FRR routes with no active attack.
+         Operator must explicitly Force Withdraw or Dismiss — not treated as
+         regular BGP artifacts because there's no attack_id/action_id. -->
+    <el-alert
+      v-if="tab === 'bgp' && bgpOrphans.length > 0"
+      :title="$t('mitigations.orphanBannerTitle', { count: bgpOrphans.length })"
+      type="warning"
+      :closable="false"
+      show-icon
+      style="margin-bottom: 16px;">
+      <template #default>
+        <div style="margin-bottom: 8px; font-size: 13px;">{{ $t('mitigations.orphanBannerDesc') }}</div>
+        <el-table :data="bgpOrphans" stripe size="small" :show-header="true" style="background: transparent;">
+          <el-table-column prop="prefix" :label="$t('mitigations.prefix')" width="180" />
+          <el-table-column prop="route_map" :label="$t('mitigations.routeMap')" width="140" />
+          <el-table-column prop="connector_name" :label="$t('mitigations.bgpConnector')" min-width="140" />
+          <el-table-column prop="created_at" :label="$t('attacks.announcedAt')" width="170">
+            <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+          </el-table-column>
+          <el-table-column :label="$t('common.actions')" width="240">
+            <template #default="{ row }">
+              <el-popconfirm :title="$t('mitigations.confirmOrphanForceWithdraw')" @confirm="orphanForceWithdraw(row)">
+                <template #reference>
+                  <el-button size="small" type="danger" plain>{{ $t('attacks.forceWithdraw') }}</el-button>
+                </template>
+              </el-popconfirm>
+              <el-popconfirm :title="$t('mitigations.confirmOrphanDismiss')" @confirm="orphanDismiss(row)">
+                <template #reference>
+                  <el-button size="small" type="info" plain>{{ $t('mitigations.dismiss') }}</el-button>
+                </template>
+              </el-popconfirm>
+            </template>
+          </el-table-column>
+        </el-table>
+      </template>
+    </el-alert>
+
     <!-- BGP Routing -->
     <div v-if="tab === 'bgp'" style="background: var(--xs-card-bg); border: 1px solid var(--xs-card-border); border-radius: var(--xs-radius-lg); box-shadow: var(--xs-shadow); overflow: hidden;">
-      <el-table :data="bgpRoutes" stripe :empty-text="$t('common.noData')" :row-style="{ cursor: 'pointer' }" @row-click="openDetail">
+      <el-table :data="bgpActive" stripe :empty-text="$t('common.noData')" :row-style="{ cursor: 'pointer' }" @row-click="openDetail">
         <el-table-column prop="attack_id" :label="$t('common.id')" width="80">
           <template #default="{ row }">
             <span class="attack-link" @click.stop="$router.push(`/attacks/${row.attack_id}`)">#{{ row.attack_id }}</span>
@@ -43,6 +80,7 @@
             <el-tag v-else-if="row.status === 'delayed'" type="warning" size="small">{{ $t('attacks.statusDelayed') }}</el-tag>
             <el-tag v-else-if="row.status === 'pending'" type="warning" size="small">{{ $t('attacks.statusPending') }}</el-tag>
             <el-tag v-else-if="row.status === 'failed'" type="danger" size="small">{{ $t('attacks.statusFailed') }}</el-tag>
+            <el-tag v-else-if="row.status === 'orphan'" type="warning" size="small" effect="plain">{{ row.status }}</el-tag>
             <el-tag v-else type="info" size="small">{{ row.status }}</el-tag>
           </template>
         </el-table-column>
@@ -57,6 +95,54 @@
         </el-table-column>
       </el-table>
     </div>
+
+    <!-- Dismissed orphans collapsible (v1.2): audit view for orphans that
+         operator dismissed OR that were auto-dismissed at first-upgrade
+         bootstrap. Allows un-dismiss to re-surface in banner. -->
+    <el-collapse
+      v-if="tab === 'bgp'"
+      v-model="dismissedExpanded"
+      style="margin-top: 16px; background: var(--xs-card-bg); border: 1px solid var(--xs-card-border); border-radius: var(--xs-radius-lg); box-shadow: var(--xs-shadow); overflow: hidden;">
+      <el-collapse-item name="dismissed">
+        <template #title>
+          <span style="padding-left: 16px; font-size: 13px; color: var(--xs-text-secondary);">
+            {{ $t('mitigations.viewDismissedOrphans', { count: dismissedOrphans.length }) }}
+          </span>
+        </template>
+        <el-table
+          :data="dismissedOrphans"
+          stripe
+          size="small"
+          :empty-text="$t('mitigations.noDismissedOrphans')"
+          style="margin: 0 16px 12px 16px;">
+          <el-table-column prop="prefix" :label="$t('mitigations.prefix')" width="180" />
+          <el-table-column prop="route_map" :label="$t('mitigations.routeMap')" width="140" />
+          <el-table-column prop="connector_name" :label="$t('mitigations.bgpConnector')" min-width="140" />
+          <el-table-column :label="$t('common.type')" width="180">
+            <template #default="{ row }">
+              <el-tag
+                :type="row.status === 'dismissed_on_upgrade' ? 'info' : ''"
+                size="small"
+                effect="plain">
+                {{ row.status === 'dismissed_on_upgrade' ? $t('mitigations.dismissedOnUpgrade') : $t('mitigations.dismissed') }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="detected_at" :label="$t('mitigations.detectedAt')" width="170">
+            <template #default="{ row }">{{ formatTime(row.detected_at) }}</template>
+          </el-table-column>
+          <el-table-column :label="$t('common.actions')" width="130">
+            <template #default="{ row }">
+              <el-popconfirm :title="$t('mitigations.confirmUndismiss')" @confirm="undismissOrphan(row)">
+                <template #reference>
+                  <el-button size="small" plain>{{ $t('mitigations.undismiss') }}</el-button>
+                </template>
+              </el-popconfirm>
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-collapse-item>
+    </el-collapse>
 
     <!-- xDrop Filtering -->
     <div v-if="tab === 'xdrop'" style="background: var(--xs-card-bg); border: 1px solid var(--xs-card-border); border-radius: var(--xs-radius-lg); box-shadow: var(--xs-shadow); overflow: hidden;">
@@ -96,6 +182,7 @@
             <el-tag v-else-if="row.status === 'delayed'" type="warning" size="small">{{ $t('attacks.statusDelayed') }}</el-tag>
             <el-tag v-else-if="row.status === 'pending'" type="warning" size="small">{{ $t('attacks.statusPending') }}</el-tag>
             <el-tag v-else-if="row.status === 'failed'" type="danger" size="small">{{ $t('attacks.statusFailed') }}</el-tag>
+            <el-tag v-else-if="row.status === 'orphan'" type="warning" size="small" effect="plain">{{ row.status }}</el-tag>
             <el-tag v-else type="info" size="small">{{ row.status }}</el-tag>
           </template>
         </el-table-column>
@@ -129,7 +216,22 @@
 
         <!-- Summary -->
         <div class="detail-section">
-          <div class="detail-row">
+          <!-- BGP: show all attached attacks (shared announcement semantics).
+               xDrop: still per-attack, show single id as before. -->
+          <template v-if="detail.action_type === 'bgp' && detail.attached_attacks && detail.attached_attacks.length">
+            <div class="detail-row">
+              <span class="detail-label">{{ $t('mitigations.attachedAttacks', { count: detail.attached_attacks.length }) }}</span>
+            </div>
+            <div v-for="(a, idx) in detail.attached_attacks" :key="idx" class="attached-attack-row">
+              <span class="attack-link" @click="$router.push(`/attacks/${a.attack_id}`); drawerVisible = false">#{{ a.attack_id }}</span>
+              <span v-if="a.decoder" class="attached-chip">{{ a.decoder }}</span>
+              <span v-if="a.response_name" class="attached-chip">{{ a.response_name }}</span>
+              <span class="attached-chip">delay={{ a.delay_minutes }}m</span>
+              <span v-if="a.detached_at" class="attached-chip attached-chip-muted">detached {{ formatTime(a.detached_at) }}</span>
+              <span v-else class="attached-chip attached-chip-active">{{ $t('mitigations.attachedCurrent') }}</span>
+            </div>
+          </template>
+          <div v-else class="detail-row">
             <span class="detail-label">{{ $t('mitigations.attack') }}</span>
             <span class="attack-link" @click="$router.push(`/attacks/${detail.attack_id}`); drawerVisible = false">#{{ detail.attack_id }}</span>
           </div>
@@ -204,7 +306,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import api from '../api'
@@ -214,6 +316,15 @@ const { t } = useI18n()
 const tab = ref('bgp')
 const bgpRoutes = ref([])
 const xdropRules = ref([])
+const dismissedOrphans = ref([])
+const dismissedExpanded = ref([]) // collapse item names that are expanded
+
+// v1.2 PR-5: split BGP rows into "active" (attached to attacks) and "orphan"
+// (FRR route without active attack). Operator uses dedicated endpoints for
+// orphans — they have no attack_id/action_id and the generic force-remove
+// endpoint rejects them.
+const bgpActive = computed(() => bgpRoutes.value.filter((r) => !r.is_orphan))
+const bgpOrphans = computed(() => bgpRoutes.value.filter((r) => r.is_orphan))
 
 // Detail drawer
 const drawerVisible = ref(false)
@@ -244,7 +355,12 @@ async function load() {
   loading = true
   try {
     if (tab.value === 'bgp') {
-      bgpRoutes.value = await api.get('/active-actions/bgp') || []
+      const [routes, dismissed] = await Promise.all([
+        api.get('/active-actions/bgp'),
+        api.get('/active-actions/bgp/dismissed-orphans'),
+      ])
+      bgpRoutes.value = routes || []
+      dismissedOrphans.value = dismissed || []
     } else {
       xdropRules.value = await api.get('/active-actions/xdrop') || []
     }
@@ -269,14 +385,68 @@ async function openDetail(row) {
 }
 
 async function forceRemove(row) {
+  // v1.2 PR-5: orphan rows must use dedicated endpoint (no attack_id/action_id).
+  // Detail drawer may call forceRemove for orphan too — route accordingly.
+  if (row.is_orphan && row.announcement_id) {
+    return orphanForceWithdraw(row)
+  }
   try {
-    await api.post('/active-actions/force-remove', {
+    const resp = await api.post('/active-actions/force-remove', {
       attack_id: row.attack_id,
       action_id: row.action_id,
       connector_id: row.connector_id,
       external_rule_id: row.external_rule_id,
     })
-    ElMessage.success(t('attacks.forceRemoved'))
+    if (resp?.warning) {
+      ElMessage.warning(resp.warning)
+    } else {
+      ElMessage.success(t('attacks.forceRemoved'))
+    }
+    load()
+  } catch (e) {
+    ElMessage.error(e?.error || e?.message || t('mitigations.forceFailed'))
+  }
+}
+
+// v1.2 PR-5: orphan-specific operator actions.
+// Backend returns 200 + {warning: ...} when the row was marked failed but
+// vtysh couldn't confirm the FRR withdraw — this is the case the operator
+// most needs to notice, so promote it to a warning toast rather than silently
+// showing success (PR-6 audit P1).
+async function orphanForceWithdraw(row) {
+  try {
+    const resp = await api.post('/active-actions/bgp/orphan-force-withdraw', {
+      announcement_id: row.announcement_id,
+    })
+    if (resp?.warning) {
+      ElMessage.warning(resp.warning)
+    } else {
+      ElMessage.success(t('attacks.forceRemoved'))
+    }
+    load()
+  } catch (e) {
+    ElMessage.error(e?.error || e?.message || t('mitigations.forceFailed'))
+  }
+}
+
+async function orphanDismiss(row) {
+  try {
+    await api.post('/active-actions/bgp/orphan-dismiss', {
+      announcement_id: row.announcement_id,
+    })
+    ElMessage.success(t('mitigations.dismissed'))
+    load()
+  } catch (e) {
+    ElMessage.error(e?.error || e?.message || t('mitigations.forceFailed'))
+  }
+}
+
+async function undismissOrphan(row) {
+  try {
+    await api.post('/active-actions/bgp/orphan-undismiss', {
+      announcement_id: row.announcement_id,
+    })
+    ElMessage.success(t('mitigations.undismissed'))
     load()
   } catch (e) {
     ElMessage.error(e?.error || e?.message || t('mitigations.forceFailed'))
@@ -304,6 +474,31 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 .detail-label {
   color: var(--xs-text-secondary);
   font-weight: 500;
+}
+.attached-attack-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0 4px 8px;
+  font-size: 12px;
+  border-left: 2px solid var(--xs-card-border);
+  margin: 2px 0;
+}
+.attached-chip {
+  font-family: 'SF Mono', monospace;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: var(--xs-card-border);
+  color: var(--xs-text-secondary);
+}
+.attached-chip-active {
+  background: var(--xs-success, #22c55e);
+  color: white;
+}
+.attached-chip-muted {
+  opacity: 0.6;
 }
 .detail-value {
   font-weight: 500;

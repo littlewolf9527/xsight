@@ -9,12 +9,23 @@ import (
 	"github.com/littlewolf9527/xsight/controller/internal/store"
 )
 
-// insertManualOverride is a helper that writes a manual_override success log
-// into the mock store's ActionExecLog.
+// insertManualOverride is a helper that records a manual override into the
+// new action_manual_overrides index (v1.2 PR-2) + writes the corresponding
+// audit log entry (v1.1 behavior, retained for downstream audits).
 func insertManualOverride(t *testing.T, ms *MockStore, attackID, actionID, connectorID int, ruleID string) {
 	t.Helper()
+	// v1.2 PR-2: index table — authoritative for HasManualOverride lookups
+	if _, err := ms.manualOverrides.Create(context.Background(), &store.ActionManualOverride{
+		AttackID:       attackID,
+		ActionID:       actionID,
+		ConnectorID:    connectorID,
+		ExternalRuleID: ruleID,
+	}); err != nil {
+		t.Fatalf("insertManualOverride index: %v", err)
+	}
+	// Audit log — kept for backward compat and non-lookup consumers
 	cid := connectorID
-	log := &store.ActionExecutionLog{
+	logEntry := &store.ActionExecutionLog{
 		AttackID:       attackID,
 		ActionID:       actionID,
 		TriggerPhase:   "manual_override",
@@ -23,8 +34,8 @@ func insertManualOverride(t *testing.T, ms *MockStore, attackID, actionID, conne
 		ConnectorID:    &cid,
 		ExecutedAt:     time.Now(),
 	}
-	if _, err := ms.actionExecLogRepo.Create(context.Background(), log); err != nil {
-		t.Fatalf("insertManualOverride: %v", err)
+	if _, err := ms.actionExecLogRepo.Create(context.Background(), logEntry); err != nil {
+		t.Fatalf("insertManualOverride log: %v", err)
 	}
 }
 

@@ -27,6 +27,14 @@ type Store interface {
 	ActionExecLog() ActionExecLogRepo
 	XDropTargets() XDropTargetRepo
 	Preconditions() PreconditionRepo
+	// v1.2 PR-2: O(1) manual override lookup
+	ManualOverrides() ActionManualOverrideRepo
+	// v1.2 PR-3: persisted scheduled delay actions (pendingDelay replacement)
+	ScheduledActions() ScheduledActionRepo
+	// v1.2 PR-4: authoritative xDrop rule state (replaces log-derivation)
+	XDropActiveRules() XDropActiveRuleRepo
+	// v1.2 PR-5: refcount-based BGP announcements (replaces per-attack withdraw)
+	BGPAnnouncements() BGPAnnouncementRepo
 	FlowLogs() FlowLogRepo
 	// v3.0: Flow listeners + sources
 	FlowListeners() FlowListenerRepo
@@ -210,6 +218,221 @@ type ActionExecLogRepo interface {
 	FindByAttackAndAction(ctx context.Context, attackID, actionID int, triggerPhase string) (*ActionExecutionLog, error)
 	FindExternalRuleIDs(ctx context.Context, attackID, actionID int) ([]string, error)
 	FindExternalRulesWithActions(ctx context.Context, attackID int) ([]RuleWithAction, error)
+}
+
+// v1.2 PR-5: BGPAnnouncementRepo manages refcount-based BGP announcements.
+// All writes happen inside repo-level transactions (the store abstraction
+// does NOT leak pgx.Tx). Callers invoke atomic operations (Attach, Detach,
+// MarkAnnounced, etc.) and the repo takes care of SELECT FOR UPDATE + COMMIT.
+//
+// Side effects (vtysh announce/withdraw) are invoked by AnnouncementManager
+// outside the transaction, using the returned intent flags. This is
+// compensating consistency, not atomic — the `announcing` and `withdrawing`
+// statuses exist as crash-recovery landmarks.
+type BGPAnnouncementRepo interface {
+	// Get returns an announcement by ID, or nil if not found.
+	Get(ctx context.Context, id int) (*BGPAnnouncement, error)
+	// FindByBusinessKey returns an announcement by (prefix, route_map, connector_id).
+	// Returns nil (not error) if not found.
+	FindByBusinessKey(ctx context.Context, prefix, routeMap string, connectorID int) (*BGPAnnouncement, error)
+
+	// Attach atomically creates or updates an announcement to reflect a new
+	// attack attachment. Returns the announcement's DB ID and an intent flag
+	// that tells the caller whether to invoke vtysh announce outside the tx.
+	//
+	// Semantics:
+	//   No existing row         → INSERT status='announcing', refcount=1 → NeedAnnounce=true
+	//   Existing row (active)   → refcount++ → NeedAnnounce=false (already announced)
+	//   Existing row (delayed)  → refcount++, status back to 'active' → NeedAnnounce=false (cancel delay)
+	//   Existing row (withdrawn)→ resurrect: status='announcing', refcount=1 → NeedAnnounce=true
+	//   Existing row (failed)   → resurrect: status='announcing', refcount=1 → NeedAnnounce=true
+	Attach(ctx context.Context, params BGPAttachParams) (BGPAttachResult, error)
+
+	// Detach atomically records an attack's detachment (sets detached_at)
+	// and recomputes refcount + delay_minutes.
+	//
+	// Semantics:
+	//   refcount > 0 after decrement  → NeedWithdraw=false (still in use)
+	//   refcount == 0 + delay == 0    → status='withdrawing' → NeedWithdraw=true
+	//   refcount == 0 + delay > 0     → status='delayed', delay_started_at=now → NeedWithdraw=false
+	Detach(ctx context.Context, attackID int, prefix, routeMap string, connectorID int) (BGPDetachResult, error)
+
+	// MarkAnnounced transitions announcing → active after a successful vtysh announce.
+	MarkAnnounced(ctx context.Context, id int) error
+	// MarkWithdrawing transitions active/delayed → withdrawing before vtysh no network.
+	// Used on delay expiry to trigger the actual withdraw.
+	MarkWithdrawing(ctx context.Context, id int) (bool, error)
+	// MarkWithdrawn transitions withdrawing → withdrawn after a successful vtysh no network.
+	MarkWithdrawn(ctx context.Context, id int) error
+	// MarkFailedAnnounce handles compensation for announce failure. If refcount=1
+	// (no concurrent attach), deletes the row; otherwise sets status=failed.
+	MarkFailedAnnounce(ctx context.Context, id int, errMsg string) error
+	// MarkFailedWithdraw sets status=failed on withdraw failure. Row kept for
+	// operator retry via ForceWithdraw.
+	MarkFailedWithdraw(ctx context.Context, id int, errMsg string) error
+
+	// ForceWithdraw transitions any active/delayed/failed announcement to
+	// withdrawing, detaching all attached attacks. Used by operator Force Withdraw.
+	ForceWithdraw(ctx context.Context, id int) error
+
+	// Dismiss transitions an orphan to dismissed (operator rejected).
+	Dismiss(ctx context.Context, id int) error
+	// Undismiss transitions a dismissed/dismissed_on_upgrade row back to orphan
+	// so the operator can re-surface it in the warning banner after a mistaken
+	// dismissal. FRR state is not touched (the route either still exists, in
+	// which case orphan re-evaluation is correct, or it was withdrawn earlier
+	// and the next bootstrap cycle will clean up the row).
+	Undismiss(ctx context.Context, id int) error
+
+	// ListActive returns announcements in active/delayed/failed/announcing/withdrawing status
+	// for Mitigations UI. Excludes withdrawn (audit-only), orphan, dismissed*.
+	ListActive(ctx context.Context) ([]BGPAnnouncement, error)
+	// ListDismissed returns announcements in dismissed or dismissed_on_upgrade
+	// status, sorted newest-first. Used by the "View dismissed orphans" UI.
+	ListDismissed(ctx context.Context) ([]BGPAnnouncement, error)
+	// ListByStatus is used by reconciliation.
+	ListByStatus(ctx context.Context, status string) ([]BGPAnnouncement, error)
+
+	// ListAttacks returns attacks attached to an announcement (both attached and detached).
+	ListAttacks(ctx context.Context, announcementID int) ([]BGPAnnouncementAttack, error)
+
+	// ListAttachmentsForAttack returns every announcement attachment record
+	// for a given attack (across all announcements), ordered by attached_at
+	// ASC. Used by mitigation-summary to enumerate which BGP announcements
+	// an attack touched.
+	ListAttachmentsForAttack(ctx context.Context, attackID int) ([]BGPAnnouncementAttack, error)
+
+	// HasOperationalHistory reports whether any bgp_announcements row exists
+	// that wasn't produced by the bootstrap scan itself. Used at startup to
+	// decide whether to mark newly-discovered FRR drift as a silent
+	// `dismissed_on_upgrade` (first-ever v1.2 boot) or a banner-visible
+	// `orphan` (v1.2 has been running, FRR drifted).
+	HasOperationalHistory(ctx context.Context) (bool, error)
+
+	// UpsertOrphan records one FRR-detected prefix as an orphan (or
+	// dismissed_on_upgrade, depending on the caller's chosen status).
+	// Semantics:
+	//   No row for this business key        → INSERT status, refcount=0, return created=true
+	//   Existing row with status='withdrawn'→ UPDATE to the new status, return created=true
+	//   Existing row with any other status  → no-op, return created=false
+	// The last case is what keeps the bootstrap safe to re-run: operator-
+	// dismissed rows stay dismissed; active/delayed mitigations stay as they
+	// are. created=true means the caller should log + audit; false = silent.
+	UpsertOrphan(ctx context.Context, prefix, routeMap string, connectorID int, status string) (bool, error)
+
+	// AppendEvent writes a timeline entry.
+	AppendEvent(ctx context.Context, announcementID int, eventType string, attackID *int, detail string) error
+	// ListEvents returns the timeline for an announcement.
+	ListEvents(ctx context.Context, announcementID int) ([]BGPAnnouncementEvent, error)
+}
+
+// BGPAttachParams bundles the inputs to Attach. action_id / response_name /
+// delay_minutes are per-attack snapshot fields; the announcement-level delay
+// is recomputed inside the transaction from bgp_announcement_attacks.
+type BGPAttachParams struct {
+	AttackID     int
+	ActionID     *int
+	ResponseName string
+	DelayMinutes int
+	Prefix       string
+	RouteMap     string
+	ConnectorID  int
+}
+
+// BGPAttachResult tells the caller what side effect (if any) to execute
+// outside the transaction.
+type BGPAttachResult struct {
+	AnnouncementID int
+	NeedAnnounce   bool // caller must run vtysh announce and report back via MarkAnnounced/MarkFailedAnnounce
+}
+
+// BGPDetachResult tells the caller whether to invoke vtysh withdraw now
+// (delay=0) or arm a delay timer (delay>0).
+type BGPDetachResult struct {
+	AnnouncementID int
+	NeedWithdraw   bool
+	Delayed        bool
+	DelayMinutes   int
+	// Refcount AFTER decrement. Useful for caller log messages.
+	RefcountAfter int
+}
+
+// v1.2 PR-4: XDropActiveRuleRepo is the authoritative state for xDrop rules.
+// Mitigations UI / mitigation-summary API read from this table instead of
+// reverse-engineering state from action_execution_log.
+type XDropActiveRuleRepo interface {
+	// Upsert inserts a new row or updates an existing one (idempotent on the
+	// business key). Used by executeXDrop and by reconciliation paths that
+	// need to record an observed state without a full state machine.
+	Upsert(ctx context.Context, r *XDropActiveRule) (int, error)
+	// MarkWithdrawing transitions active/delayed → withdrawing before the
+	// DELETE side effect. Returns false if the row is not in a transitioning
+	// state (lets callers bail out — another goroutine got there first).
+	MarkWithdrawing(ctx context.Context, attackID, actionID, connectorID int, externalRuleID string) (bool, error)
+	// MarkWithdrawn is called after DELETE success (or 404 idempotent).
+	MarkWithdrawn(ctx context.Context, attackID, actionID, connectorID int, externalRuleID string) error
+	// MarkFailed sets status=failed with an error message.
+	MarkFailed(ctx context.Context, attackID, actionID, connectorID int, externalRuleID, errMsg string) error
+	// MarkDelayed records entry into delayed state (waiting for unblock_delay_minutes timer).
+	MarkDelayed(ctx context.Context, attackID, actionID, connectorID int, externalRuleID string, delayMinutes int) error
+	// ListActive returns rules in active/delayed/failed status for Mitigations UI.
+	// withdrawn and withdrawing are excluded (withdrawn is audit-only;
+	// withdrawing is an internal recovery state).
+	ListActive(ctx context.Context) ([]XDropActiveRule, error)
+	// ListWithdrawing returns rows stuck in withdrawing — called on startup
+	// for crash recovery to retry the DELETE side effect.
+	ListWithdrawing(ctx context.Context) ([]XDropActiveRule, error)
+	// ListByAttack returns all rows for a given attack regardless of status.
+	ListByAttack(ctx context.Context, attackID int) ([]XDropActiveRule, error)
+}
+
+// v1.2 PR-3: ScheduledActionRepo persists delayed withdraw/unblock tasks so
+// they survive controller restarts. Solves the v1.1 bug where the in-memory
+// pendingDelay map silently lost all pending tasks on crash or restart.
+type ScheduledActionRepo interface {
+	// Schedule inserts a new pending row. Idempotent: if a pending row already
+	// exists for the same business key, returns the existing ID rather than
+	// failing (ON CONFLICT DO UPDATE). This matches engine.ScheduleDelay being
+	// called multiple times for the same artifact (e.g. re-dispatch).
+	Schedule(ctx context.Context, a *ScheduledAction) (int, error)
+	// Cancel marks a pending row as cancelled with the given reason.
+	// No-op if the row is no longer pending.
+	Cancel(ctx context.Context, id int, reason string) error
+	// CancelByBusinessKey marks a pending row as cancelled by artifact key.
+	// Used by CancelDelay when the caller doesn't hold the DB ID.
+	CancelByBusinessKey(ctx context.Context, actionType string, attackID, actionID, connectorID int, externalRuleID, reason string) error
+	// CancelAllForAttack cancels every pending schedule for the given attack.
+	// Used by re-breach handling (CancelDelaysForAttack in engine).
+	CancelAllForAttack(ctx context.Context, attackID int, reason string) (int, error)
+	// MarkExecuting is called right before the action runs. Guards against
+	// concurrent recovery goroutines racing to execute the same task.
+	MarkExecuting(ctx context.Context, id int) error
+	// Complete marks a row as successfully completed.
+	Complete(ctx context.Context, id int) error
+	// Fail marks a row as failed with the given error message.
+	Fail(ctx context.Context, id int, errMsg string) error
+	// ListPending returns all pending rows, ordered by scheduled_for ASC.
+	// Called on startup to re-arm timers for surviving tasks.
+	ListPending(ctx context.Context) ([]ScheduledAction, error)
+	// ListExecuting returns rows stuck in 'executing' — called on startup
+	// to reconcile tasks where the process crashed between MarkExecuting
+	// and Complete/Fail. The underlying side effects are idempotent, so
+	// retry is safe. Added in v1.2 PR-4 to close the PR-3 leftover edge case.
+	ListExecuting(ctx context.Context) ([]ScheduledAction, error)
+}
+
+// v1.2 PR-2: ActionManualOverrideRepo provides O(1) lookup for manual override
+// records, replacing the linear scan of action_execution_log in v1.1.
+type ActionManualOverrideRepo interface {
+	// Create inserts an override row. Idempotent: if the business key already
+	// exists, returns the existing row's ID (not an error) — makes repeated
+	// force-remove calls safe.
+	Create(ctx context.Context, o *ActionManualOverride) (int, error)
+	// Exists checks if a specific artifact has been overridden. O(1) via UNIQUE index.
+	Exists(ctx context.Context, attackID, actionID, connectorID int, externalRuleID string) (bool, error)
+	// ListByAttack returns all overrides for an attack — used for pre-fetching
+	// a filter set before iterating many artifacts (bgp.go / xdrop.go).
+	ListByAttack(ctx context.Context, attackID int) ([]ActionManualOverride, error)
 }
 
 // XDropTargetRepo manages the many-to-many join between actions and xDrop connectors.

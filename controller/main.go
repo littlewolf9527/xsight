@@ -218,6 +218,16 @@ func main() {
 	attackTracker := tracker.New(trackerCfg, db, rings, alertDedup, actionEngine.HandleEvent)
 	attackTracker.SetRebreachCallback(actionEngine.CancelDelaysForAttack)
 
+	// v1.2 PR-3/PR-4 crash recovery: run before serving traffic.
+	// Three phases (executed in order by ReconcileOnStartup):
+	//   1. Retry side effects for scheduled_actions stuck in 'executing'
+	//      (PR-3 leftover: crashed between MarkExecuting and Complete)
+	//   2. Retry DELETE for xdrop_active_rules stuck in 'withdrawing'
+	//      (PR-4: crashed between MarkWithdrawing and MarkWithdrawn)
+	//   3. Re-arm timers for pending scheduled_actions; overdue ones fire
+	//      immediately (PR-3: timer lost during downtime).
+	actionEngine.ReconcileOnStartup(ctx)
+
 	// Crash recovery: rebuild active attacks from DB
 	if err := attackTracker.RecoverFromDB(ctx); err != nil {
 		log.Printf("tracker recovery: %v", err)
@@ -225,6 +235,11 @@ func main() {
 
 	// BGP recovery: re-inject ephemeral routes for active attacks (FRR state lost on restart)
 	action.RecoverBGPRoutes(ctx, db)
+
+	// BGP bootstrap: scan FRR for routes not represented in bgp_announcements
+	// and mark them as orphan / dismissed_on_upgrade. See bgp_bootstrap.go for
+	// the first-boot vs. runtime semantics.
+	action.BootstrapBGPOrphans(ctx, db)
 
 	// --- Phase 1: gRPC ingestion layer ---
 	nodeState := ingestion.NewNodeState()

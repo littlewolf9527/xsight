@@ -8,6 +8,7 @@ package tests
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -104,6 +105,16 @@ func TestListActiveBGPRoutes_ReturnsOnlyActive(t *testing.T) {
 		ConnectorID:    ip(connID),
 		ConnectorName:  "bgp-main",
 		ExecutedAt:     now.Add(-4 * time.Minute),
+	})
+	// v1.2 PR-5: BGP Mitigations now reads bgp_announcements. Seed the
+	// announcement row + attach row so the API can see it.
+	annID, _ := ms.bgpAnnouncements.Attach(context.Background(), store.BGPAttachParams{
+		AttackID: 1, ActionID: ip(10), Prefix: "10.0.0.1/32", RouteMap: "RTBH", ConnectorID: connID,
+	})
+	ms.bgpAnnouncements.MarkAnnounced(context.Background(), annID.AnnouncementID)
+	// Seed BGP connector so buildActiveBGPFromAnnouncements can resolve name.
+	ms.bgpConnectors.connectors = append(ms.bgpConnectors.connectors, store.BGPConnector{
+		ID: connID, Name: "bgp-main", Enabled: true,
 	})
 
 	r := setupRouter(ms)
@@ -221,6 +232,11 @@ func TestListActiveXDropRules_ReturnsOnlyActive(t *testing.T) {
 		ConnectorName:  "xdrop-node-01",
 		ExecutedAt:     now.Add(-2 * time.Minute),
 	})
+	// v1.2 PR-4: seed authoritative state row — Mitigations queries from here now.
+	ms.ManualOverrides() // noop touch to satisfy any lazy init
+	ms.xdropActiveRules.Upsert(context.Background(), &store.XDropActiveRule{
+		AttackID: 3, ActionID: 20, ConnectorID: connID, ExternalRuleID: "123", Status: "active",
+	})
 
 	r := setupRouter(ms)
 	w := doGet(t, r, "/api/active-actions/xdrop")
@@ -336,11 +352,24 @@ func TestListActive_MultiConnector_NoCrossContamination(t *testing.T) {
 			ActionType:     "bgp",
 			TriggerPhase:   "on_detected",
 			Status:         "success",
-			ExternalRuleID: "10.5.0.1/32:BLACKHOLE",
+			ExternalRuleID: "10.5.0.1/32|BLACKHOLE",
 			ConnectorID:    ip(conn4),
 			ConnectorName:  "bgp-connector-4",
 			ExecutedAt:     now.Add(-5 * time.Minute),
 		},
+	)
+	// v1.2 PR-5: seed bgp_announcements state + connectors for API
+	a1, _ := ms.bgpAnnouncements.Attach(context.Background(), store.BGPAttachParams{
+		AttackID: 5, ActionID: ip(30), Prefix: "10.5.0.1/32", RouteMap: "RTBH", ConnectorID: conn3,
+	})
+	ms.bgpAnnouncements.MarkAnnounced(context.Background(), a1.AnnouncementID)
+	a2, _ := ms.bgpAnnouncements.Attach(context.Background(), store.BGPAttachParams{
+		AttackID: 5, ActionID: ip(31), Prefix: "10.5.0.1/32", RouteMap: "BLACKHOLE", ConnectorID: conn4,
+	})
+	ms.bgpAnnouncements.MarkAnnounced(context.Background(), a2.AnnouncementID)
+	ms.bgpConnectors.connectors = append(ms.bgpConnectors.connectors,
+		store.BGPConnector{ID: conn3, Name: "bgp-connector-3", Enabled: true},
+		store.BGPConnector{ID: conn4, Name: "bgp-connector-4", Enabled: true},
 	)
 
 	r := setupRouter(ms)
@@ -371,8 +400,8 @@ func TestListActive_MultiConnector_NoCrossContamination(t *testing.T) {
 	if got := byConn[conn3]["external_rule_id"]; got != "10.5.0.1/32|RTBH" {
 		t.Errorf("connector 3: expected external_rule_id=10.5.0.1/32|RTBH, got %v", got)
 	}
-	if got := byConn[conn4]["external_rule_id"]; got != "10.5.0.1/32:BLACKHOLE" {
-		t.Errorf("connector 4: expected external_rule_id=10.5.0.1/32:BLACKHOLE, got %v", got)
+	if got := byConn[conn4]["external_rule_id"]; got != "10.5.0.1/32|BLACKHOLE" {
+		t.Errorf("connector 4: expected external_rule_id=10.5.0.1/32|BLACKHOLE, got %v", got)
 	}
 	if byConn[conn3]["connector_name"] == byConn[conn4]["connector_name"] {
 		t.Errorf("connector names must differ; both are %v", byConn[conn3]["connector_name"])
@@ -553,30 +582,20 @@ func TestListActive_BGPAndXDropDoNotInterfere(t *testing.T) {
 			ConnectorID:    ip(connID),
 			ExecutedAt:     now.Add(-4 * time.Minute),
 		},
-		store.ActionExecutionLog{
-			ID:             2,
-			AttackID:       8,
-			ActionID:       61,
-			ActionType:     "xdrop",
-			TriggerPhase:   "on_detected",
-			Status:         "success",
-			ExternalRuleID: "789",
-			ConnectorID:    ip(connID),
-			ExecutedAt:     now.Add(-4 * time.Minute),
-		},
-		// xDrop removed, BGP still active
-		store.ActionExecutionLog{
-			ID:             3,
-			AttackID:       8,
-			ActionID:       61,
-			ActionType:     "xdrop",
-			TriggerPhase:   "on_expired",
-			Status:         "success",
-			ExternalRuleID: "789",
-			ConnectorID:    ip(connID),
-			ExecutedAt:     now.Add(-1 * time.Minute),
-		},
 	)
+	// v1.2 PR-5: seed bgp_announcements so BGP Mitigations API sees it.
+	ar, _ := ms.bgpAnnouncements.Attach(context.Background(), store.BGPAttachParams{
+		AttackID: 8, ActionID: ip(60), Prefix: "10.8.0.1/32", RouteMap: "RTBH", ConnectorID: connID,
+	})
+	ms.bgpAnnouncements.MarkAnnounced(context.Background(), ar.AnnouncementID)
+	ms.bgpConnectors.connectors = append(ms.bgpConnectors.connectors, store.BGPConnector{
+		ID: connID, Name: "test-bgp", Enabled: true,
+	})
+	// xDrop rule was withdrawn — seed xdrop_active_rules as withdrawn so it
+	// doesn't appear in the Mitigations xDrop list (ListActive filters it).
+	ms.xdropActiveRules.Upsert(context.Background(), &store.XDropActiveRule{
+		AttackID: 8, ActionID: 61, ConnectorID: connID, ExternalRuleID: "789", Status: "withdrawn",
+	})
 
 	r := setupRouter(ms)
 
@@ -596,6 +615,204 @@ func TestListActive_BGPAndXDropDoNotInterfere(t *testing.T) {
 	}
 	if got := decodeList(t, wXDrop); len(got) != 0 {
 		t.Fatalf("xdrop: expected empty list, got %d items", len(got))
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// attached_attacks: shared announcement (2 attacks) must surface both
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestListActiveBGPRoutes_AttachedAttacksShared(t *testing.T) {
+	ms := NewMockStore()
+	now := time.Now()
+	ctx := context.Background()
+
+	ms.attacks.attacks = append(ms.attacks.attacks,
+		store.Attack{ID: 11, DstIP: "192.0.2.0/24", DecoderFamily: "ip", StartedAt: now.Add(-3 * time.Minute)},
+		store.Attack{ID: 12, DstIP: "192.0.2.0/24", DecoderFamily: "udp", StartedAt: now.Add(-3 * time.Minute)},
+	)
+	ms.bgpConnectors.connectors = append(ms.bgpConnectors.connectors, store.BGPConnector{ID: 6, Name: "Main BGP", Enabled: true})
+
+	// Two attacks attach to same announcement (business key shared).
+	r1, _ := ms.bgpAnnouncements.Attach(ctx, store.BGPAttachParams{
+		AttackID: 11, ActionID: ip(114), ResponseName: "v1.2-test-B",
+		Prefix: "192.0.2.0/24", RouteMap: "RTBH", ConnectorID: 6, DelayMinutes: 1,
+	})
+	ms.bgpAnnouncements.MarkAnnounced(ctx, r1.AnnouncementID)
+	ms.bgpAnnouncements.Attach(ctx, store.BGPAttachParams{
+		AttackID: 12, ActionID: ip(121), ResponseName: "v1.2-test-C",
+		Prefix: "192.0.2.0/24", RouteMap: "RTBH", ConnectorID: 6, DelayMinutes: 5,
+	})
+
+	r := setupRouter(ms)
+	w := doGet(t, r, "/api/active-actions/bgp")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	list := decodeList(t, w)
+	if len(list) != 1 {
+		t.Fatalf("expected 1 row (shared announcement), got %d", len(list))
+	}
+	item := list[0]
+	atks, ok := item["attached_attacks"].([]any)
+	if !ok {
+		t.Fatalf("attached_attacks missing/wrong type: %+v", item["attached_attacks"])
+	}
+	if len(atks) != 2 {
+		t.Fatalf("expected 2 attached_attacks, got %d: %+v", len(atks), atks)
+	}
+	// Both attack IDs should be present.
+	ids := map[float64]map[string]any{}
+	for _, raw := range atks {
+		m := raw.(map[string]any)
+		ids[m["attack_id"].(float64)] = m
+	}
+	if _, ok := ids[11]; !ok {
+		t.Errorf("attack_id=11 not in attached_attacks")
+	}
+	if _, ok := ids[12]; !ok {
+		t.Errorf("attack_id=12 not in attached_attacks")
+	}
+	// Each should carry decoder + delay_minutes (config snapshot) + response_name.
+	if got := ids[11]["decoder"]; got != "ip" {
+		t.Errorf("attack 11 decoder = %v, want ip", got)
+	}
+	if got := ids[12]["decoder"]; got != "udp" {
+		t.Errorf("attack 12 decoder = %v, want udp", got)
+	}
+	if got := ids[11]["delay_minutes"]; got != float64(1) {
+		t.Errorf("attack 11 delay_minutes = %v, want 1", got)
+	}
+	if got := ids[12]["delay_minutes"]; got != float64(5) {
+		t.Errorf("attack 12 delay_minutes = %v, want 5", got)
+	}
+	// detached_at nil → key absent via omitempty; absent keys mean still attached.
+	if _, present := ids[11]["detached_at"]; present {
+		t.Errorf("attack 11 should be currently attached (no detached_at)")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// attached_attacks: detached history capped at 30, all active always surfaced
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestListActiveBGPRoutes_AttachedAttacksDetachedCap(t *testing.T) {
+	ms := NewMockStore()
+	now := time.Now()
+	ctx := context.Background()
+
+	ms.bgpConnectors.connectors = append(ms.bgpConnectors.connectors, store.BGPConnector{ID: 6, Name: "Main BGP", Enabled: true})
+
+	// To test the cap, we need many detach events WITHIN the same cycle
+	// (not each in its own cycle — those would be filtered by cycle scope).
+	// Simulate a long-running announcement with churn: 45 attacks all attach
+	// (refcount grows to 45, announcement stays active), then 43 detach
+	// (refcount drops to 2, but never hits 0 so announcement stays in the
+	// same cycle). 2 remain attached, 43 are historical detached within
+	// the cycle.
+	var firstAnnID int
+	for i := 1; i <= 45; i++ {
+		ms.attacks.attacks = append(ms.attacks.attacks, store.Attack{
+			ID: i, DstIP: "192.0.2.0/24", DecoderFamily: "udp",
+			StartedAt: now.Add(-time.Duration(45-i) * time.Minute),
+		})
+		ar, _ := ms.bgpAnnouncements.Attach(ctx, store.BGPAttachParams{
+			AttackID: i, ActionID: ip(111), Prefix: "192.0.2.0/24",
+			RouteMap: "RTBH", ConnectorID: 6, DelayMinutes: 0,
+		})
+		if i == 1 {
+			firstAnnID = ar.AnnouncementID
+			ms.bgpAnnouncements.MarkAnnounced(ctx, firstAnnID)
+		}
+	}
+	// Detach 1..43, leaving 44 and 45 currently attached.
+	for i := 1; i <= 43; i++ {
+		ms.bgpAnnouncements.Detach(ctx, i, "192.0.2.0/24", "RTBH", 6)
+	}
+
+	r := setupRouter(ms)
+	w := doGet(t, r, "/api/active-actions/bgp")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	list := decodeList(t, w)
+	if len(list) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(list))
+	}
+	atks := list[0]["attached_attacks"].([]any)
+	// Expect: 2 active + 30 detached cap = 32 total.
+	if len(atks) != 32 {
+		t.Fatalf("expected 32 entries (2 active + 30 capped detached), got %d", len(atks))
+	}
+	// First 2 must be currently-attached (no detached_at field).
+	for i := 0; i < 2; i++ {
+		entry := atks[i].(map[string]any)
+		if _, present := entry["detached_at"]; present {
+			t.Errorf("entry %d should be active (no detached_at), got %+v", i, entry)
+		}
+	}
+	// Remaining 30 must all have detached_at populated.
+	for i := 2; i < 32; i++ {
+		entry := atks[i].(map[string]any)
+		if _, present := entry["detached_at"]; !present {
+			t.Errorf("entry %d should be detached, got %+v", i, entry)
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// attached_attacks must filter to CURRENT cycle only. Previous-cycle attacks
+// (attached before announcement's most recent announced_at — resurrect) are
+// excluded, so the operator drawer shows only who's attached to THIS run.
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestListActiveBGPRoutes_AttachedAttacksCycleFiltered(t *testing.T) {
+	ms := NewMockStore()
+	ctx := context.Background()
+
+	ms.bgpConnectors.connectors = append(ms.bgpConnectors.connectors, store.BGPConnector{ID: 6, Name: "Main BGP", Enabled: true})
+
+	// Cycle 1: attack 1 attached + detached, then cycle ends (withdraw).
+	ms.attacks.attacks = append(ms.attacks.attacks, store.Attack{
+		ID: 1, DstIP: "192.0.2.0/24", DecoderFamily: "udp",
+	})
+	ar1, _ := ms.bgpAnnouncements.Attach(ctx, store.BGPAttachParams{
+		AttackID: 1, Prefix: "192.0.2.0/24", RouteMap: "RTBH", ConnectorID: 6,
+	})
+	ms.bgpAnnouncements.MarkAnnounced(ctx, ar1.AnnouncementID)
+	ms.bgpAnnouncements.Detach(ctx, 1, "192.0.2.0/24", "RTBH", 6)
+	ms.bgpAnnouncements.MarkWithdrawn(ctx, ar1.AnnouncementID)
+
+	// Cycle 2 (resurrect): attack 2 attached.
+	ms.attacks.attacks = append(ms.attacks.attacks, store.Attack{
+		ID: 2, DstIP: "192.0.2.0/24", DecoderFamily: "udp",
+	})
+	ar2, _ := ms.bgpAnnouncements.Attach(ctx, store.BGPAttachParams{
+		AttackID: 2, Prefix: "192.0.2.0/24", RouteMap: "RTBH", ConnectorID: 6,
+	})
+	ms.bgpAnnouncements.MarkAnnounced(ctx, ar2.AnnouncementID)
+	if ar1.AnnouncementID != ar2.AnnouncementID {
+		t.Fatalf("expected resurrect (same id); got %d vs %d", ar1.AnnouncementID, ar2.AnnouncementID)
+	}
+
+	r := setupRouter(ms)
+	w := doGet(t, r, "/api/active-actions/bgp")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	list := decodeList(t, w)
+	if len(list) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(list))
+	}
+	atks := list[0]["attached_attacks"].([]any)
+	// Only current-cycle attack (attack_id=2) should appear; attack 1 from
+	// the previous lifecycle must be filtered out.
+	if len(atks) != 1 {
+		t.Fatalf("expected 1 current-cycle attack, got %d: %+v", len(atks), atks)
+	}
+	entry := atks[0].(map[string]any)
+	if entry["attack_id"].(float64) != 2 {
+		t.Errorf("expected attack_id=2 (current cycle), got %v", entry["attack_id"])
 	}
 }
 

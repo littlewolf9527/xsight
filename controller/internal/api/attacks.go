@@ -287,6 +287,97 @@ func getAttackSensorLogs(deps Dependencies) gin.HandlerFunc {
 	}
 }
 
+// getMitigationSummary aggregates the per-attack mitigation state from the
+// three v1.2 sources of truth (action_execution_log, bgp_announcements +
+// attachments, xdrop_active_rules) into a single response so the frontend
+// doesn't need to fan out N requests per attack to render the Mitigations
+// drawer / attack detail page.
+func getMitigationSummary(deps Dependencies) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			errResponse(c, http.StatusBadRequest, "invalid attack id")
+			return
+		}
+		attack, err := deps.Store.Attacks().Get(c, id)
+		if err != nil {
+			errResponse(c, http.StatusNotFound, "attack not found")
+			return
+		}
+
+		execs, err := deps.Store.ActionExecLog().ListByAttack(c, id)
+		if err != nil {
+			errResponse(c, http.StatusInternalServerError, "load executions: "+err.Error())
+			return
+		}
+		if execs == nil {
+			execs = []store.ActionExecutionLog{}
+		}
+
+		xrules, err := deps.Store.XDropActiveRules().ListByAttack(c, id)
+		if err != nil {
+			errResponse(c, http.StatusInternalServerError, "load xdrop rules: "+err.Error())
+			return
+		}
+		if xrules == nil {
+			xrules = []store.XDropActiveRule{}
+		}
+
+		attachments, err := deps.Store.BGPAnnouncements().ListAttachmentsForAttack(c, id)
+		if err != nil {
+			errResponse(c, http.StatusInternalServerError, "load bgp attachments: "+err.Error())
+			return
+		}
+		bgpView := make([]gin.H, 0, len(attachments))
+		for _, att := range attachments {
+			ann, err := deps.Store.BGPAnnouncements().Get(c, att.AnnouncementID)
+			if err != nil || ann == nil {
+				continue
+			}
+			bgpView = append(bgpView, gin.H{
+				"announcement":         ann,
+				"attached_at":          att.AttachedAt,
+				"detached_at":          att.DetachedAt,
+				"attack_delay_minutes": att.DelayMinutes,
+				"attack_action_id":     att.ActionID,
+			})
+		}
+
+		summary := gin.H{
+			"total_evaluated": len(execs),
+			"success":         0,
+			"failed":          0,
+			"skipped":         0,
+			"timeout":         0,
+		}
+		skipReasons := map[string]int{}
+		for _, l := range execs {
+			switch l.Status {
+			case "success":
+				summary["success"] = summary["success"].(int) + 1
+			case "failed":
+				summary["failed"] = summary["failed"].(int) + 1
+			case "skipped":
+				summary["skipped"] = summary["skipped"].(int) + 1
+				if l.SkipReason != "" {
+					skipReasons[l.SkipReason]++
+				}
+			case "timeout":
+				summary["timeout"] = summary["timeout"].(int) + 1
+			}
+		}
+		summary["skip_reasons"] = skipReasons
+
+		ok(c, gin.H{
+			"attack":            attack,
+			"executions":        execs,
+			"xdrop_rules":       xrules,
+			"bgp_announcements": bgpView,
+			"summary":           summary,
+		})
+	}
+}
+
 func listAuditLog(deps Dependencies) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		filter := store.AuditFilter{

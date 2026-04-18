@@ -15,6 +15,62 @@ import (
 	"github.com/littlewolf9527/xsight/controller/internal/store"
 )
 
+// xDropSyntheticFailedRuleIDPrefix is attached to a rule row when xDrop's
+// POST /rules failed before any real rule ID was returned (connect refused,
+// timeout, 4xx/5xx, etc.). Surfaces the failure in `xdrop_active_rules` so
+// Mitigations UI can show a "failed" badge, while letting the later unblock
+// path recognize there's no real rule on the xDrop side to DELETE.
+const xDropSyntheticFailedRuleIDPrefix = "failed-create-"
+
+// syntheticFailedXDropRuleID returns a deterministic synthetic rule ID for a
+// failed xDrop create. Deterministic on (attack, action) so retries upsert
+// the same row (idempotent), and distinguishable via the prefix so the
+// unblock path can skip the DELETE.
+func syntheticFailedXDropRuleID(attackID, actionID int) string {
+	return fmt.Sprintf("%s%d-%d", xDropSyntheticFailedRuleIDPrefix, attackID, actionID)
+}
+
+func isSyntheticFailedXDropRuleID(ruleID string) bool {
+	return strings.HasPrefix(ruleID, xDropSyntheticFailedRuleIDPrefix)
+}
+
+// CloseSyntheticXDropRuleLocal honors the "no real rule to DELETE" contract
+// for synthetic "failed-create-*" IDs: writes an audit log, marks the
+// xdrop_active_rules row withdrawn, and (if `engine` is non-nil and
+// scheduledActionID > 0) completes the corresponding scheduled_action.
+//
+// Called by both immediate and delayed unblock code paths. Keeping a single
+// function guarantees the two paths can never drift — which is what the
+// PR-8 audit specifically asked to lock down.
+//
+// Exported for focused integration testing from the tests package.
+func CloseSyntheticXDropRuleLocal(
+	ctx context.Context,
+	s store.Store,
+	engine *Engine,
+	attackID, actionID, connectorID int,
+	connectorName, triggerPhase, ruleID string,
+	scheduledActionID int,
+) {
+	connID := connectorID
+	s.ActionExecLog().Create(ctx, &store.ActionExecutionLog{
+		AttackID:       attackID,
+		ActionID:       actionID,
+		ActionType:     "xdrop",
+		ConnectorName:  connectorName,
+		ConnectorID:    &connID,
+		TriggerPhase:   triggerPhase,
+		ExternalRuleID: ruleID,
+		Status:         "success",
+		ErrorMessage:   "synthetic failed-create rule; no xDrop DELETE needed",
+		ExecutedAt:     time.Now(),
+	})
+	s.XDropActiveRules().MarkWithdrawn(ctx, attackID, actionID, connectorID, ruleID)
+	if engine != nil && scheduledActionID > 0 {
+		engine.CompleteDelay(ctx, scheduledActionID, attackID, actionID, connectorID, ruleID)
+	}
+}
+
 // xdropRuleRequest is the default request body sent to xDrop API.
 // Matches xDrop's RuleRequest format — any field left empty/zero is treated as wildcard.
 type xdropRuleRequest struct {
@@ -184,23 +240,28 @@ func executeXDrop(
 				continue // no rules for this connector
 			}
 
-			// Per-artifact manual_override suppression: skip rules that were force-removed
-			overrideLogs, _ := s.ActionExecLog().ListByAttack(ctx, attackDBID)
-			overrideSet := make(map[string]bool) // "connID:ruleID" → true
-			for _, ol := range overrideLogs {
-				if ol.TriggerPhase == "manual_override" && ol.Status == "success" && ol.ExternalRuleID != "" {
-					cid := 0
-					if ol.ConnectorID != nil {
-						cid = *ol.ConnectorID
-					}
-					overrideSet[fmt.Sprintf("%d:%s", cid, ol.ExternalRuleID)] = true
-				}
+			// Per-artifact manual_override suppression: v1.2 PR-2 uses the
+			// indexed action_manual_overrides table instead of scanning
+			// execution logs. Pre-fetch set for the attack, then O(1)
+			// membership check per rule.
+			//
+			// Key must include action_id — two different actions on the same
+			// attack may share connector+rule, but operator force-removing one
+			// must NOT suppress the other. Matches the UNIQUE business key on
+			// the action_manual_overrides table.
+			overrides, err := s.ManualOverrides().ListByAttack(ctx, attackDBID)
+			if err != nil {
+				log.Printf("action: xdrop unblock override lookup failed (attack=%d): %v — proceeding without override filter", attackDBID, err)
+			}
+			overrideSet := make(map[string]bool, len(overrides))
+			for _, o := range overrides {
+				overrideSet[fmt.Sprintf("%d:%d:%s", o.ActionID, o.ConnectorID, o.ExternalRuleID)] = true
 			}
 			var filteredRules []store.RuleWithAction
 			for _, ra := range rulesWithActions {
-				key := fmt.Sprintf("%d:%s", conn.ID, ra.RuleID)
+				key := fmt.Sprintf("%d:%d:%s", ra.ActionID, conn.ID, ra.RuleID)
 				if overrideSet[key] {
-					log.Printf("action: xdrop unblock skipping rule %s (manual override, attack=%d)", ra.RuleID, attackDBID)
+					log.Printf("action: xdrop unblock skipping rule %s (manual override, attack=%d action=%d)", ra.RuleID, attackDBID, ra.ActionID)
 					continue
 				}
 				filteredRules = append(filteredRules, ra)
@@ -240,15 +301,44 @@ func executeXDrop(
 			deleted := 0
 			var lastErr string
 			for _, ruleID := range immediateRules {
+				// v1.2 PR-4: transition active→withdrawing before side effect.
+				// If the row has already moved to withdrawing/withdrawn/failed
+				// (another goroutine got there first, or a force-remove landed),
+				// MarkWithdrawing returns false and we skip this artifact.
+				actionIDForRule := action.ID
+				for _, ra := range rulesWithActions {
+					if ra.RuleID == ruleID {
+						actionIDForRule = ra.ActionID
+						break
+					}
+				}
+				if ok, _ := s.XDropActiveRules().MarkWithdrawing(ctx, attackDBID, actionIDForRule, connID, ruleID); !ok {
+					// Row not in active/delayed — either no row (legacy) or already
+					// past this transition. Proceed anyway for backward compat with
+					// rules that predate PR-4 bootstrap.
+					log.Printf("action: xdrop unblock rule %s not in active state (proceeding, attack=%d)", ruleID, attackDBID)
+				}
+
+				// Synthetic "failed-create-*" IDs never made it onto the xDrop
+				// node, so DELETE would pointlessly 404. Skip the HTTP call and
+				// close the row locally — this also cleans up failed rows in
+				// the state table instead of letting them linger.
+				if isSyntheticFailedXDropRuleID(ruleID) {
+					deleted++
+					CloseSyntheticXDropRuleLocal(ctx, s, nil, attackDBID, actionIDForRule, connID, conn.Name, triggerPhase, ruleID, 0)
+					continue
+				}
+
 				delURL := apiURL + "/" + ruleID
 				req, err := http.NewRequestWithContext(ctx, "DELETE", delURL, nil)
 				if err != nil {
 					lastErr = fmt.Sprintf("create request: %v", err)
 					s.ActionExecLog().Create(ctx, &store.ActionExecutionLog{
-						AttackID: attackDBID, ActionID: action.ID, ActionType: "xdrop",
+						AttackID: attackDBID, ActionID: actionIDForRule, ActionType: "xdrop",
 						ConnectorName: conn.Name, ConnectorID: &connID, TriggerPhase: triggerPhase,
 						ExternalRuleID: ruleID, Status: "failed", ErrorMessage: lastErr, ExecutedAt: time.Now(),
 					})
+					s.XDropActiveRules().MarkFailed(ctx, attackDBID, actionIDForRule, connID, ruleID, lastErr)
 					continue
 				}
 				req.Header.Set("Content-Type", "application/json")
@@ -260,10 +350,11 @@ func executeXDrop(
 				if err != nil {
 					lastErr = fmt.Sprintf("DELETE %s: %v", delURL, err)
 					s.ActionExecLog().Create(ctx, &store.ActionExecutionLog{
-						AttackID: attackDBID, ActionID: action.ID, ActionType: "xdrop",
+						AttackID: attackDBID, ActionID: actionIDForRule, ActionType: "xdrop",
 						ConnectorName: conn.Name, ConnectorID: &connID, TriggerPhase: triggerPhase,
 						ExternalRuleID: ruleID, Status: "failed", ErrorMessage: lastErr, ExecutedAt: time.Now(),
 					})
+					s.XDropActiveRules().MarkFailed(ctx, attackDBID, actionIDForRule, connID, ruleID, lastErr)
 					continue
 				}
 				resp.Body.Close()
@@ -278,7 +369,7 @@ func executeXDrop(
 					}
 					ruleLog := &store.ActionExecutionLog{
 						AttackID:       attackDBID,
-						ActionID:       action.ID,
+						ActionID:       actionIDForRule,
 						ActionType:     "xdrop",
 						ConnectorName:  conn.Name,
 						ConnectorID:    &connID,
@@ -291,12 +382,13 @@ func executeXDrop(
 					if _, err := s.ActionExecLog().Create(ctx, ruleLog); err != nil {
 						log.Printf("action: create per-rule unblock log: %v", err)
 					}
+					s.XDropActiveRules().MarkWithdrawn(ctx, attackDBID, actionIDForRule, connID, ruleID)
 				} else {
 					lastErr = fmt.Sprintf("DELETE %s: HTTP %d", delURL, resp.StatusCode)
 					// Write per-rule failed log with full business key
 					failLog := &store.ActionExecutionLog{
 						AttackID:       attackDBID,
-						ActionID:       action.ID,
+						ActionID:       actionIDForRule,
 						ActionType:     "xdrop",
 						ConnectorName:  conn.Name,
 						ConnectorID:    &connID,
@@ -309,15 +401,76 @@ func executeXDrop(
 					if _, err := s.ActionExecLog().Create(ctx, failLog); err != nil {
 						log.Printf("action: create per-rule failed log: %v", err)
 					}
+					s.XDropActiveRules().MarkFailed(ctx, attackDBID, actionIDForRule, connID, ruleID, fmt.Sprintf("HTTP %d", resp.StatusCode))
 				}
 			}
 
 			// Schedule delayed rule deletions — write "scheduled" log entries for Mitigations UI
 			for _, dr := range delayedRules {
 				scheduledFor := time.Now().Add(dr.delay)
+				// Resolve the action_id for THIS rule (may differ from the
+				// enclosing action when rules came from multiple actions).
+				ruleActionID := action.ID
+				for _, ra := range rulesWithActions {
+					if ra.RuleID == dr.ruleID {
+						ruleActionID = ra.ActionID
+						break
+					}
+				}
+				// v1.2 PR-4 P2 fix: persist the schedule FIRST, before mutating
+				// xdrop_active_rules. If persistence fails we must not put the
+				// rule into the authoritative `delayed` state — that would leave
+				// it permanently stuck in Mitigations UI with no recovery path
+				// (ReconcileOnStartup only scans scheduled_actions/withdrawing,
+				// never xdrop_active_rules.delayed alone).
+				var schedID int
+				var cancelCtx context.Context
+				var persistErr error
+				if engine != nil {
+					id, cctx, perr := engine.ScheduleDelay(ctx, "xdrop_unblock", attackDBID, ruleActionID, connID, dr.ruleID, scheduledFor)
+					if perr != nil {
+						persistErr = perr
+						log.Printf("action: xdrop ScheduleDelay persist failed rule=%s attack=%d action=%d: %v", dr.ruleID, attackDBID, ruleActionID, perr)
+					} else {
+						schedID = id
+						cancelCtx = cctx
+					}
+				}
+				if persistErr != nil {
+					// Schedule did not persist — refuse to pretend the artifact is
+					// in durable delayed state. Mark as failed so operator can see
+					// the broken state in Mitigations and Force Unblock manually.
+					// No goroutine launched: without persistence, a restart mid-delay
+					// would lose the task silently, which is exactly what PR-3/PR-4
+					// are trying to prevent.
+					errMsg := fmt.Sprintf("schedule persist failed: %v", persistErr)
+					s.XDropActiveRules().MarkFailed(ctx, attackDBID, ruleActionID, connID, dr.ruleID, errMsg)
+					failSched := &store.ActionExecutionLog{
+						AttackID:       attackDBID,
+						ActionID:       ruleActionID,
+						ActionType:     "xdrop",
+						TriggerPhase:   triggerPhase,
+						ResponseName:   responseName,
+						ConnectorName:  conn.Name,
+						ConnectorID:    &connID,
+						ExternalRuleID: dr.ruleID,
+						Status:         "failed",
+						ErrorMessage:   errMsg,
+						ExecutedAt:     time.Now(),
+					}
+					if _, err := s.ActionExecLog().Create(ctx, failSched); err != nil {
+						log.Printf("action: create failed schedule log rule=%s: %v", dr.ruleID, err)
+					}
+					continue
+				}
+
+				// Schedule persisted — safe to advertise delayed state.
+				if err := s.XDropActiveRules().MarkDelayed(ctx, attackDBID, ruleActionID, connID, dr.ruleID, int(dr.delay/time.Minute)); err != nil {
+					log.Printf("action: xdrop_active_rules mark delayed rule=%s: %v", dr.ruleID, err)
+				}
 				schedLog := &store.ActionExecutionLog{
 					AttackID:       attackDBID,
-					ActionID:       action.ID,
+					ActionID:       ruleActionID,
 					ActionType:     "xdrop",
 					TriggerPhase:   triggerPhase,
 					ResponseName:   responseName,
@@ -334,21 +487,46 @@ func executeXDrop(
 				}
 				log.Printf("action: scheduling delayed unblock rule %s in %v (attack=%d connector=%d)",
 					dr.ruleID, dr.delay, attackDBID, conn.ID)
-				go func(ruleID string, d time.Duration, connCopy store.XDropConnector, cID int) {
+				go func(ruleID string, d time.Duration, connCopy store.XDropConnector, cID int, sid int, cctx context.Context, aID int) {
 					// Per-artifact cancelable delay via Engine
-					if engine != nil {
-						cancelCtx := engine.ScheduleDelay(attackDBID, action.ID, cID, ruleID)
+					if engine != nil && cctx != nil {
 						select {
 						case <-time.After(d):
-							// Timer expired — proceed with deletion
-						case <-cancelCtx.Done():
-							log.Printf("action: delayed unblock rule %s cancelled (re-breach) attack=%d", ruleID, attackDBID)
+							// Race guard before side-effect
+							execGuardCtx, gc := context.WithTimeout(context.Background(), 5*time.Second)
+							ok := engine.MarkExecutingDelay(execGuardCtx, sid)
+							gc()
+							if !ok {
+								log.Printf("action: delayed unblock rule %s skipped attack=%d scheduled_id=%d (no longer pending)", ruleID, attackDBID, sid)
+								return
+							}
+						case <-cctx.Done():
+							log.Printf("action: delayed unblock rule %s cancelled attack=%d scheduled_id=%d", ruleID, attackDBID, sid)
 							return
 						}
-						engine.CompleteDelay(attackDBID, action.ID, cID, ruleID)
 					} else {
 						time.Sleep(d) // legacy fallback
 					}
+					// v1.2 PR-4: transition delayed → withdrawing before side effect
+					markCtx, mc := context.WithTimeout(context.Background(), 5*time.Second)
+					s.XDropActiveRules().MarkWithdrawing(markCtx, attackDBID, aID, cID, ruleID)
+					mc()
+
+					// Synthetic "failed-create-*" IDs never made it onto the
+					// xDrop node. Same contract as the immediate unblock loop:
+					// skip the HTTP DELETE, close the row locally, and mark
+					// the scheduled_action complete. Without this, delayed
+					// unblock would fire a real DELETE against /rules/failed-
+					// create-... which could 4xx/5xx and leak the row into a
+					// spurious failed state. PR-8 audit P1.
+					if isSyntheticFailedXDropRuleID(ruleID) {
+						log.Printf("action: delayed unblock rule %s is synthetic failed-create; no xDrop DELETE needed (attack=%d)", ruleID, attackDBID)
+						localCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						CloseSyntheticXDropRuleLocal(localCtx, s, engine, attackDBID, aID, cID, connCopy.Name, triggerPhase, ruleID, sid)
+						cancel()
+						return
+					}
+
 					delCtx, delCancel := context.WithTimeout(context.Background(), 30*time.Second)
 					defer delCancel()
 					delURL := strings.TrimRight(connCopy.APIURL, "/") + "/rules/" + ruleID
@@ -357,11 +535,15 @@ func executeXDrop(
 						log.Printf("action: delayed unblock rule %s failed: %v", ruleID, err)
 						errCtx, ec := context.WithTimeout(context.Background(), 5*time.Second)
 						s.ActionExecLog().Create(errCtx, &store.ActionExecutionLog{
-							AttackID: attackDBID, ActionID: action.ID, ActionType: "xdrop",
+							AttackID: attackDBID, ActionID: aID, ActionType: "xdrop",
 							ConnectorName: connCopy.Name, ConnectorID: &cID, TriggerPhase: triggerPhase,
 							ExternalRuleID: ruleID, Status: "failed", ErrorMessage: fmt.Sprintf("create request: %v", err), ExecutedAt: time.Now(),
 						})
+						s.XDropActiveRules().MarkFailed(errCtx, attackDBID, aID, cID, ruleID, fmt.Sprintf("create request: %v", err))
 						ec()
+						if engine != nil {
+							engine.FailDelay(context.Background(), sid, attackDBID, aID, cID, ruleID, fmt.Sprintf("create request: %v", err))
+						}
 						return
 					}
 					req.Header.Set("Content-Type", "application/json")
@@ -375,11 +557,15 @@ func executeXDrop(
 						log.Printf("action: delayed unblock rule %s failed: %v", ruleID, err)
 						errCtx2, ec2 := context.WithTimeout(context.Background(), 5*time.Second)
 						s.ActionExecLog().Create(errCtx2, &store.ActionExecutionLog{
-							AttackID: attackDBID, ActionID: action.ID, ActionType: "xdrop",
+							AttackID: attackDBID, ActionID: aID, ActionType: "xdrop",
 							ConnectorName: connCopy.Name, ConnectorID: &cID, TriggerPhase: triggerPhase,
 							ExternalRuleID: ruleID, Status: "failed", ErrorMessage: fmt.Sprintf("DELETE: %v", err), ExecutedAt: time.Now(),
 						})
+						s.XDropActiveRules().MarkFailed(errCtx2, attackDBID, aID, cID, ruleID, fmt.Sprintf("DELETE: %v", err))
 						ec2()
+						if engine != nil {
+							engine.FailDelay(context.Background(), sid, attackDBID, aID, cID, ruleID, fmt.Sprintf("DELETE: %v", err))
+						}
 						return
 					}
 					resp.Body.Close()
@@ -395,7 +581,7 @@ func executeXDrop(
 						}
 						ruleLog := &store.ActionExecutionLog{
 							AttackID:       attackDBID,
-							ActionID:       action.ID,
+							ActionID:       aID,
 							ActionType:     "xdrop",
 							ConnectorName:  connCopy.Name,
 							ConnectorID:    &cID,
@@ -409,12 +595,20 @@ func executeXDrop(
 						if _, err := s.ActionExecLog().Create(logCtx, ruleLog); err != nil {
 							log.Printf("action: create per-rule delayed unblock log: %v", err)
 						}
+						// v1.2 PR-4: state table withdrawing → withdrawn
+						s.XDropActiveRules().MarkWithdrawn(logCtx, attackDBID, aID, cID, ruleID)
 						lc()
+						// v1.2 PR-3: mark scheduled_action completed
+						if engine != nil {
+							doneCtx, dc := context.WithTimeout(context.Background(), 5*time.Second)
+							engine.CompleteDelay(doneCtx, sid, attackDBID, aID, cID, ruleID)
+							dc()
+						}
 					} else {
 						// Real failure — write per-rule failed log
 						failLog := &store.ActionExecutionLog{
 							AttackID:       attackDBID,
-							ActionID:       action.ID,
+							ActionID:       aID,
 							ActionType:     "xdrop",
 							ConnectorName:  connCopy.Name,
 							ConnectorID:    &cID,
@@ -428,9 +622,17 @@ func executeXDrop(
 						if _, err := s.ActionExecLog().Create(logCtx2, failLog); err != nil {
 							log.Printf("action: create per-rule delayed failed log: %v", err)
 						}
+						// v1.2 PR-4: state table → failed
+						s.XDropActiveRules().MarkFailed(logCtx2, attackDBID, aID, cID, ruleID, fmt.Sprintf("HTTP %d", resp.StatusCode))
 						lc2()
+						// v1.2 PR-3: mark scheduled_action failed
+						if engine != nil {
+							doneCtx, dc := context.WithTimeout(context.Background(), 5*time.Second)
+							engine.FailDelay(doneCtx, sid, attackDBID, aID, cID, ruleID, fmt.Sprintf("HTTP %d", resp.StatusCode))
+							dc()
+						}
 					}
-				}(dr.ruleID, dr.delay, conn, connID)
+				}(dr.ruleID, dr.delay, conn, connID, schedID, cancelCtx, ruleActionID)
 			}
 
 			totalRules := len(immediateRules) + len(delayedRules)
@@ -462,6 +664,18 @@ func executeXDrop(
 		if err != nil {
 			execLog.Status = "failed"
 			execLog.ErrorMessage = fmt.Sprintf("create request: %v", err)
+			// v1.2 PR-4 bug fix: surface create failures in xdrop_active_rules
+			// via a synthetic rule ID so Mitigations UI shows a failed badge
+			// instead of silently dropping the failure on the floor.
+			if triggerPhase == "on_detected" {
+				execLog.ExternalRuleID = syntheticFailedXDropRuleID(attackDBID, action.ID)
+				s.XDropActiveRules().Upsert(ctx, &store.XDropActiveRule{
+					AttackID: attackDBID, ActionID: action.ID, ConnectorID: conn.ID,
+					ExternalRuleID: execLog.ExternalRuleID,
+					Status:         "failed",
+					ErrorMessage:   execLog.ErrorMessage,
+				})
+			}
 			lastLog = execLog
 			if _, err := s.ActionExecLog().Create(ctx, execLog); err != nil {
 				log.Printf("action: create action_execution_log: %v", err)
@@ -481,6 +695,17 @@ func executeXDrop(
 		if err != nil {
 			execLog.Status = "failed"
 			execLog.ErrorMessage = fmt.Sprintf("HTTP %s %s: %v", httpMethod, apiURL, err)
+			// v1.2 PR-4 bug fix: see above — synthetic ID keeps failed state
+			// visible in Mitigations even when the HTTP layer never completed.
+			if triggerPhase == "on_detected" {
+				execLog.ExternalRuleID = syntheticFailedXDropRuleID(attackDBID, action.ID)
+				s.XDropActiveRules().Upsert(ctx, &store.XDropActiveRule{
+					AttackID: attackDBID, ActionID: action.ID, ConnectorID: conn.ID,
+					ExternalRuleID: execLog.ExternalRuleID,
+					Status:         "failed",
+					ErrorMessage:   execLog.ErrorMessage,
+				})
+			}
 			lastLog = execLog
 			if _, err := s.ActionExecLog().Create(ctx, execLog); err != nil {
 				log.Printf("action: create action_execution_log: %v", err)
@@ -498,6 +723,11 @@ func executeXDrop(
 		if statusCode >= 400 {
 			execLog.Status = "failed"
 			execLog.ErrorMessage = fmt.Sprintf("HTTP %d: %s", statusCode, string(respBody))
+			// v1.2 PR-4 bug fix: no real rule ID returned on 4xx/5xx — use a
+			// synthetic one so the failure lands in xdrop_active_rules.
+			if triggerPhase == "on_detected" {
+				execLog.ExternalRuleID = syntheticFailedXDropRuleID(attackDBID, action.ID)
+			}
 		} else {
 			execLog.Status = "success"
 			// Try to extract external_rule_id from response
@@ -512,6 +742,28 @@ func executeXDrop(
 				} else if ruleID, ok := respJSON["rule_id"]; ok {
 					execLog.ExternalRuleID = fmt.Sprintf("%v", ruleID)
 				}
+			}
+		}
+
+		// v1.2 PR-4: record xdrop rule state. Written for both success and
+		// failure so Mitigations UI can surface 'failed' state from the table
+		// rather than reverse-engineering from execution log. Failure paths
+		// above populate a synthetic ExternalRuleID — see
+		// syntheticFailedXDropRuleID.
+		if triggerPhase == "on_detected" && execLog.ExternalRuleID != "" {
+			ruleState := &store.XDropActiveRule{
+				AttackID:       attackDBID,
+				ActionID:       action.ID,
+				ConnectorID:    conn.ID,
+				ExternalRuleID: execLog.ExternalRuleID,
+				Status:         "active",
+			}
+			if execLog.Status == "failed" {
+				ruleState.Status = "failed"
+				ruleState.ErrorMessage = execLog.ErrorMessage
+			}
+			if _, err := s.XDropActiveRules().Upsert(ctx, ruleState); err != nil {
+				log.Printf("action: xdrop_active_rules upsert rule=%s: %v", execLog.ExternalRuleID, err)
 			}
 		}
 

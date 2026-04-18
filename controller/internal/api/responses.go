@@ -9,8 +9,22 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"github.com/littlewolf9527/xsight/controller/internal/action"
 	"github.com/littlewolf9527/xsight/controller/internal/store"
 )
+
+// validateActionTemplateVars rejects unknown {var} placeholders in any action
+// field that flows through expandParams at execution time, so misspellings
+// surface at API time rather than as silent literal forwarding.
+func validateActionTemplateVars(dto actionDTO) error {
+	if err := action.ValidateTemplateVars("xdrop_custom_payload", string(dto.XDropPayload)); err != nil {
+		return err
+	}
+	if err := action.ValidateTemplateVars("shell_extra_args", dto.ShellExtraArgs); err != nil {
+		return err
+	}
+	return nil
+}
 
 // --- Responses ---
 
@@ -279,6 +293,37 @@ func dtoToAction(dto actionDTO, respID int) store.ResponseAction {
 	return act
 }
 
+// actionToDTO snapshots an existing action into the DTO shape used by the API,
+// so updateAction can pre-populate the merge target before applying a partial
+// PUT body. Mirrors dtoToAction's typed-FK → generic ConnectorID mapping.
+func actionToDTO(a *store.ResponseAction) actionDTO {
+	enabled := a.Enabled
+	dto := actionDTO{
+		ActionType:              a.ActionType,
+		TriggerPhase:            a.TriggerPhase,
+		RunMode:                 a.RunMode,
+		PeriodSeconds:           a.PeriodSeconds,
+		Execution:               a.Execution,
+		Priority:                a.Priority,
+		Enabled:                 &enabled,
+		XDropAction:             a.XDropAction,
+		XDropPayload:            a.XDropCustomPayload,
+		ShellExtraArgs:          a.ShellExtraArgs,
+		UnblockDelayMinutes:     a.UnblockDelayMinutes,
+		BGPRouteMap:             a.BGPRouteMap,
+		BGPWithdrawDelayMinutes: a.BGPWithdrawDelayMinutes,
+	}
+	switch a.ActionType {
+	case "webhook":
+		dto.ConnectorID = a.WebhookConnectorID
+	case "shell":
+		dto.ConnectorID = a.ShellConnectorID
+	case "bgp":
+		dto.ConnectorID = a.BGPConnectorID
+	}
+	return dto
+}
+
 func createAction(deps Dependencies) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		respID, _ := strconv.Atoi(c.Param("id"))
@@ -310,6 +355,11 @@ func createAction(deps Dependencies) gin.HandlerFunc {
 		// Validate: xDrop action semantics
 		if msg := validateXDropAction(dto); msg != "" {
 			errResponse(c, http.StatusBadRequest, msg)
+			return
+		}
+		// Validate: template variable placeholders in user payloads
+		if err := validateActionTemplateVars(dto); err != nil {
+			errResponse(c, http.StatusBadRequest, err.Error())
 			return
 		}
 		// Global prefix guard: reject xDrop/BGP if this response is used by 0.0.0.0/0
@@ -415,9 +465,31 @@ func updateAction(deps Dependencies) gin.HandlerFunc {
 			errResponse(c, http.StatusBadRequest, "auto-generated on_expired actions cannot be edited directly — edit the on_detected action instead")
 			return
 		}
-		var dto actionDTO
+		// Merge semantics: pre-populate the DTO from the existing action so a
+		// partial PUT (e.g. only bgp_withdraw_delay_minutes) doesn't clobber
+		// unset fields. JSON Unmarshal only overwrites keys present in the body.
+		dto := actionToDTO(old)
+		if old.ActionType == "xdrop" {
+			if targets, err := deps.Store.XDropTargets().List(c, id); err == nil {
+				ids := make([]int, len(targets))
+				for j, t := range targets {
+					ids[j] = t.ID
+				}
+				dto.TargetNodeIDs = ids
+			}
+		}
 		if err := c.ShouldBindJSON(&dto); err != nil {
 			errResponse(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Reject cross-type updates: with merge semantics, the old row's typed
+		// connector FK (webhook/shell/bgp) gets carried over via actionToDTO →
+		// dtoToAction. Re-binding that old connector ID to a new action_type's
+		// FK field silently points the action at a connector of the wrong type,
+		// or an ID that doesn't exist at all. Safer to force delete+recreate.
+		if dto.ActionType != "" && dto.ActionType != old.ActionType {
+			errResponse(c, http.StatusBadRequest,
+				"cannot change action_type via PUT — delete this action and create a new one instead")
 			return
 		}
 		// Validate: on_expired xDrop/BGP must be auto-generated, not manual
@@ -443,6 +515,11 @@ func updateAction(deps Dependencies) gin.HandlerFunc {
 		// Validate: xDrop action semantics
 		if msg := validateXDropAction(dto); msg != "" {
 			errResponse(c, http.StatusBadRequest, msg)
+			return
+		}
+		// Validate: template variable placeholders in user payloads
+		if err := validateActionTemplateVars(dto); err != nil {
+			errResponse(c, http.StatusBadRequest, err.Error())
 			return
 		}
 		// Global prefix guard

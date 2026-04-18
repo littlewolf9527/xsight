@@ -241,6 +241,15 @@ func createTemplateRule(deps Dependencies) gin.HandlerFunc {
 			Inheritable: inheritable,
 			Enabled:     true,
 		}
+		// response_id is optional but must be honored if provided. Earlier
+		// versions of this handler silently dropped it, forcing a follow-up
+		// PUT just to attach a response.
+		if v, ok := raw["response_id"]; ok && v != nil {
+			if n, ok := v.(float64); ok {
+				rid := int(n)
+				req.ResponseID = &rid
+			}
+		}
 		if err := validateThreshold(&req); err != nil {
 			errResponse(c, http.StatusBadRequest, err.Error())
 			return

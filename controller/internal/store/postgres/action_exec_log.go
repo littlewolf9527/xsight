@@ -16,11 +16,11 @@ func (r *actionExecLogRepo) Create(ctx context.Context, l *store.ActionExecution
 		`INSERT INTO action_execution_log
 		 (attack_id, action_id, response_name, action_type, connector_name, trigger_phase,
 		  status, status_code, error_message, request_body, response_body, external_rule_id,
-		  connector_id, duration_ms, scheduled_for)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id`,
+		  connector_id, duration_ms, scheduled_for, detail, skip_reason)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING id`,
 		l.AttackID, l.ActionID, l.ResponseName, l.ActionType, l.ConnectorName, l.TriggerPhase,
 		l.Status, l.StatusCode, l.ErrorMessage, l.RequestBody, l.ResponseBody, l.ExternalRuleID,
-		l.ConnectorID, l.DurationMs, l.ScheduledFor).
+		l.ConnectorID, l.DurationMs, l.ScheduledFor, l.Detail, l.SkipReason).
 		Scan(&id)
 	return id, err
 }
@@ -29,7 +29,8 @@ func (r *actionExecLogRepo) ListByAttack(ctx context.Context, attackID int) ([]s
 	rows, err := r.pool.Query(ctx,
 		`SELECT id, attack_id, action_id, response_name, action_type, connector_name, trigger_phase,
 		        status, status_code, error_message, request_body, response_body, external_rule_id,
-		        connector_id, duration_ms, executed_at, scheduled_for
+		        connector_id, duration_ms, executed_at, scheduled_for,
+		        COALESCE(detail, ''), COALESCE(skip_reason, '')
 		 FROM action_execution_log
 		 WHERE attack_id=$1 ORDER BY executed_at DESC`, attackID)
 	if err != nil {
@@ -42,7 +43,8 @@ func (r *actionExecLogRepo) ListByAttack(ctx context.Context, attackID int) ([]s
 		var l store.ActionExecutionLog
 		if err := rows.Scan(&l.ID, &l.AttackID, &l.ActionID, &l.ResponseName, &l.ActionType,
 			&l.ConnectorName, &l.TriggerPhase, &l.Status, &l.StatusCode, &l.ErrorMessage,
-			&l.RequestBody, &l.ResponseBody, &l.ExternalRuleID, &l.ConnectorID, &l.DurationMs, &l.ExecutedAt, &l.ScheduledFor); err != nil {
+			&l.RequestBody, &l.ResponseBody, &l.ExternalRuleID, &l.ConnectorID, &l.DurationMs, &l.ExecutedAt, &l.ScheduledFor,
+			&l.Detail, &l.SkipReason); err != nil {
 			return nil, err
 		}
 		list = append(list, l)
@@ -55,13 +57,15 @@ func (r *actionExecLogRepo) FindByAttackAndAction(ctx context.Context, attackID,
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, attack_id, action_id, response_name, action_type, connector_name, trigger_phase,
 		        status, status_code, error_message, request_body, response_body, external_rule_id,
-		        connector_id, duration_ms, executed_at, scheduled_for
+		        connector_id, duration_ms, executed_at, scheduled_for,
+		        COALESCE(detail, ''), COALESCE(skip_reason, '')
 		 FROM action_execution_log
 		 WHERE attack_id=$1 AND action_id=$2 AND trigger_phase=$3
 		 ORDER BY executed_at DESC LIMIT 1`, attackID, actionID, triggerPhase).
 		Scan(&l.ID, &l.AttackID, &l.ActionID, &l.ResponseName, &l.ActionType,
 			&l.ConnectorName, &l.TriggerPhase, &l.Status, &l.StatusCode, &l.ErrorMessage,
-			&l.RequestBody, &l.ResponseBody, &l.ExternalRuleID, &l.ConnectorID, &l.DurationMs, &l.ExecutedAt, &l.ScheduledFor)
+			&l.RequestBody, &l.ResponseBody, &l.ExternalRuleID, &l.ConnectorID, &l.DurationMs, &l.ExecutedAt, &l.ScheduledFor,
+			&l.Detail, &l.SkipReason)
 	if err != nil {
 		return nil, fmt.Errorf("action_execution_log attack=%d action=%d phase=%s: %w", attackID, actionID, triggerPhase, err)
 	}
@@ -70,10 +74,15 @@ func (r *actionExecLogRepo) FindByAttackAndAction(ctx context.Context, attackID,
 
 // FindExternalRulesWithActions returns all (external_rule_id, action_id, connector_id) for a given attack.
 // Used by unblock to delete rules only on the connector that originally created them.
+// Includes synthetic "failed-create-*" IDs (see syntheticFailedXDropRuleID) so
+// orphan failed rows in xdrop_active_rules get closed out by the unblock loop
+// rather than lingering indefinitely. The unblock loop short-circuits the
+// actual HTTP DELETE for these synthetic IDs (per isSyntheticFailedXDropRuleID).
 func (r *actionExecLogRepo) FindExternalRulesWithActions(ctx context.Context, attackID int) ([]store.RuleWithAction, error) {
 	query := `SELECT DISTINCT external_rule_id, action_id, COALESCE(connector_id, 0)
 		 FROM action_execution_log
-		 WHERE attack_id=$1 AND action_type='xdrop' AND external_rule_id != '' AND status='success'`
+		 WHERE attack_id=$1 AND action_type='xdrop' AND external_rule_id != ''
+		   AND (status='success' OR (status='failed' AND external_rule_id LIKE 'failed-create-%'))`
 	rows, err := r.pool.Query(ctx, query, attackID)
 	if err != nil {
 		return nil, fmt.Errorf("find external_rules attack=%d: %w", attackID, err)

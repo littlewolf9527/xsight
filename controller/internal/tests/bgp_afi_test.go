@@ -176,13 +176,15 @@ func TestBGPAutoAFI_HasManualOverride_IPv6(t *testing.T) {
 	ms := NewMockStore()
 	eng := action.NewEngine(ms, "auto")
 
-	connID := 1
-	ms.actionExecLog.logs = append(ms.actionExecLog.logs, store.ActionExecutionLog{
-		ID: 40, AttackID: 10, ActionID: 70, ActionType: "manual_override",
-		TriggerPhase: "manual_override", Status: "success",
-		ExternalRuleID: "2001:db8::1/128|RTBH", ConnectorID: &connID,
-		ExecutedAt: time.Now(),
-	})
+	// v1.2 PR-2: seed the index table (authoritative for HasManualOverride)
+	if _, err := ms.manualOverrides.Create(context.Background(), &store.ActionManualOverride{
+		AttackID:       10,
+		ActionID:       70,
+		ConnectorID:    1,
+		ExternalRuleID: "2001:db8::1/128|RTBH",
+	}); err != nil {
+		t.Fatalf("seed manual_override: %v", err)
+	}
 
 	ctx := context.Background()
 	if !eng.HasManualOverride(ctx, 10, 70, 1, "2001:db8::1/128|RTBH") {
@@ -245,6 +247,14 @@ func TestBGPAutoAFI_ActiveActionsParseIPv6(t *testing.T) {
 		ExternalRuleID: "2001:db8::99/128|RTBH", ConnectorID: &connID,
 		ConnectorName: "test-bgp", ExecutedAt: now.Add(-4 * time.Minute),
 	})
+	// v1.2 PR-5: seed bgp_announcements state
+	ar, _ := ms.bgpAnnouncements.Attach(context.Background(), store.BGPAttachParams{
+		AttackID: 200, ActionID: ip(50), Prefix: "2001:db8::99/128", RouteMap: "RTBH", ConnectorID: connID,
+	})
+	ms.bgpAnnouncements.MarkAnnounced(context.Background(), ar.AnnouncementID)
+	ms.bgpConnectors.connectors = append(ms.bgpConnectors.connectors, store.BGPConnector{
+		ID: connID, Name: "test-bgp", Enabled: true,
+	})
 
 	r := setupRouter(ms)
 	w := httptest.NewRecorder()
@@ -278,16 +288,21 @@ func TestBGPAutoAFI_ActiveActionsParseIPv6(t *testing.T) {
 func TestBGPAutoAFI_DelayHelper_IPv6(t *testing.T) {
 	ms := NewMockStore()
 	eng := action.NewEngine(ms, "auto")
+	ctx := context.Background()
+	scheduledFor := time.Now().Add(1 * time.Minute)
 
-	ctx := eng.ScheduleDelay(1, 2, 3, "2001:db8::1/128|RTBH")
-	if ctx == nil {
+	_, cctx, err := eng.ScheduleDelay(ctx, "bgp_withdraw", 1, 2, 3, "2001:db8::1/128|RTBH", scheduledFor)
+	if err != nil {
+		t.Fatalf("ScheduleDelay returned error for IPv6 key: %v", err)
+	}
+	if cctx == nil {
 		t.Fatal("ScheduleDelay returned nil for IPv6 key")
 	}
 
 	// Cancel and verify
 	eng.CancelDelay(1, 2, 3, "2001:db8::1/128|RTBH")
 	select {
-	case <-ctx.Done():
+	case <-cctx.Done():
 		// Expected
 	default:
 		t.Error("CancelDelay did not cancel IPv6 key context")

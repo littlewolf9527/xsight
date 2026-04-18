@@ -131,6 +131,7 @@ func NewRouter(deps Dependencies) *gin.Engine {
 		api.GET("/attacks/:id", getAttack(deps))
 		api.GET("/attacks/:id/action-log", getAttackActionLog(deps))
 		api.GET("/attacks/:id/sensor-logs", getAttackSensorLogs(deps))
+		api.GET("/attacks/:id/mitigation-summary", getMitigationSummary(deps))
 		api.POST("/attacks/:id/expire", expireAttack(deps))
 
 		// Active response actions (BGP routing + xDrop filtering view)
@@ -138,6 +139,14 @@ func NewRouter(deps Dependencies) *gin.Engine {
 		api.GET("/active-actions/xdrop", listActiveXDropRules(deps))
 		api.GET("/active-actions/timeline", getArtifactTimeline(deps))
 		api.POST("/active-actions/force-remove", forceRemoveAction(deps))
+		// v1.2 PR-5: operator endpoints for BGP orphan announcements.
+		// Orphans have no attack_id/action_id, so force-remove's binding:"required"
+		// on those fields would reject the request. These are dedicated endpoints
+		// keyed on announcement_id.
+		api.POST("/active-actions/bgp/orphan-force-withdraw", orphanForceWithdraw(deps))
+		api.POST("/active-actions/bgp/orphan-dismiss", orphanDismiss(deps))
+		api.GET("/active-actions/bgp/dismissed-orphans", listDismissedOrphans(deps))
+		api.POST("/active-actions/bgp/orphan-undismiss", orphanUndismiss(deps))
 
 		// Audit log
 		api.GET("/audit-log", listAuditLog(deps))
