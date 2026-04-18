@@ -1044,6 +1044,15 @@ var migrations = []string{
 	// on_expired success in the log — those rules are still externally active
 	// and need a row in xdrop_active_rules. ON CONFLICT DO NOTHING keeps the
 	// migration idempotent across restarts.
+	//
+	// v1.2.2: the paired on_expired action (auto-created unblock) has a
+	// *different* action_id from the on_detected parent — so the NOT EXISTS
+	// match must NOT include action_id. Matching on
+	// (attack_id, connector_id, external_rule_id) is sufficient: a given
+	// xDrop rule is uniquely identified by those three. Including action_id
+	// here was the v1.2.0 bug that caused every historical rule (even ones
+	// with a successful paired unblock) to be backfilled as "still active".
+	// Mirrors the BGP backfill above, which correctly omits action_id.
 	`INSERT INTO xdrop_active_rules (attack_id, action_id, connector_id, external_rule_id, status, created_at)
 	 SELECT DISTINCT ON (l.attack_id, l.action_id, l.connector_id, l.external_rule_id)
 	        l.attack_id, l.action_id, l.connector_id, l.external_rule_id,
@@ -1060,7 +1069,6 @@ var migrations = []string{
 	       AND l2.trigger_phase = 'on_expired'
 	       AND l2.status = 'success'
 	       AND l2.attack_id = l.attack_id
-	       AND l2.action_id = l.action_id
 	       AND l2.connector_id = l.connector_id
 	       AND l2.external_rule_id = l.external_rule_id
 	   )
