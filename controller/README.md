@@ -34,8 +34,9 @@ The Controller provides a REST API, gRPC ingestion endpoint, real-time detection
 | `engine/classifier` | Attack type classifier using sampled packet data (SYN flood, UDP amplification, etc.) |
 | `engine/dedup` | Alert deduplication to prevent duplicate attack records for the same target |
 | `tracker` | Attack lifecycle state machine -- confirmation window, active tracking, dynamic expiry, crash recovery from DB |
-| `action` | Response execution engine. Supports four action types (xDrop filter/rate-limit, BGP blackhole via FRR/vtysh, webhook HTTP calls, shell scripts) with preconditions, trigger phases, run modes, and execution logging |
-| `api` | Gin-based REST API with JWT + API key authentication. Full CRUD for all configuration entities |
+| `action` | Response execution engine. Supports four action types (xDrop filter/rate-limit, BGP blackhole via FRR/vtysh, webhook HTTP calls, shell scripts) with preconditions, trigger phases, run modes, and execution logging. v1.2 adds the Action State Layer (bgp_announcements + xdrop_active_rules + scheduled_actions) as single source of truth; v1.2.1 adds xDrop decoder compatibility gate |
+| `api` | Gin-based REST API with JWT + API key authentication. Full CRUD for all configuration entities, plus the unauthenticated `/metrics` endpoint |
+| `metrics` | Prometheus instrumentation (v1.2.1). Inline counters for vtysh ops / action dispatches / skips / recovery outcomes; custom collectors for BGP / xDrop / scheduled-action state gauges; attack tracker wrapper. Installed once as a `store.Store` decorator so metrics are a side effect of the DB write |
 | `configpub` | Config Publisher -- pushes prefix/threshold changes to connected nodes via gRPC, with version tracking and drift detection |
 | `retention` | Automatic data cleanup. Drops old ts_stats chunks, flow_logs, expired attacks, and audit log entries on a configurable schedule |
 | `watchdog` | systemd watchdog integration (sd_notify ready + heartbeat) |
@@ -114,6 +115,12 @@ log:
 auth:
   api_key: "CHANGE_ME"    # REST API key (X-API-Key header). Generate: openssl rand -hex 32
 
+action_engine:
+  mode: "observe"          # "observe" (default, safe) skips xDrop dispatch with
+                           # skip_reason=mode_observe. Set to "auto" to enable
+                           # automated xDrop blocking. BGP/webhook/shell are
+                           # NOT gated by this setting.
+
 detection:
   hard_threshold_confirm_seconds: 3      # consecutive breach seconds before attack declared
   dynamic_threshold_confirm_seconds: 5
@@ -155,6 +162,8 @@ The controller will:
 
 A pprof debug endpoint runs on `127.0.0.1:6060` (localhost only).
 
+**Prometheus metrics** are exposed at `GET /metrics` on the HTTP listener (unauthenticated — rely on network-level isolation). See [../docs/architecture.md § 7 Observability](../docs/architecture.md#7-observability-v121) for the metric catalogue.
+
 ## Directory Structure
 
 ```
@@ -179,8 +188,9 @@ controller/
       classifier/          # Attack type classification
       dedup/               # Alert deduplication
     tracker/               # Attack lifecycle state machine
-    action/                # Response execution (xDrop, BGP, webhook, shell)
-    api/                   # REST API handlers + router
+    action/                # Response execution (xDrop, BGP, webhook, shell) + v1.2 Action State Layer
+    metrics/               # Prometheus instrumentation (v1.2.1)
+    api/                   # REST API handlers + router + /metrics endpoint
     configpub/             # Config push to nodes via gRPC
     retention/             # Data retention cleaner
     netutil/               # IP/prefix formatting utilities

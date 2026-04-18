@@ -13,8 +13,10 @@
 3. [Controller Control Plane](#3-controller-control-plane)
 4. [Action Execution Engine](#4-action-execution-engine)
 5. [Auto-Paired Action Lifecycle](#5-auto-paired-action-lifecycle)
-6. [Data Model](#6-data-model)
-7. [Frontend Architecture](#7-frontend-architecture)
+6. [Action State Layer (v1.2)](#6-action-state-layer-v12)
+7. [Observability (v1.2.1)](#7-observability-v121)
+8. [Data Model](#8-data-model)
+9. [Frontend Architecture](#9-frontend-architecture)
 
 ---
 
@@ -282,11 +284,15 @@ The resolution path depends on the attack direction:
 
 The engine iterates over the response's actions, sorted by `(trigger_phase, priority)`:
 
-1. **Phase matching**: `on_detected` actions fire on attack confirmation; `on_expired` actions fire on expiry.
-2. **Run mode**: `once` (fire once per attack), `periodic` (fire every N seconds while active), `retry_until_success`.
-3. **Precondition evaluation**: Each action can have preconditions that filter by 12 attributes (decoder, severity, domain, cidr, node, pps, bps, attack_type, dominant ports, unique source IPs). All conditions use AND logic — every condition must be satisfied.
-4. **First-match ACL**: For non-webhook types (xDrop, BGP, Shell), only the first matching action per type executes. Webhook actions all execute (multi-channel notification).
-5. **Execution**: The action is dispatched to the appropriate handler (webhook POST, shell exec, xDrop API call, vtysh command).
+1. **`action_engine.mode` gate** — the global `action_engine.mode` config value (`observe` | `auto`, default `observe`) gates xDrop actions only. In `observe` mode all xDrop actions are skipped with `skip_reason=mode_observe`; BGP / webhook / shell are never gated by this setting. Set `mode: auto` in `config.yaml` to enable xDrop blocking.
+2. **Phase matching**: `on_detected` actions fire on attack confirmation; `on_expired` actions fire on expiry.
+3. **Run mode**: `once` (fire once per attack), `periodic` (fire every N seconds while active), `retry_until_success`.
+4. **Precondition evaluation**: Each action can have preconditions that filter by 12 attributes (decoder, severity, domain, cidr, node, pps, bps, attack_type, dominant ports, unique source IPs). All conditions use AND logic — every condition must be satisfied.
+5. **First-match ACL**: For non-webhook types (xDrop, BGP, Shell), only the first matching action per type executes. Webhook actions all execute (multi-channel notification).
+6. **xDrop decoder gate (v1.2.1)**: After the first-match mark, if `action_type=xdrop` and the attack's `decoder_family` is not in the xDrop-compatible whitelist (`tcp`, `tcp_syn`, `udp`, `icmp`, `fragment`), the action is skipped with `skip_reason=decoder_not_xdrop_compatible`. The `ip` decoder is intentionally excluded — it is an L3 aggregate and would degrade to a full-prefix blackhole. Operators should use BGP null-route for L3-aggregate attacks.
+7. **Execution**: The action is dispatched to the appropriate handler (webhook POST, shell exec, xDrop API call, vtysh command).
+
+All skip outcomes are recorded in `action_execution_log` with `status=skipped` and a structured `skip_reason` column. The `xsight_action_skip_total{skip_reason}` Prometheus counter mirrors each log entry so operators can rate-monitor skips without pulling log rows.
 
 ### xDrop Execution
 
@@ -295,22 +301,45 @@ The engine iterates over the response's actions, sorted by `(trigger_phase, prio
 - **tcp_syn auto-injection**: When the attack decoder is `tcp_syn`, the engine automatically adds `protocol: tcp` and `tcp_flags: SYN,!ACK` to the xDrop rule payload.
 - **Custom payload**: Supports dynamic variable expansion — `{ip}`, `{dominant_src_port}`, `{dominant_dst_port}`, etc. Variables are resolved at execution time from the attack record and flow analysis data.
 
-### BGP Execution
+### BGP Execution (Wanguard-Style Shared Announcement)
 
-- **on_detected** (announce): Constructs a vtysh command: `configure terminal → router bgp {ASN} → address-family {auto} → network {prefix} route-map {name}`.
-- **on_expired** (withdraw): Looks up previously announced routes from execution logs and runs `no network ...` for each.
-- **Auto-AFI**: The address-family is determined at runtime from the prefix IP version using `net.ParseCIDR` / `net.ParseIP`. IPv4 prefixes use `ipv4 unicast`, IPv6 prefixes use `ipv6 unicast`. A single BGP connector handles both.
-- **External rule ID format**: `{prefix}|{route_map}` (the `|` separator avoids collision with `:` in IPv6 addresses).
+v1.2 treats a BGP announcement as a **refcounted resource keyed on `(prefix, route_map, connector_id)`**, not a per-attack side effect. Multiple attacks that resolve to the same prefix + route-map share a single FRR route; the route is only withdrawn when the last attack detaches.
 
-### Delayed Execution
+**Attach path (on_detected)**:
+1. `Attach(prefix, route_map, connector_id, attack_id, action_id, delay_minutes)` runs inside a `SELECT … FOR UPDATE` transaction on the business key.
+2. If no row exists, it INSERTs a `bgp_announcements` row with `status=announcing`, `refcount=1`, inserts into `bgp_announcement_attacks`, and returns `NeedAnnounce=true`.
+3. If a row exists, it increments `refcount`, inserts into `bgp_announcement_attacks`, and returns `NeedAnnounce=false` — the caller does **not** re-run vtysh.
+4. Only `NeedAnnounce=true` triggers `configure terminal → router bgp {ASN} → address-family {auto} → network {prefix} route-map {name}`. On success the row transitions to `active`.
 
-Both xDrop and BGP support delayed removal after attack expiry:
+**Detach path (on_expired)**:
+1. `Detach(announcement_id, attack_id)` decrements `refcount` and stamps `detached_at` on the `bgp_announcement_attacks` row.
+2. If `refcount > 0` after decrement, the announcement stays active — other attached attacks still need the route.
+3. If `refcount == 0`, the announcement transitions to `delayed` (if the effective delay > 0) or `withdrawing` (delay = 0). The **effective delay is MAX(delay_minutes across all attacks attached in this cycle)** — see Cycle-Sticky MAX Delay below.
+4. When the delay elapses without a re-attach, vtysh `no network …` runs and the row transitions to `withdrawn`.
 
-1. When the on_expired event fires and the action has a delay > 0, the engine writes a `scheduled` execution log entry with a `scheduled_for` timestamp.
-2. A cancelable delayed execution is started. If the delay period elapses without interruption, the removal executes.
-3. If the attack **re-breaches** during the delay, all pending delays for that attack are cancelled via the tracker's re-breach callback.
-4. If the operator **force-removes** a specific artifact, only that artifact's delay is cancelled.
-5. Delays are identified by a full business key: `(attack_id, action_id, connector_id, external_rule_id)`.
+**Auto-AFI**: The address-family is resolved at runtime from the prefix IP version using `net.ParseCIDR` / `net.ParseIP`. IPv4 prefixes use `ipv4 unicast`, IPv6 prefixes use `ipv6 unicast`. A single BGP connector handles both.
+
+**Business key in execution log**: `external_rule_id = {prefix}|{route_map}` (the `|` separator avoids collision with `:` in IPv6 addresses). The announcement's DB `id` is carried on each `action_execution_log` row via `announcement_id`.
+
+**Cycle-Sticky MAX Delay**: When multiple attacks share an announcement, the effective withdraw delay is `MAX(delay_minutes)` across all attacks attached during the current announce cycle (from `announced_at` to the final `Detach` that drops refcount to 0). An attack that attaches mid-cycle with a shorter delay cannot shorten an already-locked-in longer delay; likewise attaching with a longer delay extends the MAX. This is recorded on `bgp_announcement_attacks.delay_minutes` so the post-cycle audit shows each attack's contribution.
+
+### xDrop Execution
+
+- **on_detected** (filter_l4 / rate_limit): POST to xDrop API. The returned `rule_id` is stored as `external_rule_id` in `action_execution_log` and in a new row in `xdrop_active_rules` (v1.2 authoritative state table, see Section 6).
+- **on_expired** (unblock): Looks up all `xdrop_active_rules` rows for this attack and DELETEs each rule via the xDrop API. Each successful removal stamps `withdrawn_at` on the rule row and writes a per-artifact log entry.
+- **tcp_syn auto-injection**: When the attack decoder is `tcp_syn`, the engine automatically adds `protocol: tcp` and `tcp_flags: SYN,!ACK` to the xDrop rule payload.
+- **Protocol normalization (v1.2.1)**: xDrop accepts the enum `{all, tcp, udp, icmp, icmpv6}` for its `protocol` field. xSight normalizes `tcp_syn → tcp` and `fragment → all` at payload-emit time. The `ip` decoder is filtered out earlier by the decoder compatibility gate (see Action Dispatch step 6).
+- **Custom payload**: Supports dynamic variable expansion — `{ip}`, `{dominant_src_port}`, `{dominant_dst_port}`, etc. Variables are resolved at execution time from the attack record and flow analysis data.
+
+### Delayed Execution (Persisted)
+
+Both xDrop and BGP support delayed removal after attack expiry. In v1.2, delayed tasks are **persisted** in the `scheduled_actions` table so they survive controller restarts:
+
+1. When the on_expired event fires and the action has a delay > 0, the engine writes a row into `scheduled_actions` with `status=pending`, `scheduled_for={now + delay}`, and the full business key `(attack_id, action_id, connector_id, external_rule_id)`. For BGP, the row also carries `announcement_id`.
+2. A cancelable in-memory timer is started. When it fires, the row flips to `status=executing` (`MarkExecuting`), runs the removal, then transitions to `completed` / `failed` via `Complete` / `Fail`.
+3. If the attack **re-breaches** during the delay, all pending rows for that attack are cancelled with `status=cancelled` and `cancel_reason=rebreach`.
+4. If the operator **force-removes** a specific artifact, only that artifact's row is cancelled (`cancel_reason=force_remove`).
+5. On startup, `RecoverScheduledActions` scans pending rows and re-arms timers for future `scheduled_for`, fires overdue tasks immediately, and `reconcileExecutingSchedules` retries rows stuck in `executing` (crashed between `MarkExecuting` and `Complete`). Outcomes are counted in the `xsight_scheduled_actions_recovered_total{outcome}` Prometheus counter (`armed`, `overdue_fired`, `executing_retried`).
 
 ### Manual Override (Force Remove)
 
@@ -362,7 +391,119 @@ Each successful withdrawal/unblock writes a **per-artifact** execution log entry
 
 ---
 
-## 6. Data Model
+## 6. Action State Layer (v1.2)
+
+Prior to v1.2, the Active Mitigations page derived artifact status from `action_execution_log` — a log-scanning query that was fragile under concurrent attach/detach and lost state across controller restarts. v1.2 introduces an explicit **Action State Layer** with dedicated state tables. The log is retained as an append-only audit trail, but UI and API queries now read state directly from the state tables.
+
+### State Tables
+
+| Table | Purpose | Key columns |
+|-------|---------|-------------|
+| `bgp_announcements` | Per-announcement lifecycle, refcounted | `prefix`, `route_map`, `connector_id`, `status`, `refcount`, `delay_minutes`, `announced_at`, `withdrawn_at` |
+| `bgp_announcement_attacks` | Which attacks are attached to which announcement | `announcement_id`, `attack_id`, `action_id`, `delay_minutes`, `attached_at`, `detached_at` |
+| `bgp_announcement_events` | Append-only audit (announce/attach/detach/delay_started/withdrawn/orphan_detected) | `announcement_id`, `event_type`, `attack_id`, `detail`, `created_at` |
+| `xdrop_active_rules` | Per-xDrop-rule lifecycle | `attack_id`, `action_id`, `connector_id`, `external_rule_id`, `status`, `delay_started_at`, `delay_minutes`, `withdrawn_at` |
+| `scheduled_actions` | Persisted delayed tasks (xdrop_unblock, bgp_withdraw) | `action_type`, `attack_id`, `action_id`, `external_rule_id`, `announcement_id`, `scheduled_for`, `status`, `cancel_reason` |
+| `action_manual_overrides` | Operator force-remove audit (for on_expired suppression) | `attack_id`, `action_id`, `connector_id`, `external_rule_id`, `created_by` |
+
+`bgp_announcements.status` enum: `announcing` → `active` → (`delayed`|`withdrawing`) → `withdrawn` | `failed` | `orphan` | `dismissed` | `dismissed_on_upgrade`.
+
+`xdrop_active_rules.status` enum: `active` → (`delayed`|`withdrawing`) → `withdrawn` | `failed`.
+
+`scheduled_actions.status` enum: `pending` → `executing` → `completed` | `cancelled` | `failed`.
+
+### FRR Orphan Detection (Bootstrap Scan)
+
+On controller startup, `BootstrapBGPOrphans` runs once:
+
+1. Queries FRR via vtysh for the current BGP RIB on each registered connector (`show bgp ipv4/ipv6 unicast`).
+2. For each FRR prefix that has **no matching active `bgp_announcements` row with refcount > 0**, inserts an orphan marker row into `bgp_announcements`.
+3. On the very first v1.2 boot (no prior announcement history), orphans are inserted with `status=dismissed_on_upgrade` — this represents pre-v1.2 routes that xSight did not create and should not claim ownership of. Operators can review them in the UI and choose to adopt, withdraw, or leave dismissed.
+4. On subsequent boots, new orphans (routes in FRR with no backing xSight attack) are inserted with `status=orphan`. Operators use `POST /api/active-actions/bgp/orphan-force-withdraw` or `/orphan-dismiss` to resolve them.
+5. Rows that the operator has already dismissed are never re-pestered — the bootstrap only overwrites rows in `withdrawn` status.
+
+This closes the pre-v1.2 blind spot where FRR routes could outlive xSight (e.g., crash between announce and DB write) with no visibility.
+
+### UI Status Derivation
+
+The Active Mitigations page queries the state tables directly rather than log-scanning:
+
+- **BGP tab**: `SELECT FROM bgp_announcements WHERE status IN ('active', 'delayed', 'withdrawing', 'orphan')`.
+- **xDrop tab**: `SELECT FROM xdrop_active_rules WHERE status IN ('active', 'delayed', 'withdrawing')`.
+- **Detail drawer Execution Timeline**: merges `bgp_announcement_events` (BGP) or synthesized entries from `action_execution_log` (xDrop) plus `action_manual_overrides` rows.
+
+### bgp_role on Action-Execution-Log
+
+Because a single BGP announcement can serve multiple attacks, the `GET /api/attacks/:id/action-log` response enriches each BGP on_detected log row with a `bgp_role` field:
+
+| bgp_role | Meaning |
+|----------|---------|
+| `triggered` | This attack was first to attach in the current cycle — the vtysh announce actually fired for this attack. |
+| `attached_shared` | This attack joined an existing `active` announcement (refcount was already ≥1). No vtysh side effect. |
+| (empty) | Not a BGP on_detected row, or the announcement lookup failed. |
+
+The `triggered` attack is determined by sorting `bgp_announcement_attacks` on `(attached_at ASC, attack_id ASC)` and picking the first. A cycle filter (`attached_at >= announced_at`) is applied first so prior-cycle ghost attachments are ignored. The enrichment also returns `announcement_id` and `announcement_refcount` so the UI can render "shared with N attacks" tooltips.
+
+---
+
+## 7. Observability (v1.2.1)
+
+### Prometheus `/metrics` Endpoint
+
+The Controller exposes a Prometheus scrape endpoint at `GET /metrics`. It is **unauthenticated by convention** (matching kube-apiserver / etcd / Prometheus itself) — network-level isolation is expected to gate it.
+
+The registry is populated at startup by `metrics.Register()`. The default `promhttp.Handler()` also exposes Go runtime and process metrics for free.
+
+**Counters (inline, bumped at call sites):**
+
+| Metric | Labels | Semantics |
+|--------|--------|-----------|
+| `xsight_vtysh_ops_total` | `operation`, `result` | vtysh announce/withdraw outcomes. `operation ∈ {announce, withdraw}`, `result ∈ {success, failed, idempotent}`. `idempotent` = FRR reported route-absent on withdraw, xSight absorbed as success. |
+| `xsight_action_executions_total` | `action_type`, `status` | Action dispatch outcomes. `action_type ∈ {bgp, xdrop, webhook, shell}`, `status ∈ {success, failed, timeout, skipped, scheduled}`. |
+| `xsight_action_skip_total` | `skip_reason` | Broken-out view of `status=skipped`. `skip_reason ∈ {mode_observe, precondition_not_matched, first_match_suppressed, decoder_not_xdrop_compatible, manual_override_suppressed, force_removed}`. |
+| `xsight_scheduled_actions_recovered_total` | `outcome` | Startup recovery of `scheduled_actions`. `outcome ∈ {armed, overdue_fired, executing_retried}`. Non-zero `executing_retried` is an incident signal (crash between MarkExecuting and Complete). |
+
+**Custom collectors (scrape-time DB reads, fresh gauges):**
+
+| Metric | Labels | Source |
+|--------|--------|--------|
+| `xsight_bgp_announcements` | `status` | `SELECT status, count(*) FROM bgp_announcements GROUP BY status` |
+| `xsight_xdrop_rules` | `status` | `SELECT status, count(*) FROM xdrop_active_rules GROUP BY status` |
+| `xsight_scheduled_actions` | `status` | `SELECT status, count(*) FROM scheduled_actions GROUP BY status` |
+
+Each collector has a 5-second context timeout. If the query errors, the collector emits zero samples for that scrape (standard "collector error" signal in Prometheus) rather than returning HTTP 500.
+
+**Attack tracker gauges (wrap atomic counters in `tracker.Tracker`):**
+
+| Metric | Type | Source |
+|--------|------|--------|
+| `xsight_attacks_active` | Gauge | `tracker.ActiveCount()` |
+| `xsight_attacks_created_total` | Counter | `tracker.CreatedTotal` |
+| `xsight_attacks_suppressed_total` | Counter | `tracker.SuppressedTotal` (dedup) |
+| `xsight_attacks_evicted_total` | Counter | `tracker.EvictedTotal` (capacity cap reached — non-zero means raise `max_active_attacks`) |
+
+### Instrumentation Pattern
+
+The engine instruments its `store.Store` via a thin decorator (`metrics.InstrumentStore`) installed once in `main.go`. Only the `ActionExecLog().Create()` path is wrapped — it bumps `xsight_action_executions_total{action_type, status}` from the log row's own fields. All other call sites pass through without modification. This keeps the metric as a side effect of a durable DB write (single source of truth), so the log row and the counter can never disagree.
+
+### xDrop Decoder Compatibility Gate
+
+xDrop operates at L4 (protocol + 5-tuple). Decoders that are L3 aggregates (`ip`) cannot be safely translated to an xDrop rule — the resulting `protocol=all` with a `dst_ip` match would degrade into a full-prefix blackhole once flow analysis for `dominant_src_port` / `dominant_dst_port` fails to narrow it. v1.2.1 therefore enforces a compatibility whitelist:
+
+| Decoder | xDrop-compatible | Rationale |
+|---------|------------------|-----------|
+| `tcp` | yes | Maps to `protocol=tcp` |
+| `tcp_syn` | yes | Maps to `protocol=tcp` + `tcp_flags=SYN,!ACK` |
+| `udp` | yes | Maps to `protocol=udp` |
+| `icmp` | yes | Maps to `protocol=icmp` (or `icmpv6`) |
+| `fragment` | yes | Normalized to `protocol=all`; fragmented traffic is a clear attack signal |
+| `ip` | **no** | L3 aggregate — use BGP null-route instead |
+
+Attacks whose `decoder_family` is not in the whitelist have their xDrop actions skipped with `skip_reason=decoder_not_xdrop_compatible`. BGP / webhook / shell are unaffected.
+
+---
+
+## 8. Data Model
 
 ### Core Tables
 
@@ -374,11 +515,24 @@ Each successful withdrawal/unblock writes a **per-artifact** execution log entry
 | `thresholds` | Detection rules: domain, direction, decoder, unit, value; optional per-rule response_id override |
 | `responses` | Response definitions (containers for actions) |
 | `response_actions` | Actions: type, trigger_phase, connector, delay, paired_with, auto_generated |
-| `action_execution_log` | Execution records: trigger_phase, status, external_rule_id, connector_id, scheduled_for |
+| `action_execution_log` | Append-only audit of every dispatch: trigger_phase, status, skip_reason, external_rule_id, connector_id, scheduled_for |
 | `action_preconditions` | Per-action filter conditions (attribute, operator, value) |
 | `ts_stats` | Time-series traffic data (TimescaleDB hypertable with compression) |
 | `flow_logs` | Sampled flow data for attack fingerprinting |
 | `config_audit_log` | Configuration change audit trail |
+
+### Action State Tables (v1.2)
+
+See [Section 6](#6-action-state-layer-v12) for lifecycle semantics.
+
+| Table | Purpose |
+|-------|---------|
+| `bgp_announcements` | Per-announcement state (shared, refcounted). Unique on `(prefix, route_map, connector_id)` |
+| `bgp_announcement_attacks` | N:1 mapping of attacks → announcement. PK `(announcement_id, attack_id)` |
+| `bgp_announcement_events` | Append-only audit trail for Mitigations detail drawer |
+| `xdrop_active_rules` | Per-xDrop-rule state. Unique on `(attack_id, action_id, connector_id, external_rule_id)` |
+| `scheduled_actions` | Persisted delayed withdraw/unblock tasks (survives restart) |
+| `action_manual_overrides` | Operator force-remove audit, used for per-artifact on_expired suppression |
 
 ### Additional Tables
 
@@ -410,9 +564,15 @@ Each successful withdrawal/unblock writes a **per-artifact** execution log entry
 
 **Per-rule `response_id`**: On `thresholds` table. When set, overrides the template's default response for attacks triggered by that specific rule. Enables different responses for inbound vs outbound detection rules within the same template.
 
+**`bgp_announcements.refcount`**: Number of currently-attached attacks. The announcement can only transition to `delayed`/`withdrawing` when `refcount` drops to 0. Concurrent Attach/Detach are serialized via `SELECT … FOR UPDATE` on the business key — races between attach and detach on the same announcement cannot produce a torn state.
+
+**`bgp_announcement_attacks.delay_minutes`**: Snapshot of the originating action's `bgp_withdraw_delay_minutes` at attach time. Used to compute the cycle-sticky MAX delay and for the post-cycle audit (which attack contributed which delay).
+
+**`scheduled_actions.announcement_id`**: On BGP withdraw rows, points at the `bgp_announcements.id` being withdrawn. Lets the scheduler flip the announcement row to `withdrawing`/`withdrawn` atomically with the vtysh call.
+
 ---
 
-## 7. Frontend Architecture
+## 9. Frontend Architecture
 
 ### Stack
 
@@ -451,8 +611,8 @@ All UI text is externalized in `i18n/en.js` and `i18n/zh.js`. Language is switch
 | Dashboard | `/` | Stats cards + active attacks table + traffic trend |
 | Traffic Overview | `/traffic-overview` | Time-series charts with prefix/node/direction filters |
 | Attacks | `/attacks` | Active + historical attacks with detail drill-down |
-| Attack Detail | `/attacks/:id` | Summary + execution log + sensor logs (flow data) |
-| Active Mitigations | `/mitigations` | BGP Routing + xDrop Filtering tabs with detail drawer |
+| Attack Detail | `/attacks/:id` | Summary + execution log (with BGP Role column) + per-attack Force Remove + sensor logs |
+| Active Mitigations | `/mitigations` | BGP Routing + xDrop Filtering tabs with detail drawer. BGP tab also surfaces `orphan` announcements |
 | Nodes | `/nodes` | Node list with status, config sync, flow config |
 | Watch Prefixes | `/prefixes` | Prefix management with template binding |
 | Templates | `/templates` | Threshold template list + detail modal with rules |

@@ -374,6 +374,8 @@ Click **+ Add Action** in either section. The Action Editor dialog has these fie
 | Target Nodes | Which xDrop connectors to target (empty = all) |
 | Unblock Delay (min) | Minutes to wait before removing the rule after attack expires (0-1440) |
 
+> **xDrop decoder scope (v1.2.1):** xDrop actions only run for attacks whose decoder is one of `tcp`, `tcp_syn`, `udp`, `icmp`, or `fragment`. Attacks with decoder `ip` (L3 aggregate) are skipped — use a BGP action for those. The skip is recorded in the action log with `skip_reason=decoder_not_xdrop_compatible`.
+
 **BGP-specific fields:**
 
 | Field | Description |
@@ -538,7 +540,7 @@ Path: **Sidebar > MONITORING > Attacks**
 
 **Attack Detail** (click any attack row):
 - Summary: IP, decoder, severity, peak values, start/end times, node sources
-- **Actions Log**: All actions that fired for this attack with status, connector, duration, error message
+- **Actions Log**: All actions that fired for this attack with status, connector, duration, error message. For BGP `on_detected` entries, a **BGP Role** column shows whether this attack actually triggered the vtysh announce (`triggered`) or joined a shared announcement created by another attack (`attached`). A per-attack **Force Remove** button lets you detach this attack from a shared BGP announcement or remove its xDrop rule without affecting other attached attacks (see [§ 7.4 Force Remove](#74-active-mitigations)).
 - **Sensor Logs**: Sampled flow data — top source IPs, source ports, destination ports, and 5-tuple flow breakdown
 
 ### 7.4 Active Mitigations
@@ -571,7 +573,35 @@ Columns: Attack ID, Dst IP, Rule ID, Action (drop/rate_limit), Protocol, TCP Fla
 
 **Force Remove:** Click **Force Withdraw** (BGP) or **Force Unblock** (xDrop) to immediately remove a mitigation. After force removal, the automatic on_expired action is suppressed for that specific artifact.
 
-### 7.5 Audit Log
+> **Shared BGP announcements (v1.2):** When multiple attacks trigger the same `(prefix, route_map)` combination, they share a single BGP announcement. The announcement's refcount shows how many attacks are currently attached. Force Withdraw from the Active Mitigations page detaches **all** attached attacks and withdraws the announcement. To detach a single attack without withdrawing the shared route, use the per-attack Force Remove button on the Attack Detail page.
+
+**Orphan announcements (v1.2):** On startup, xSight scans FRR for routes that have no backing attack in xSight (either pre-upgrade remnants or crash residue). These appear in the BGP tab with `Orphan` status. For first-time v1.2 upgrades, pre-existing routes are auto-marked `Dismissed on Upgrade` — xSight will not claim ownership of them. Use the **Force Withdraw** / **Dismiss** actions in the row menu to resolve them.
+
+### 7.5 Observability (`/metrics`)
+
+The Controller exposes a Prometheus scrape endpoint at `GET /metrics` (port 8080, **unauthenticated** — rely on network-level isolation). Add a scrape config to Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: xsight-controller
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["controller-ip:8080"]
+```
+
+Useful metrics to alert on:
+
+| Metric | Alert idea |
+|--------|------------|
+| `xsight_attacks_evicted_total` | Non-zero → raise `max_active_attacks` |
+| `xsight_scheduled_actions_recovered_total{outcome="executing_retried"}` | Non-zero after restart → crash between MarkExecuting / Complete (incident signal) |
+| `xsight_action_skip_total{skip_reason="decoder_not_xdrop_compatible"}` | Spike → operator is targeting `ip`-decoder attacks with xDrop actions (should be BGP) |
+| `xsight_bgp_announcements{status="orphan"}` | Non-zero → FRR has routes xSight doesn't know about; resolve via UI |
+| `xsight_vtysh_ops_total{result="failed"}` | Rate-alert → FRR connectivity issue |
+
+See [architecture.md § 7 Observability](architecture.md#7-observability-v121) for the full metric catalogue.
+
+### 7.6 Audit Log
 
 Path: **Sidebar > SETTINGS > Audit Log**
 
@@ -696,3 +726,10 @@ xSight provides a full REST API for automation and integration.
 - Check connector API URL and key.
 - Increase timeout if xDrop has sync delays (30000ms recommended).
 - Review execution logs for HTTP error codes.
+- **v1.2.1:** xDrop is skipped for attacks with decoder `ip` (L3 aggregate). Check the action log for `skip_reason=decoder_not_xdrop_compatible`. Use a BGP action instead, or add a decoder-based precondition to your rules so the right attacks route to the right action.
+- **v1.2:** xDrop actions are also skipped when `action_engine.mode: observe` — the default. Set `action_engine.mode: auto` in `config.yaml` and restart the controller to enable dispatch. BGP, webhook, and shell are not gated by this setting.
+
+### Verifying metrics scrape
+- `curl -s http://controller-ip:8080/metrics | grep ^xsight_` — should return ~15 metric families.
+- If empty: metrics may not be registered; check controller logs at startup for `metrics.Register failed`.
+- If scrape times out: one of the custom collectors hit the 5s DB timeout — check PostgreSQL load.

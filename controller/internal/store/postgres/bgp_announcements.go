@@ -480,6 +480,28 @@ func (r *bgpAnnouncementRepo) Undismiss(ctx context.Context, id int) error {
 	return nil
 }
 
+// CountByStatus returns status → row count for all current
+// bgp_announcements. Used by the Prometheus xsight_bgp_announcements
+// gauge collector. One SELECT ... GROUP BY query per scrape.
+func (r *bgpAnnouncementRepo) CountByStatus(ctx context.Context) (map[string]int, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT status, COUNT(*) FROM bgp_announcements GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int)
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, err
+		}
+		out[status] = n
+	}
+	return out, rows.Err()
+}
+
 // HasOperationalHistory returns true if any row exists with a status other
 // than `orphan` / `dismissed_on_upgrade`. These two statuses are the only
 // ones the bootstrap scan itself produces, so their absence means this

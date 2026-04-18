@@ -78,8 +78,20 @@ The system has two components:
 | **Webhook** | HTTP callback to external systems (SIEM, Slack, PagerDuty, etc.) |
 | **Shell** | Execute local scripts for custom automation |
 
+- **Auto-paired actions** — creating an xDrop/BGP `on_detected` action auto-creates the matching `on_expired` cleanup (unblock / withdraw), kept in sync through the parent's lifecycle
 - **Auto `tcp_flags` injection** — SYN flood events automatically add `tcp_flags=SYN` to xDrop rules for precision blocking without collateral damage
-- **Dynamic expiry** — response rules auto-expire and are re-evaluated on each detection cycle
+- **xDrop decoder compatibility gate** — xDrop is L4-only; `ip` (L3 aggregate) attacks are skipped with `decoder_not_xdrop_compatible` so they don't degrade into full-prefix blackholes. Use BGP for those.
+- **Shared BGP announcements (Wanguard-style)** — multiple attacks sharing a `(prefix, route_map)` ref a single FRR route. MAX delay across attached attacks, atomic attach/detach under `SELECT FOR UPDATE`.
+- **Persisted delayed tasks** — `scheduled_actions` table survives controller restart; startup reconciliation re-arms pending timers, fires overdue tasks, retries in-flight crashed tasks.
+- **FRR orphan detection** — startup scan surfaces FRR routes with no backing xSight attack so operators can withdraw or dismiss them.
+
+### Active Mitigations & Per-Attack Drilldown
+- Dedicated `Active Mitigations` page with BGP Routing + xDrop Filtering tabs and a detail drawer per artifact (Summary / Configuration / Execution Timeline).
+- Attack Detail shows a `BGP Role` column (`triggered` vs `attached` to a shared announcement) and per-attack Force Remove so a single attack can be detached without withdrawing the shared route.
+
+### Observability
+- Prometheus `/metrics` endpoint with ~15 xSight-specific metrics (vtysh ops, action dispatches, skip reasons, scheduled-action recovery outcomes, state-table gauges, tracker counters) plus Go runtime / process metrics for free.
+- Custom collectors read DB state at scrape time — always fresh, no staleness window, no background refresh goroutine.
 
 ### Traffic Analysis
 - **Flow fingerprint** — 5-tuple sampling during attacks captures top talkers and protocol distribution

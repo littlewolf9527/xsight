@@ -168,9 +168,17 @@ database:
 
 auth:
   api_key: "CHANGE_ME"   # generate with: openssl rand -hex 32
+
+action_engine:
+  mode: "observe"        # IMPORTANT: set to "auto" to enable xDrop blocking.
+                         # "observe" (default) skips all xDrop actions with
+                         # skip_reason=mode_observe. BGP, webhook, shell
+                         # actions are NOT gated by this setting.
 ```
 
 See `controller/config.example.yaml` for the full list of options (detection thresholds, ring buffer sizing, data retention).
+
+> **Safety default:** `action_engine.mode` starts as `observe` so a fresh install cannot accidentally push xDrop rules. After validating detection against real traffic, switch to `auto` to enable automated xDrop blocking. You can also manage xDrop/BGP from the Web UI before flipping this switch — manual Force Remove operations always run regardless of mode.
 
 ### Node
 
@@ -248,6 +256,24 @@ curl -H "X-API-Key: YOUR_KEY" http://localhost:8080/api/stats/summary
 ```
 
 A successful response returns JSON with node and traffic statistics.
+
+**Prometheus scrape (optional):**
+
+```bash
+curl -s http://localhost:8080/metrics | grep ^xsight_ | head
+```
+
+`/metrics` is **unauthenticated by convention** — the endpoint relies on network-level isolation (same as kube-apiserver / etcd / Prometheus itself). If the controller is internet-reachable, firewall port 8080 or expose `/metrics` through a reverse proxy with its own auth.
+
+To scrape from Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: xsight-controller
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["controller-ip:8080"]
+```
 
 ---
 

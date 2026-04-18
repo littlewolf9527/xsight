@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -94,6 +97,34 @@ func listActiveAttacks(deps Dependencies) gin.HandlerFunc {
 	}
 }
 
+// ActionExecutionLogView wraps store.ActionExecutionLog with v1.2.1 API
+// enrichments that the frontend needs but don't belong in the persisted
+// schema. BGPRole lets the Attack Detail page show whether this attack
+// triggered the BGP route or attached to an existing one (shared).
+// AnnouncementID/Refcount let the per-attack Force Remove popconfirm show
+// a differentiated prompt (single-attack withdraw vs shared-detach
+// affecting N siblings) without a second round-trip.
+type ActionExecutionLogView struct {
+	store.ActionExecutionLog
+	// BGPRole is populated for action_type=bgp on_detected entries. Values:
+	//   "triggered"       — this attack was the first to attach to the
+	//                       announcement (the vtysh announce call was its
+	//                       side effect).
+	//   "attached_shared" — this attack joined an existing announcement
+	//                       (no vtysh announce; refcount incremented).
+	//   ""                — either not BGP, not on_detected, or the
+	//                       announcement row could not be found.
+	BGPRole string `json:"bgp_role,omitempty"`
+	// AnnouncementID is the bgp_announcements.id that this BGP log row
+	// ultimately attached to. Zero if not a BGP row / announcement lookup
+	// failed.
+	AnnouncementID int `json:"announcement_id,omitempty"`
+	// AnnouncementRefcount is the announcement's refcount at query time.
+	// Frontend uses this to pick popconfirm wording (simple force-withdraw
+	// when refcount<=1, shared-detach warning when refcount>1).
+	AnnouncementRefcount int `json:"announcement_refcount,omitempty"`
+}
+
 func getAttackActionLog(deps Dependencies) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id, err := strconv.Atoi(c.Param("id"))
@@ -109,8 +140,138 @@ func getAttackActionLog(deps Dependencies) gin.HandlerFunc {
 		if logs == nil {
 			logs = []store.ActionExecutionLog{}
 		}
-		c.JSON(http.StatusOK, logs)
+		// Pre-compute BGP role for every BGP on_detected success entry in
+		// one pass (one query per unique announcement, not per log row).
+		views := enrichActionLogsWithBGPRole(c, deps.Store, id, logs)
+		c.JSON(http.StatusOK, views)
 	}
+}
+
+// enrichActionLogsWithBGPRole computes `bgp_role` for each BGP on_detected
+// success entry by comparing this attack's attached_at with the earliest
+// attach on the same announcement. Bounded queries: one
+// ListAttachmentsForAttack + at most one ListAttacks per unique
+// announcement. Ignores entries where the announcement lookup fails (best-
+// effort enrichment).
+func enrichActionLogsWithBGPRole(ctx context.Context, s store.Store, attackID int, logs []store.ActionExecutionLog) []ActionExecutionLogView {
+	views := make([]ActionExecutionLogView, len(logs))
+	for i, l := range logs {
+		views[i] = ActionExecutionLogView{ActionExecutionLog: l}
+	}
+
+	// Which announcements has this attack attached to.
+	attachments, err := s.BGPAnnouncements().ListAttachmentsForAttack(ctx, attackID)
+	if err != nil || len(attachments) == 0 {
+		return views
+	}
+	seenAnns := make(map[int]struct{}, len(attachments))
+	for _, a := range attachments {
+		seenAnns[a.AnnouncementID] = struct{}{}
+	}
+
+	// For each announcement, determine the IDENTITY of the attach that
+	// actually triggered the vtysh announce FOR THE CURRENT CYCLE. Three
+	// things at play:
+	//
+	//   1. Time equality is unstable — Postgres timestamp precision can
+	//      collide for attaches inside the same transaction window, which
+	//      would tag multiple rows as "triggered" despite only one vtysh
+	//      side-effect firing. Sort tie-breaks by attack_id ASC (Attach's
+	//      SELECT FOR UPDATE serializes, so earliest attached_at + lowest
+	//      attack_id matches the actual insert order).
+	//
+	//   2. bgp_announcement_attacks is append-only across resurrects. A
+	//      long-lived announcement that has cycled active → withdrawn →
+	//      active accumulates prior-cycle attach rows with detached_at
+	//      set. Picking MIN(attached_at) globally would always pin the
+	//      role on a ghost attack from the very first cycle. Anchor on
+	//      ann.AnnouncedAt (reset by the refcount model on each resurrect)
+	//      and consider only this cycle's attaches — mirrors PR-7's
+	//      attached_attacks cycle-filter on the Mitigations drawer.
+	//
+	//   3. We need ann.AnnouncedAt here, so fetch the announcement row
+	//      once per unique annID inside the loop.
+	triggerPerAnn := make(map[int]triggerIdentity, len(seenAnns))
+	for annID := range seenAnns {
+		ann, err := s.BGPAnnouncements().Get(ctx, annID)
+		if err != nil || ann == nil {
+			continue
+		}
+		atts, err := s.BGPAnnouncements().ListAttacks(ctx, annID)
+		if err != nil || len(atts) == 0 {
+			continue
+		}
+		cycleAtts := make([]store.BGPAnnouncementAttack, 0, len(atts))
+		for _, a := range atts {
+			if !a.AttachedAt.Before(ann.AnnouncedAt) {
+				cycleAtts = append(cycleAtts, a)
+			}
+		}
+		if len(cycleAtts) == 0 {
+			continue
+		}
+		sort.SliceStable(cycleAtts, func(i, j int) bool {
+			if !cycleAtts[i].AttachedAt.Equal(cycleAtts[j].AttachedAt) {
+				return cycleAtts[i].AttachedAt.Before(cycleAtts[j].AttachedAt)
+			}
+			return cycleAtts[i].AttackID < cycleAtts[j].AttackID
+		})
+		first := cycleAtts[0]
+		id := triggerIdentity{AttackID: first.AttackID}
+		if first.ActionID != nil {
+			id.ActionID = *first.ActionID
+		}
+		triggerPerAnn[annID] = id
+	}
+
+	// Match logs to announcements via external_rule_id ("prefix|route_map")
+	// + connector_id. A log row inherits "triggered" iff its (attack_id,
+	// action_id) matches the trigger identity of the CURRENT cycle on that
+	// announcement. Cycle scoping matters because bgp_announcement_attacks
+	// is append-only: prior-cycle rows (from attacks before the most recent
+	// resurrect) persist with detached_at set, and naively picking the
+	// minimum attached_at across all rows would always pin the role on a
+	// ghost attack from a long-expired cycle.
+	//
+	// The cycle anchor is ann.AnnouncedAt (reset by the refcount model on
+	// each resurrect); we filter the attach set by attached_at >= that
+	// anchor and determine trigger identity from the cycle-scoped slice.
+	// Mirrors the same cycle-filter used by buildActiveBGPFromAnnouncements
+	// for the attached_attacks drawer list.
+	for i := range views {
+		entry := &views[i].ActionExecutionLog
+		if entry.ActionType != "bgp" || entry.TriggerPhase != "on_detected" ||
+			entry.Status != "success" || entry.ConnectorID == nil || entry.ExternalRuleID == "" {
+			continue
+		}
+		parts := strings.SplitN(entry.ExternalRuleID, "|", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		ann, err := s.BGPAnnouncements().FindByBusinessKey(ctx, parts[0], parts[1], *entry.ConnectorID)
+		if err != nil || ann == nil {
+			continue
+		}
+		trigger, ok := triggerPerAnn[ann.ID]
+		if !ok {
+			continue
+		}
+		if entry.AttackID == trigger.AttackID && entry.ActionID == trigger.ActionID {
+			views[i].BGPRole = "triggered"
+		} else {
+			views[i].BGPRole = "attached_shared"
+		}
+		views[i].AnnouncementID = ann.ID
+		views[i].AnnouncementRefcount = ann.Refcount
+	}
+	return views
+}
+
+// triggerIdentity is the (attack_id, action_id) tuple of the attach that
+// triggered the vtysh announce for an announcement's current cycle.
+type triggerIdentity struct {
+	AttackID int
+	ActionID int // 0 if attach carried nil action_id (rare, recovery paths)
 }
 
 func statsSummary(deps Dependencies) gin.HandlerFunc {
@@ -313,6 +474,10 @@ func getMitigationSummary(deps Dependencies) gin.HandlerFunc {
 		if execs == nil {
 			execs = []store.ActionExecutionLog{}
 		}
+		// Enrich each BGP on_detected success row with bgp_role so the
+		// Attack Detail page can show triggered vs attached_shared without
+		// re-deriving state from announcement events.
+		execViews := enrichActionLogsWithBGPRole(c, deps.Store, id, execs)
 
 		xrules, err := deps.Store.XDropActiveRules().ListByAttack(c, id)
 		if err != nil {
@@ -370,7 +535,7 @@ func getMitigationSummary(deps Dependencies) gin.HandlerFunc {
 
 		ok(c, gin.H{
 			"attack":            attack,
-			"executions":        execs,
+			"executions":        execViews,
 			"xdrop_rules":       xrules,
 			"bgp_announcements": bgpView,
 			"summary":           summary,

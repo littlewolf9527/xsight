@@ -309,6 +309,11 @@ type BGPAnnouncementRepo interface {
 	// `orphan` (v1.2 has been running, FRR drifted).
 	HasOperationalHistory(ctx context.Context) (bool, error)
 
+	// CountByStatus returns the count of bgp_announcements grouped by
+	// status. Used by the Prometheus xsight_bgp_announcements gauge; the
+	// map key is the status string, value is the row count.
+	CountByStatus(ctx context.Context) (map[string]int, error)
+
 	// UpsertOrphan records one FRR-detected prefix as an orphan (or
 	// dismissed_on_upgrade, depending on the caller's chosen status).
 	// Semantics:
@@ -384,6 +389,9 @@ type XDropActiveRuleRepo interface {
 	ListWithdrawing(ctx context.Context) ([]XDropActiveRule, error)
 	// ListByAttack returns all rows for a given attack regardless of status.
 	ListByAttack(ctx context.Context, attackID int) ([]XDropActiveRule, error)
+	// CountByStatus returns the count of xdrop_active_rules grouped by
+	// status. Used by the Prometheus xsight_xdrop_rules gauge.
+	CountByStatus(ctx context.Context) (map[string]int, error)
 }
 
 // v1.2 PR-3: ScheduledActionRepo persists delayed withdraw/unblock tasks so
@@ -419,6 +427,9 @@ type ScheduledActionRepo interface {
 	// and Complete/Fail. The underlying side effects are idempotent, so
 	// retry is safe. Added in v1.2 PR-4 to close the PR-3 leftover edge case.
 	ListExecuting(ctx context.Context) ([]ScheduledAction, error)
+	// CountByStatus returns the count of scheduled_actions grouped by
+	// status. Used by the Prometheus xsight_scheduled_actions gauge.
+	CountByStatus(ctx context.Context) (map[string]int, error)
 }
 
 // v1.2 PR-2: ActionManualOverrideRepo provides O(1) lookup for manual override

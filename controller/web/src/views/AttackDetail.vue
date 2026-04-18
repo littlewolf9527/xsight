@@ -93,9 +93,34 @@
           <el-table-column prop="duration_ms" :label="$t('attacks.durationMs')" width="100">
             <template #default="{ row }">{{ row.duration_ms != null ? row.duration_ms + ' ms' : '-' }}</template>
           </el-table-column>
-          <el-table-column :label="$t('common.actions')" width="80">
+          <!-- v1.2.1: BGP role shows whether this attack TRIGGERED a new route
+               announcement (vtysh announce ran for it) or ATTACHED to an
+               existing announcement (refcount++, no vtysh side effect). Blank
+               for non-BGP rows. -->
+          <el-table-column prop="bgp_role" :label="$t('attacks.bgpRole')" width="140">
+            <template #default="{ row }">
+              <el-tag v-if="row.bgp_role === 'triggered'" type="danger" size="small" effect="plain">{{ $t('attacks.bgpRoleTriggered') }}</el-tag>
+              <el-tag v-else-if="row.bgp_role === 'attached_shared'" type="info" size="small" effect="plain">{{ $t('attacks.bgpRoleAttached') }}</el-tag>
+              <span v-else style="color: var(--xs-text-secondary);">—</span>
+            </template>
+          </el-table-column>
+          <el-table-column :label="$t('common.actions')" width="200">
             <template #default="{ row }">
               <el-button size="small" link @click="viewActionDetail(row)">{{ $t('attacks.viewDetail') }}</el-button>
+              <!-- v1.2.1: per-attack Force Remove for BGP/xDrop successful
+                   on_detected rows. BGP differentiates by announcement
+                   refcount — shared announcements show a warning so the
+                   operator can pick "detach just this attack" vs "force
+                   withdraw (affects N attacks)". xDrop is per-rule so the
+                   simple prompt suffices. -->
+              <el-popconfirm
+                v-if="canForceRemoveRow(row)"
+                :title="perAttackForceRemoveTitle(row)"
+                @confirm="forceRemoveActionRow(row)">
+                <template #reference>
+                  <el-button size="small" type="danger" link>{{ row.action_type === 'bgp' ? $t('attacks.forceWithdraw') : $t('attacks.forceUnblock') }}</el-button>
+                </template>
+              </el-popconfirm>
             </template>
           </el-table-column>
         </el-table>
@@ -204,8 +229,11 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
+import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api, { getAttack, getAttackActionLog, getAttackSensorLogs } from '../api'
+
+const { t } = useI18n()
 
 const route = useRoute()
 const attack = ref(null)
@@ -262,6 +290,65 @@ function viewActionDetail(row) {
   selectedAction.value = row
   showRawResponse.value = false
   showActionDetail.value = true
+}
+
+// v1.2.1 per-attack Force Remove helpers. We surface the button only for
+// BGP/xDrop on_detected success rows that carry an external_rule_id +
+// connector_id (the minimum /active-actions/force-remove needs). Other
+// rows — webhook, skipped, scheduled — have nothing to remove.
+//
+// Additional guard: if the attack has already ended (attack.ended_at set),
+// hide the button. An ended attack's BGP attach is already detached —
+// clicking Force Remove would 404 at the backend. For xDrop rules the
+// same applies once the rule is withdrawn. This matches operator intent:
+// Force Remove is an "abort now" affordance for LIVE mitigations.
+function canForceRemoveRow(row) {
+  if (!row) return false
+  if (row.trigger_phase !== 'on_detected') return false
+  if (row.status !== 'success') return false
+  if (row.action_type !== 'bgp' && row.action_type !== 'xdrop') return false
+  if (!row.external_rule_id || !row.connector_id) return false
+  // Attack-level guard: only show button while the attack is still active.
+  if (attack.value && attack.value.ended_at) return false
+  return true
+}
+
+// BGP rows with refcount > 1 share an announcement; clicking Force Remove
+// from an attack detail page would detach only this attack in the
+// straightforward semantic. The message needs to communicate that — the
+// operator sees how many siblings remain and can proceed knowingly. For
+// xDrop (per-rule) the simple prompt is accurate.
+function perAttackForceRemoveTitle(row) {
+  if (row.action_type === 'xdrop') return t('attacks.confirmForceUnblock')
+  const refcount = row.announcement_refcount || 0
+  if (refcount > 1) {
+    // N-1 siblings remain after we detach this attack. Announcement itself
+    // stays up (refcount still > 0).
+    return t('attacks.confirmDetachFromShared', { remaining: refcount - 1 })
+  }
+  // Single-attack announcement → detaching this attack brings refcount to
+  // zero, which triggers withdraw. Honest simple prompt.
+  return t('attacks.confirmForceWithdraw')
+}
+
+async function forceRemoveActionRow(row) {
+  try {
+    const resp = await api.post('/active-actions/force-remove', {
+      attack_id:        Number(route.params.id),
+      action_id:        row.action_id,
+      connector_id:     row.connector_id,
+      external_rule_id: row.external_rule_id,
+      action_type:      row.action_type,
+    })
+    if (resp && resp.warning) {
+      ElMessage.warning(resp.warning)
+    } else {
+      ElMessage.success(t('attacks.forceRemoved'))
+    }
+    loadActionLog()
+  } catch (e) {
+    ElMessage.error(e?.error || e?.message || t('mitigations.forceFailed'))
+  }
 }
 
 async function loadSensorLogs() {

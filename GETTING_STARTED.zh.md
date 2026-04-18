@@ -168,9 +168,17 @@ database:
 
 auth:
   api_key: "CHANGE_ME"   # 生成方式: openssl rand -hex 32
+
+action_engine:
+  mode: "observe"        # 重要：设为 "auto" 才会真正下发 xDrop 封禁。
+                         # "observe"（默认）下所有 xDrop 动作被跳过，
+                         # 记录 skip_reason=mode_observe。BGP、Webhook、
+                         # Shell 动作不受此开关影响。
 ```
 
 完整配置选项（检测阈值、环形缓冲区大小、数据保留策略等）请参考 `controller/config.example.yaml`。
+
+> **安全默认值：** `action_engine.mode` 默认是 `observe`，这样全新部署不会误下发 xDrop 规则。先对照真实流量验证检测能力，再切到 `auto` 启用自动封禁。切换前也可以在 Web UI 里手动管理 xDrop / BGP——手动的 Force Remove 操作与 mode 无关，任何模式下都能执行。
 
 ### Node
 
@@ -248,6 +256,24 @@ curl -H "X-API-Key: YOUR_KEY" http://localhost:8080/api/stats/summary
 ```
 
 正常返回包含节点和流量统计的 JSON 数据。
+
+**Prometheus 抓取（可选）：**
+
+```bash
+curl -s http://localhost:8080/metrics | grep ^xsight_ | head
+```
+
+`/metrics` **按惯例不做认证**——依赖网络层隔离（与 kube-apiserver / etcd / Prometheus 自身一致）。若 Controller 可从公网访问，请把 8080 口加防火墙，或通过反向代理加认证后再暴露 `/metrics`。
+
+Prometheus 抓取配置示例：
+
+```yaml
+scrape_configs:
+  - job_name: xsight-controller
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["controller-ip:8080"]
+```
 
 ---
 

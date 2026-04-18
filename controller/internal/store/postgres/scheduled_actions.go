@@ -129,6 +129,27 @@ func (r *scheduledActionRepo) ListExecuting(ctx context.Context) ([]store.Schedu
 	return r.listByStatus(ctx, "executing")
 }
 
+// CountByStatus returns status → row count for all scheduled_actions.
+// Used by the Prometheus xsight_scheduled_actions gauge collector.
+func (r *scheduledActionRepo) CountByStatus(ctx context.Context) (map[string]int, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT status, COUNT(*) FROM scheduled_actions GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int)
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, err
+		}
+		out[status] = n
+	}
+	return out, rows.Err()
+}
+
 func (r *scheduledActionRepo) listByStatus(ctx context.Context, status string) ([]store.ScheduledAction, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT id, action_type, attack_id, action_id, connector_id, external_rule_id,

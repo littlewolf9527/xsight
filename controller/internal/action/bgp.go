@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/littlewolf9527/xsight/controller/internal/metrics"
 	"github.com/littlewolf9527/xsight/controller/internal/store"
 )
 
@@ -244,6 +245,7 @@ func bgpAnnounce(ctx context.Context, s store.Store, engine *Engine, conn *store
 	durationMs := int(time.Since(t0).Milliseconds())
 
 	if vErr != nil {
+		metrics.RecordVtysh("announce", "failed")
 		log.Printf("action: bgp announce failed announcement_id=%d: %v output=%s",
 			attachResult.AnnouncementID, vErr, out)
 		// Compensate: delete row if refcount=1, else mark failed.
@@ -269,6 +271,7 @@ func bgpAnnounce(ctx context.Context, s store.Store, engine *Engine, conn *store
 		}, vErr
 	}
 
+	metrics.RecordVtysh("announce", "success")
 	if mErr := s.BGPAnnouncements().MarkAnnounced(ctx, attachResult.AnnouncementID); mErr != nil {
 		log.Printf("action: bgp MarkAnnounced announcement_id=%d: %v", attachResult.AnnouncementID, mErr)
 	}
@@ -550,6 +553,7 @@ func performBGPWithdraw(ctx context.Context, s store.Store, conn *store.BGPConne
 		outStr := strings.TrimSpace(out)
 		if isFRRRouteAbsentError(outStr) {
 			// Idempotent success — route already gone.
+			metrics.RecordVtysh("withdraw", "idempotent")
 			log.Printf("action: bgp withdraw %s already gone (idempotent, announcement_id=%d)", externalRuleID, announcementID)
 			if mErr := s.BGPAnnouncements().MarkWithdrawn(ctx, announcementID); mErr != nil {
 				log.Printf("action: bgp MarkWithdrawn announcement_id=%d: %v", announcementID, mErr)
@@ -573,6 +577,7 @@ func performBGPWithdraw(ctx context.Context, s store.Store, conn *store.BGPConne
 			}, nil
 		}
 		// Real failure.
+		metrics.RecordVtysh("withdraw", "failed")
 		if mErr := s.BGPAnnouncements().MarkFailedWithdraw(ctx, announcementID, vErr.Error()); mErr != nil {
 			log.Printf("action: bgp MarkFailedWithdraw announcement_id=%d: %v", announcementID, mErr)
 		}
@@ -595,6 +600,7 @@ func performBGPWithdraw(ctx context.Context, s store.Store, conn *store.BGPConne
 	}
 
 	// Success.
+	metrics.RecordVtysh("withdraw", "success")
 	log.Printf("action: bgp withdraw %s route-map=%s connector=%s announcement_id=%d", dstIP, routeMap, conn.Name, announcementID)
 	if mErr := s.BGPAnnouncements().MarkWithdrawn(ctx, announcementID); mErr != nil {
 		log.Printf("action: bgp MarkWithdrawn announcement_id=%d: %v", announcementID, mErr)
@@ -831,8 +837,10 @@ func RecoverBGPRoutes(ctx context.Context, s store.Store) {
 			cmd := fmt.Sprintf("configure terminal\nrouter bgp %d\naddress-family %s\nnetwork %s route-map %s",
 				conn.BGPASN, raf, prefix, routeMap)
 			if _, err := runVtysh(ctx, conn.VtyshPath, cmd); err != nil {
+				metrics.RecordVtysh("announce", "failed")
 				log.Printf("bgp recovery: re-inject %s route-map=%s failed: %v", prefix, routeMap, err)
 			} else {
+				metrics.RecordVtysh("announce", "success")
 				reinjected++
 				activeRuleIDs[logEntry.ExternalRuleID] = true
 			}
@@ -883,8 +891,13 @@ func RecoverBGPRoutes(ctx context.Context, s store.Store) {
 				cmd := fmt.Sprintf("configure terminal\nrouter bgp %d\naddress-family %s\nno network %s route-map %s",
 					conn.BGPASN, caf, prefix, routeMap)
 				if _, err := runVtysh(ctx, conn.VtyshPath, cmd); err != nil {
-					// Ignore errors — route may already have been withdrawn normally
+					// Treat stale-route cleanup errors as idempotent — the route
+					// may already have been withdrawn normally. Not "failed" to
+					// avoid polluting the failed-rate metric.
+					metrics.RecordVtysh("withdraw", "idempotent")
 					log.Printf("bgp recovery: cleanup stale %s route-map=%s (may already be gone): %v", prefix, routeMap, err)
+				} else {
+					metrics.RecordVtysh("withdraw", "success")
 				}
 				cleaned++
 			}

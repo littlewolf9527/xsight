@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/littlewolf9527/xsight/controller/internal/metrics"
 	"github.com/littlewolf9527/xsight/controller/internal/store"
 	"github.com/littlewolf9527/xsight/controller/internal/tracker"
 )
@@ -28,6 +29,12 @@ const (
 	SkipReasonModeObserve            = "mode_observe"
 	SkipReasonManualOverride         = "manual_override"
 	SkipReasonAlreadyExecuted        = "already_executed"
+	// SkipReasonDecoderNotSupported: attack's decoder_family is an L3
+	// aggregate (e.g. `ip`) that has no clean mapping to xDrop's L4 filter
+	// semantics. xDrop is gated at dispatch for these decoders to avoid
+	// silent broadening (protocol=all + absent src_port ⇒ full-prefix
+	// blackhole). Operators should mitigate L3 aggregates via BGP instead.
+	SkipReasonDecoderNotSupported = "decoder_not_xdrop_compatible"
 )
 
 // writeSkipLog records a skip event in action_execution_log with structured
@@ -49,6 +56,12 @@ func writeSkipLog(ctx context.Context, s store.Store, attackID int, act store.Re
 	if _, err := s.ActionExecLog().Create(ctx, logEntry); err != nil {
 		log.Printf("action: write skip log attack=%d action=%d reason=%s: %v", attackID, act.ID, skipReason, err)
 	}
+	// metrics.RecordAction counter increment happens transparently via the
+	// metrics.InstrumentStore wrapper installed at startup (see main.go).
+	// Do NOT add inline RecordAction here or we'd double-count.
+	// xsight_action_skip_total is a separate counter broken out by
+	// skip_reason — the wrapper covers the generic status=skipped bucket.
+	metrics.RecordSkip(skipReason)
 }
 
 // Engine evaluates and executes response actions when attacks change state.
@@ -332,10 +345,12 @@ func (e *Engine) retryBGPAnnounce(ann store.BGPAnnouncement) {
 		conn.BGPASN, af, ann.Prefix, ann.RouteMap)
 	out, vErr := runVtysh(ctx, conn.VtyshPath, cmd)
 	if vErr != nil {
+		metrics.RecordVtysh("announce", "failed")
 		log.Printf("action: retry announce announcement_id=%d failed: %v output=%s", ann.ID, vErr, out)
 		_ = e.store.BGPAnnouncements().MarkFailedAnnounce(ctx, ann.ID, vErr.Error())
 		return
 	}
+	metrics.RecordVtysh("announce", "success")
 	if err := e.store.BGPAnnouncements().MarkAnnounced(ctx, ann.ID); err != nil {
 		log.Printf("action: retry announce MarkAnnounced announcement_id=%d: %v", ann.ID, err)
 	}
@@ -384,6 +399,7 @@ func (e *Engine) reconcileExecutingSchedules(ctx context.Context) {
 		// Re-run the side effect as if this were a fresh recovery. The
 		// underlying executeBGP / xDrop DELETE paths handle idempotency
 		// (vtysh "Can't find", HTTP 404) so double-execution is safe.
+		metrics.RecordRecovered("executing_retried")
 		switch sa.ActionType {
 		case "bgp_withdraw":
 			go e.executeRecoveredBGPWithdraw(ctx, sa)
@@ -467,9 +483,11 @@ func (e *Engine) RecoverScheduledActions(ctx context.Context) error {
 		remaining := time.Until(sa.ScheduledFor)
 		if remaining <= 0 {
 			overdue++
+			metrics.RecordRecovered("overdue_fired")
 			go e.runRecoveredAction(sa, 0)
 		} else {
 			armed++
+			metrics.RecordRecovered("armed")
 			go e.runRecoveredAction(sa, remaining)
 		}
 	}
@@ -1001,6 +1019,25 @@ func (e *Engine) HandleEvent(event tracker.AttackEvent) {
 			firstMatchTypes[act.ActionType] = true
 		}
 
+		// v1.2.1: xDrop decoder compatibility gate. Runs AFTER manual /
+		// first_match gates so manual and first-match-suppressed actions
+		// don't get spurious decoder skip logs. Runs BEFORE the goroutine
+		// spawn so the skip log is visible to callers that check
+		// immediately after HandleEvent returns.
+		//
+		// xDrop is an L4 filter tool; L3-aggregate decoders (e.g. `ip`)
+		// have no clean 5-tuple mapping and would silently broaden into
+		// full-prefix blackhole when flow analysis fails to populate
+		// src_ip/src_port. Route those attacks to BGP null-route by
+		// skipping the xDrop action.
+		if act.ActionType == "xdrop" && !IsXDropCompatibleDecoder(attack.DecoderFamily) {
+			writeSkipLog(ctx, e.store, event.DBID, act, resp.Name, "",
+				SkipReasonDecoderNotSupported,
+				fmt.Sprintf("decoder=%s is an L3 aggregate; xDrop is L4-only. Use BGP null-route for this attack class.",
+					attack.DecoderFamily))
+			continue
+		}
+
 		// Only query flow_logs if the action actually uses flow-derived data.
 		// If getFA() was already called (e.g. by precondition evaluation), reuse cached result.
 		var flowData *FlowAnalysis
@@ -1468,6 +1505,9 @@ func (e *Engine) executeAction(ctx context.Context, event tracker.AttackEvent, a
 		}
 
 	case "xdrop":
+		// NOTE: decoder compatibility gate (v1.2.1) runs in the main
+		// dispatch loop (HandleEvent) BEFORE reaching this goroutine, so
+		// by the time we're here the decoder is guaranteed compatible.
 		// Defense-in-depth: skip xDrop for global attacks (no concrete IP to block)
 		if attack.DstIP == "0.0.0.0/0" {
 			log.Printf("action: xdrop skipped for global attack %d (0.0.0.0/0 has no concrete target)", event.DBID)

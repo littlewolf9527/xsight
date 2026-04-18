@@ -444,7 +444,10 @@ func TestDelayedUnblock_FullPath_AllTablesAgreeOnRuleActionID(t *testing.T) {
 	// Attack — expired, bound to response 1
 	respID := 1
 	ms.attacks.attacks = append(ms.attacks.attacks, store.Attack{
-		ID: 1000, DstIP: "192.0.2.100", DecoderFamily: "ip", Direction: "receives",
+		// DecoderFamily=udp (not ip) so xDrop decoder gate (v1.2.1) lets
+		// the action proceed — this test targets the delayed-unblock path,
+		// not the decoder compatibility gate.
+		ID: 1000, DstIP: "192.0.2.100", DecoderFamily: "udp", Direction: "receives",
 		StartedAt: now.Add(-5 * time.Minute), EndedAt: &endedAt,
 		ResponseID: &respID,
 	})

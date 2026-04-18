@@ -893,6 +893,16 @@ func (r *mockScheduledActionRepo) ListExecuting(_ context.Context) ([]store.Sche
 	return out, nil
 }
 
+func (r *mockScheduledActionRepo) CountByStatus(_ context.Context) (map[string]int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]int)
+	for _, rec := range r.records {
+		out[rec.Status]++
+	}
+	return out, nil
+}
+
 // v1.2 PR-4: mockXDropActiveRuleRepo persists XDropActiveRule records with
 // UNIQUE business-key semantics. Upsert consolidates existing rows.
 type mockXDropActiveRuleRepo struct {
@@ -1022,6 +1032,16 @@ func (r *mockXDropActiveRuleRepo) ListByAttack(_ context.Context, attackID int) 
 		if rec.AttackID == attackID {
 			out = append(out, rec)
 		}
+	}
+	return out, nil
+}
+
+func (r *mockXDropActiveRuleRepo) CountByStatus(_ context.Context) (map[string]int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]int)
+	for _, rec := range r.records {
+		out[rec.Status]++
 	}
 	return out, nil
 }
@@ -1356,6 +1376,16 @@ func (r *mockBGPAnnouncementRepo) Undismiss(_ context.Context, id int) error {
 	}
 	r.appendEventLocked(id, store.BGPEventUndismissed, nil, "dismissed orphan re-surfaced by operator")
 	return nil
+}
+
+func (r *mockBGPAnnouncementRepo) CountByStatus(_ context.Context) (map[string]int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]int)
+	for _, a := range r.announcements {
+		out[a.Status]++
+	}
+	return out, nil
 }
 
 func (r *mockBGPAnnouncementRepo) HasOperationalHistory(_ context.Context) (bool, error) {

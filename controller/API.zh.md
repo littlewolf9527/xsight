@@ -11,6 +11,12 @@
 
 JWT 令牌有效期 24 小时。
 
+### `GET /metrics` — Prometheus 抓取端点（无需认证）
+
+暴露所有 v1.2 / v1.2.1 埋点指标（vtysh 操作、动作执行、动作跳过、调度动作恢复结果、当前 BGP 公告 / xDrop 规则 / 调度动作按状态的 gauge、攻击追踪计数器），以及默认的 Go runtime 与 process 指标。
+
+**按惯例不做认证**（与 kube-apiserver / etcd / Prometheus 自身一致）——依赖网络层隔离。完整指标目录见 [docs/architecture.zh.md § 7 可观测性](../docs/architecture.zh.md#7-可观测性-v121)。
+
 ---
 
 ## 登录
@@ -250,8 +256,13 @@ JWT 令牌有效期 24 小时。
 | `xdrop_action` | string | 仅 xDrop：`filter_l4`, `rate_limit` 或 `unblock` |
 | `xdrop_custom_payload` | object | 仅 xDrop：匹配字段（`dst_ip`, `src_ip`, `dst_port`, `src_port`, `protocol`）和 `rate_limit` 值 |
 | `shell_extra_args` | string | 仅 Shell：传递给命令的附加参数 |
-| `unblock_delay_minutes` | int | 仅 xDrop filter/rate_limit：N 分钟后自动解封（0-1440） |
+| `unblock_delay_minutes` | int | 仅 xDrop filter_l4/rate_limit：N 分钟后自动解封（0-1440） |
 | `bgp_route_map` | string | 仅 BGP：**on_detected 必填。** 黑洞注入使用的 route-map 名称 |
+| `bgp_withdraw_delay_minutes` | int | 仅 BGP：攻击结束后延迟 N 分钟才撤回（0-1440）。多个共享同一公告的攻击下，单次 announce cycle 的有效延迟 = 所有攻击 `delay_minutes` 的 MAX——详见 [architecture.zh.md § BGP 执行](../docs/architecture.zh.md#bgp-执行wanguard-风格共享公告) |
+
+> **xDrop decoder 兼容性 (v1.2.1)：** 仅当攻击的 decoder 在 L4 兼容白名单中（`tcp`、`tcp_syn`、`udp`、`icmp`、`fragment`）时，xDrop 动作才会下发。decoder 为 `ip` 的攻击会以 `skip_reason=decoder_not_xdrop_compatible` 跳过——L3 聚合攻击应使用 BGP。
+
+> **自动配对动作：** 创建 xDrop（`filter_l4`/`rate_limit`）或 BGP `on_detected` 动作时，系统会自动创建对应的 `on_expired` 子动作（`unblock` / withdraw）。子动作不可直接编辑，需通过父动作修改。在 `trigger_phase=on_expired` 下手动创建 `xdrop` 或 `bgp` 动作会被拒绝（HTTP 400）。
 
 ### xDrop 目标
 
@@ -484,8 +495,9 @@ JWT 令牌有效期 24 小时。
 | GET | `/api/attacks/active` | 列出当前活跃攻击 |
 | GET | `/api/attacks/:id` | 获取攻击详情（含动作执行日志） |
 | POST | `/api/attacks/:id/expire` | 强制过期一个活跃攻击 |
-| GET | `/api/attacks/:id/action-log` | 获取攻击的动作执行日志 |
+| GET | `/api/attacks/:id/action-log` | 获取攻击的动作执行日志（v1.2：包含 `bgp_role`） |
 | GET | `/api/attacks/:id/sensor-logs` | 获取攻击的 Flow 级传感器日志 |
+| GET | `/api/attacks/:id/mitigation-summary` | 单攻击的缓解聚合视图（v1.2） |
 
 ### 列出攻击 -- GET /api/attacks
 
@@ -524,6 +536,88 @@ JWT 令牌有效期 24 小时。
 | `limit` | int | 最大 Flow 记录数（默认：1000，最大：10000） |
 
 **响应：** `{ "flows": [...], "total": N, "expired": bool, "window": "full"|"last_1h" }`
+
+### 动作日志 -- GET /api/attacks/:id/action-log
+
+返回该攻击的所有 `action_execution_log` 行。BGP `on_detected` 条目会带上 v1.2 公告级字段，前端借此区分"真正触发 vtysh 的攻击"与"加入已存在共享公告的攻击"。
+
+**响应（数组元素形状）：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id`、`attack_id`、`action_id`、`action_type`、`trigger_phase`、`status`、`external_rule_id`、`connector_id`、`skip_reason`、`scheduled_for`、`started_at`、`completed_at`、`duration_ms`、`error_message` | — | `action_execution_log` 的基础字段。 |
+| `bgp_role` | string | 仅 BGP `on_detected`。`"triggered"` = 本攻击是当前 cycle 中首个 attach 的（vtysh announce 为本攻击触发）。`"attached_shared"` = 本攻击加入已 active 的公告（无 vtysh 副作用）。其他情况为空。 |
+| `announcement_id` | int | 仅 BGP `on_detected`。本条日志附带的 `bgp_announcements` 行 ID。 |
+| `announcement_refcount` | int | 仅 BGP `on_detected`。查询时公告的当前 refcount。 |
+
+### 缓解摘要 -- GET /api/attacks/:id/mitigation-summary (v1.2)
+
+单个攻击的所有缓解结果聚合视图，由 v1.2 动作状态层驱动。供 Attack Detail 页面渲染 BGP Role 列、逐攻击 Force Remove 按钮和逐攻击的缓解计数，前端无需从原始日志重新拼装状态。
+
+**响应：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `total_evaluated` | int | 该攻击的动作日志总数 |
+| `success` | int | `status=success` 的日志数 |
+| `failed` | int | `status=failed` 的日志数 |
+| `skipped` | int | `status=skipped` 的日志数 |
+| `timeout` | int | `status=timeout` 的日志数 |
+| `skip_reasons` | map[string]int | `skipped` 条目按 `skip_reason` 的分布 |
+| `action_logs` | array | 结构同 `/action-log` 响应（含 `bgp_role`、`announcement_id`、`announcement_refcount`） |
+| `xdrop_rules` | array | 本攻击的 `xdrop_active_rules` 行：`id`、`connector_id`、`external_rule_id`、`status`、`delay_started_at`、`delay_minutes`、`withdrawn_at`、`created_at`、`error_message` |
+| `bgp_announcements` | array | 逐公告的 attachment：`announcement`（完整 `bgp_announcements` 行）、`attached_at`、`detached_at`、`attack_delay_minutes`、`attack_action_id` |
+
+---
+
+## 活跃缓解 (v1.2)
+
+当前 xSight 维护的 BGP 路由与 xDrop 规则的实时视图，含强制移除与 orphan 公告处理端点。
+
+### 列表
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/active-actions/bgp` | 列出活跃 BGP 公告（除 `withdrawn`/`dismissed` 外所有状态） |
+| GET | `/api/active-actions/xdrop` | 列出活跃 xDrop 规则（除 `withdrawn`/`failed` 外所有状态） |
+| GET | `/api/active-actions/timeline` | 获取单个制品的执行时间线（详情抽屉用） |
+
+**Timeline 查询参数：**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `artifact_type` | string | `bgp` 或 `xdrop` |
+| `announcement_id` | int | 仅 BGP |
+| `attack_id`、`action_id`、`connector_id`、`external_rule_id` | — | 仅 xDrop（四者共同标识一条规则） |
+
+### 强制移除（逐攻击 / 逐制品）
+
+```
+POST /api/active-actions/force-remove
+```
+
+强制移除指定的缓解制品。BGP 会把该攻击从公告解绑（refcount 降为 0 时通过 vtysh 撤回）；xDrop 会 DELETE 规则。两种路径都会写入 `manual_override` 审计行，使自然的 on_expired 清理跳过该制品。
+
+**请求体：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `artifact_type` | string | **必填。** `bgp` 或 `xdrop` |
+| `attack_id` | int | **必填。** |
+| `action_id` | int | **必填。** |
+| `connector_id` | int | **必填。** |
+| `external_rule_id` | string | **必填。** |
+
+### Orphan BGP 公告
+
+Orphan 公告是 `BootstrapBGPOrphans` 在 Controller 启动时扫 FRR 发现、但 xSight 没有对应活跃攻击的路由。v1.2 首次升级时记录为 `dismissed_on_upgrade`；后续新出现的 orphan 为 `orphan`，需要运维处理。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/active-actions/bgp/orphan-force-withdraw` | 通过 vtysh 撤回 orphan 公告。请求体：`{ "announcement_id": N }`。非 orphan 行返回 400——改用 `/force-remove`。 |
+| POST | `/api/active-actions/bgp/orphan-dismiss` | 标记 orphan 为运维已知晓（不撤回）。请求体：`{ "announcement_id": N }` |
+| GET | `/api/active-actions/bgp/dismissed-orphans` | 列出处于 `dismissed` / `dismissed_on_upgrade` 状态的公告 |
+| POST | `/api/active-actions/bgp/orphan-undismiss` | 把已 dismiss 的 orphan 重新搬回可见列表。请求体：`{ "announcement_id": N }` |
 
 ---
 

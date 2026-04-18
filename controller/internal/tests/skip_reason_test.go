@@ -335,6 +335,155 @@ func TestSkipReason_ExecutionManual_NotFirstMatchSuppressed_EvenWhenAfterAuto(t 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// S18 (v1.2.1): decoder_not_xdrop_compatible — xdrop gated for L3 aggregate
+// decoders. xDrop is an L4 filter; `ip` decoder has no clean 5-tuple
+// mapping so it would silently degrade into full-prefix blackhole. The
+// gate routes operators toward BGP null-route for this attack class.
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestSkipReason_DecoderNotXDropCompatible_IPDecoder(t *testing.T) {
+	act := store.ResponseAction{
+		ID: 100, ActionType: "xdrop", TriggerPhase: "on_detected",
+		RunMode: "once", Enabled: true,
+	}
+	// setupDispatchMock default attack has DecoderFamily="ip" — exactly the
+	// scenario we need to gate. mode="auto" so mode_observe doesn't short-
+	// circuit before our new check.
+	ms, eng, attack := setupDispatchMock(t, "auto", []store.ResponseAction{act})
+
+	dispatch(eng, attack)
+
+	l := findSkipLog(ms, 100)
+	if l == nil {
+		t.Fatalf("expected skipped log for xdrop action with decoder=ip; got none: all=%+v", ms.actionExecLog.logs)
+	}
+	if l.SkipReason != action.SkipReasonDecoderNotSupported {
+		t.Errorf("skip_reason = %q, want %q", l.SkipReason, action.SkipReasonDecoderNotSupported)
+	}
+	if !strings.Contains(l.ErrorMessage, "ip") || !strings.Contains(l.ErrorMessage, "BGP") {
+		t.Errorf("error_message should name the decoder + suggest BGP; got %q", l.ErrorMessage)
+	}
+	_ = attack
+}
+
+// Fragment is IN the whitelist: fragment floods are a clear attack signal
+// and broad drop is an acceptable response. This test pins fragment as
+// executable (no decoder_not_xdrop_compatible skip).
+func TestSkipReason_DecoderNotXDropCompatible_FragmentAllowed(t *testing.T) {
+	act := store.ResponseAction{
+		ID: 101, ActionType: "xdrop", TriggerPhase: "on_detected",
+		RunMode: "once", Enabled: true,
+	}
+	ms, eng, attack := setupDispatchMock(t, "auto", []store.ResponseAction{act})
+	attack.DecoderFamily = "fragment"
+
+	dispatch(eng, attack)
+
+	// Should NOT be skipped for decoder reasons. (It may still fail
+	// downstream due to missing xdrop connector, but that's `failed`,
+	// not `skipped+decoder_not_xdrop_compatible`.)
+	for _, l := range ms.actionExecLog.logs {
+		if l.ActionID == 101 && l.SkipReason == action.SkipReasonDecoderNotSupported {
+			t.Errorf("fragment decoder should NOT be gated; got skip_reason=%q", l.SkipReason)
+		}
+	}
+}
+
+// Positive control: tcp_syn (also in whitelist) must pass the decoder
+// gate too. Guards against a regression where someone tightens the
+// whitelist to only tcp/udp/icmp.
+func TestSkipReason_DecoderNotXDropCompatible_TcpSynAllowed(t *testing.T) {
+	act := store.ResponseAction{
+		ID: 102, ActionType: "xdrop", TriggerPhase: "on_detected",
+		RunMode: "once", Enabled: true,
+	}
+	ms, eng, attack := setupDispatchMock(t, "auto", []store.ResponseAction{act})
+	attack.DecoderFamily = "tcp_syn"
+
+	dispatch(eng, attack)
+
+	for _, l := range ms.actionExecLog.logs {
+		if l.ActionID == 102 && l.SkipReason == action.SkipReasonDecoderNotSupported {
+			t.Errorf("tcp_syn decoder should NOT be gated; got skip_reason=%q", l.SkipReason)
+		}
+	}
+}
+
+// v1.2.1 regression: pins the exact dispatch-loop ordering for the 3
+// intertwined gates (first_match / decoder / manual). The ordering is:
+//
+//   1. mode_observe, execution=manual, first_match check (all pre-existing)
+//   2. mark firstMatchTypes[act.ActionType]
+//   3. decoder compatibility gate (NEW in v1.2.1)
+//   4. goroutine → executeAction
+//
+// Scenario: two xDrop actions on the same response, attack decoder=ip.
+// Expected log outcomes:
+//   - action 200 (earlier priority) claims first-match slot, THEN gets
+//     decoder-gated → skip_reason=decoder_not_xdrop_compatible.
+//   - action 201 (later priority) never reaches the decoder gate because
+//     first_match_suppressed fires earlier in the loop →
+//     skip_reason=first_match_suppressed.
+//
+// If anyone reorders gate steps in the future (e.g. moves decoder gate
+// above first_match mark, or into the executeAction goroutine), this test
+// catches the regression before the wrong skip_reason ships.
+func TestSkipReason_DecoderGateOrdering_WithFirstMatch(t *testing.T) {
+	act1 := store.ResponseAction{
+		ID: 200, ActionType: "xdrop", TriggerPhase: "on_detected",
+		RunMode: "once", Enabled: true, Priority: 1,
+	}
+	act2 := store.ResponseAction{
+		ID: 201, ActionType: "xdrop", TriggerPhase: "on_detected",
+		RunMode: "once", Enabled: true, Priority: 2,
+	}
+	// Default attack decoder=ip — the specific scenario we need to pin.
+	ms, eng, attack := setupDispatchMock(t, "auto", []store.ResponseAction{act1, act2})
+
+	dispatch(eng, attack)
+
+	l1 := findSkipLog(ms, 200)
+	if l1 == nil {
+		t.Fatalf("expected skipped log for first xdrop action (200); got none")
+	}
+	if l1.SkipReason != action.SkipReasonDecoderNotSupported {
+		t.Errorf("action 200 skip_reason = %q, want %q (first-match marked but decoder gate hit next)",
+			l1.SkipReason, action.SkipReasonDecoderNotSupported)
+	}
+
+	l2 := findSkipLog(ms, 201)
+	if l2 == nil {
+		t.Fatalf("expected skipped log for second xdrop action (201); got none")
+	}
+	if l2.SkipReason != action.SkipReasonFirstMatchSuppressed {
+		t.Errorf("action 201 skip_reason = %q, want %q (first_match suppress fires before decoder gate)",
+			l2.SkipReason, action.SkipReasonFirstMatchSuppressed)
+	}
+	_ = attack
+}
+
+// Control: BGP action with decoder=ip is NOT gated — the decoder
+// compatibility gate is xDrop-specific. BGP is the correct mitigation for
+// L3 aggregates; if BGP were also gated operators would have no response.
+func TestSkipReason_DecoderNotXDropCompatible_BGPNotGated(t *testing.T) {
+	act := store.ResponseAction{
+		ID: 103, ActionType: "bgp", TriggerPhase: "on_detected",
+		RunMode: "once", Enabled: true,
+	}
+	ms, eng, attack := setupDispatchMock(t, "auto", []store.ResponseAction{act})
+	// Default decoder=ip.
+
+	dispatch(eng, attack)
+
+	for _, l := range ms.actionExecLog.logs {
+		if l.ActionID == 103 && l.SkipReason == action.SkipReasonDecoderNotSupported {
+			t.Errorf("BGP action must NOT be gated by xdrop decoder whitelist; got skip_reason=%q", l.SkipReason)
+		}
+	}
+	_ = attack
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Positive: precondition passes → no skip log, action proceeds
 // ─────────────────────────────────────────────────────────────────────────────
 

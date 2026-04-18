@@ -15,6 +15,46 @@ import (
 	"github.com/littlewolf9527/xsight/controller/internal/store"
 )
 
+// xDropCompatibleDecoders is the set of xSight decoder_family values that
+// are allowed to produce xDrop rules. xDrop operates at L4 (filter on
+// protocol + src/dst ip/port + tcp_flags); decoders that map cleanly to
+// that model are included.
+//
+// Exclusion rationale:
+//   - `ip`: L3 aggregate meaning "any IP protocol". xDrop can only express
+//     this as `protocol=all`, which combined with absent flow-derived port
+//     fields (common when the attack source is diffuse) degrades into a
+//     full-prefix blackhole — silently broader than the operator usually
+//     intends. Aggregate L3 attacks should be mitigated by BGP null-route
+//     (which blackholes the whole prefix consciously).
+//
+// Inclusion rationale (why `fragment` is here): fragment floods are a
+// clear attack signal by construction; dropping broadly at the xDrop
+// layer is an acceptable response. fragment → `all` in the xDrop payload
+// is a semantic downgrade but not a silent one because operators who
+// configure a fragment-decoder threshold have already accepted the
+// aggressive drop intent.
+//
+// Maintenance: to extend support to a new decoder, update this map + the
+// protocol mapping in decoderToXDropProtocol + UI help text + roadmap
+// compatibility matrix.
+var xDropCompatibleDecoders = map[string]bool{
+	"tcp":      true,
+	"tcp_syn":  true,
+	"udp":      true,
+	"icmp":     true,
+	"fragment": true,
+	// "ip" intentionally excluded — use BGP null-route for L3 aggregate.
+}
+
+// IsXDropCompatibleDecoder reports whether an attack with the given
+// decoder_family is eligible for xDrop rule creation. Exposed so the
+// action engine dispatch path can gate xDrop actions without reaching
+// into xdrop.go internals.
+func IsXDropCompatibleDecoder(decoder string) bool {
+	return xDropCompatibleDecoders[decoder]
+}
+
 // xDropSyntheticFailedRuleIDPrefix is attached to a rule row when xDrop's
 // POST /rules failed before any real rule ID was returned (connect refused,
 // timeout, 4xx/5xx, etc.). Surfaces the failure in `xdrop_active_rules` so
@@ -142,7 +182,14 @@ func executeXDrop(
 		if err != nil {
 			body = []byte(expanded) // fallback to raw string if fixup fails
 		}
-		// Auto-inject tcp_flags for tcp_syn attacks if not already specified
+		// Normalize protocol field: xSight decoder_family values like "ip"
+		// and "fragment" are not in xDrop's protocol enum; translate them
+		// (e.g. "ip" → "all") so custom payloads with `{decoder}` work
+		// across all threshold rule types without operator translation.
+		body = normalizeXDropProtocol(body)
+		// Auto-inject tcp_flags for tcp_syn attacks if not already specified.
+		// Runs AFTER normalize so its own protocol rewrite (tcp_syn → tcp)
+		// still wins when decoder=tcp_syn.
 		body = injectTcpFlags(body, attack)
 	} else {
 		// Default payload: dst_ip drop/rate_limit based on xdrop_action
@@ -817,7 +864,16 @@ func fixPayloadTypes(raw []byte) ([]byte, error) {
 	return json.Marshal(m)
 }
 
-// decoderToXDropProtocol maps xSight decoder families to xDrop protocol values.
+// decoderToXDropProtocol maps xSight decoder_family values to the xDrop
+// API's narrower protocol enum.
+//
+//	xSight decoder_family: ip, tcp, tcp_syn, udp, icmp, fragment, ""
+//	xDrop protocol enum:   all, tcp, udp, icmp, icmpv6
+//
+// Returns "" if the decoder doesn't map to anything meaningful (shouldn't
+// happen in practice; caller should treat "" as "leave protocol field
+// untouched"). tcp_syn collapses to tcp; xDrop differentiates via
+// tcp_flags. ip/fragment collapse to "all" (xSight-aggregate semantics).
 func decoderToXDropProtocol(decoder string) string {
 	switch decoder {
 	case "tcp", "tcp_syn":
@@ -826,9 +882,65 @@ func decoderToXDropProtocol(decoder string) string {
 		return "udp"
 	case "icmp":
 		return "icmp"
+	case "ip", "fragment":
+		return "all"
 	default:
 		return ""
 	}
+}
+
+// normalizeXDropProtocol rewrites the `protocol` field in a custom xDrop
+// payload to a value the xDrop API accepts. Runs unconditionally for every
+// custom-payload xDrop request (after expandParams + fixPayloadTypes, before
+// injectTcpFlags).
+//
+// Why this exists: operators configure payloads like
+// `"protocol": "{decoder}"` for convenience. `{decoder}` expands to xSight's
+// decoder_family name (e.g. "tcp_syn" for SYN-flood rules, "fragment" for
+// fragment floods), which xDrop rejects as-is because its protocol enum is
+// narrower. Without this normalization the rule create fails with HTTP 400
+// and the attack's xdrop_active_rules row goes to the failed state.
+//
+// Decoder → xDrop mapping:
+//   - "tcp_syn" → "tcp" (tcp_flags injected separately by injectTcpFlags)
+//   - "fragment" → "all" (fragment floods drop broadly; operator accepted
+//     the aggressive semantic by picking a fragment-decoder threshold)
+//
+// Not reached paths (kept for defense-in-depth):
+//   - "ip" → "all" mapping exists in decoderToXDropProtocol but won't fire
+//     in normal flow because the action engine dispatch gate rejects
+//     decoder=ip BEFORE xDrop executeXDrop is called (see engine.go
+//     xdrop case + IsXDropCompatibleDecoder). The mapping is retained
+//     so an operator who hand-crafts a payload with literal "protocol":"ip"
+//     still gets a working rule instead of a 400 rejection.
+//
+// Behavior:
+//   - protocol matches xSight decoder → translate via decoderToXDropProtocol
+//   - protocol already a valid xDrop value (all/tcp/udp/icmp/icmpv6) → no change
+//   - protocol absent → no change (xDrop accepts as "all" implicitly)
+//   - protocol something else → no change (let xDrop reject and surface error)
+func normalizeXDropProtocol(body []byte) []byte {
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	proto, ok := m["protocol"].(string)
+	if !ok || proto == "" {
+		return body
+	}
+	// Already valid xDrop value — leave it alone even if it overlaps the
+	// xSight decoder_family (e.g., "tcp", "udp", "icmp" are fine in both).
+	switch proto {
+	case "all", "tcp", "udp", "icmp", "icmpv6":
+		return body
+	}
+	if mapped := decoderToXDropProtocol(proto); mapped != "" && mapped != proto {
+		m["protocol"] = mapped
+		if out, err := json.Marshal(m); err == nil {
+			return out
+		}
+	}
+	return body
 }
 
 // injectTcpFlags auto-injects tcp_flags and normalizes protocol for tcp_syn attacks.

@@ -86,7 +86,7 @@
         </el-table-column>
         <el-table-column :label="$t('common.actions')" width="130">
           <template #default="{ row }">
-            <el-popconfirm :title="$t('attacks.confirmForceWithdraw')" @confirm="forceRemove(row)">
+            <el-popconfirm :title="forceWithdrawTitle(row)" @confirm="forceRemove(row)">
               <template #reference>
                 <el-button size="small" type="danger" plain @click.stop>{{ $t('attacks.forceWithdraw') }}</el-button>
               </template>
@@ -292,7 +292,7 @@
 
         <!-- Force Remove -->
         <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--xs-card-border);">
-          <el-popconfirm :title="detail.action_type === 'bgp' ? $t('attacks.confirmForceWithdraw') : $t('attacks.confirmForceUnblock')" @confirm="forceRemove(detail); drawerVisible = false">
+          <el-popconfirm :title="detail.action_type === 'bgp' ? forceWithdrawTitle(detail) : $t('attacks.confirmForceUnblock')" @confirm="forceRemove(detail); drawerVisible = false">
             <template #reference>
               <el-button type="danger" plain style="width: 100%;">
                 {{ detail.action_type === 'bgp' ? $t('attacks.forceWithdraw') : $t('attacks.forceUnblock') }}
@@ -347,6 +347,23 @@ function formatElapsed(createdAt) {
   if (h > 0) return `${h}h ${m}m`
   const s = Math.floor(elapsed % 60)
   return m > 0 ? `${m}m ${s}s` : `${s}s`
+}
+
+// Returns the appropriate "Force withdraw" popconfirm title for a BGP row.
+// When refcount > 1 (i.e. multiple active attacks share this announcement),
+// warn the operator that clicking will detach all of them at once. For
+// delayed rows (refcount=0) or single-attack rows, keep the simple prompt.
+//
+// Counting rule: an attack is "active on this announcement" iff its
+// attached_attacks entry has no detached_at timestamp.
+function forceWithdrawTitle(row) {
+  if (row && Array.isArray(row.attached_attacks)) {
+    const active = row.attached_attacks.filter(a => !a.detached_at).length
+    if (active > 1) {
+      return t('mitigations.confirmForceWithdrawShared', { count: active })
+    }
+  }
+  return t('attacks.confirmForceWithdraw')
 }
 
 let loading = false

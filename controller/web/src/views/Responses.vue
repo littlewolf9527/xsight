@@ -175,6 +175,15 @@
 
         <!-- xDrop-specific fields -->
         <template v-if="actionForm.action_type === 'xdrop'">
+          <!-- v1.2.1: surface the decoder compatibility gate at the action
+               config point. Operators who bind this response to an `ip`-
+               decoder threshold rule will see their xdrop action skipped
+               at dispatch time; this note pre-empts the support ticket. -->
+          <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 14px;" :title="$t('responses.xdropDecoderScope')">
+            <template #default>
+              <div style="font-size: 12px;">{{ $t('responses.xdropDecoderScopeBody') }}</div>
+            </template>
+          </el-alert>
           <el-form-item :label="$t('responses.xdropAction')">
             <el-select v-model="actionForm.xdrop_action" style="width: 100%;">
               <el-option label="Filter L4" value="filter_l4" />

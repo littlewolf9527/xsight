@@ -107,6 +107,27 @@ func (r *xdropActiveRuleRepo) ListByAttack(ctx context.Context, attackID int) ([
 	return scanXDropActiveRules(rows)
 }
 
+// CountByStatus returns status → row count for all xdrop_active_rules.
+// Used by the Prometheus xsight_xdrop_rules gauge collector.
+func (r *xdropActiveRuleRepo) CountByStatus(ctx context.Context) (map[string]int, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT status, COUNT(*) FROM xdrop_active_rules GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int)
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, err
+		}
+		out[status] = n
+	}
+	return out, rows.Err()
+}
+
 func (r *xdropActiveRuleRepo) listByStatus(ctx context.Context, where string) ([]store.XDropActiveRule, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT id, attack_id, action_id, connector_id, external_rule_id,

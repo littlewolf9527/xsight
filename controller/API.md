@@ -11,6 +11,12 @@ All `/api/*` endpoints (except `/api/login`) require one of:
 
 JWT tokens expire after 24 hours.
 
+### `GET /metrics` — Prometheus scrape (unauthenticated)
+
+Exposes Prometheus metrics for all v1.2 / v1.2.1 instrumentation (vtysh ops, action executions, action skips, scheduled-action recovery outcomes, current BGP announcements / xDrop rules / scheduled actions by status, and attack-tracker counters), plus the default Go runtime and process metrics.
+
+**Unauthenticated by convention** (matching kube-apiserver / etcd / Prometheus itself). Rely on network-level isolation. See [docs/architecture.md § 7 Observability](../docs/architecture.md#7-observability-v121) for the full metric catalogue.
+
 ---
 
 ## Login
@@ -250,8 +256,13 @@ Actions within a response policy. Each action has a type, trigger phase, and run
 | `xdrop_action` | string | xDrop only: `filter_l4`, `rate_limit`, or `unblock` |
 | `xdrop_custom_payload` | object | xDrop only: match fields (`dst_ip`, `src_ip`, `dst_port`, `src_port`, `protocol`) and `rate_limit` value |
 | `shell_extra_args` | string | Shell only: additional arguments passed to the command |
-| `unblock_delay_minutes` | int | xDrop filter/rate_limit only: auto-unblock after N minutes (0-1440) |
+| `unblock_delay_minutes` | int | xDrop filter_l4/rate_limit only: auto-unblock after N minutes (0-1440) |
 | `bgp_route_map` | string | BGP only: **Required for on_detected.** Route-map name for blackhole injection |
+| `bgp_withdraw_delay_minutes` | int | BGP only: delay before withdrawing route after attack expires (0-1440). Effective delay across multiple sharing attacks is MAX per announce cycle — see [architecture.md § BGP Execution](../docs/architecture.md#bgp-execution-wanguard-style-shared-announcement) |
+
+> **xDrop decoder compatibility (v1.2.1):** xDrop actions are only dispatched for attacks whose decoder is in the L4-compatible whitelist (`tcp`, `tcp_syn`, `udp`, `icmp`, `fragment`). Attacks with decoder `ip` are skipped with `skip_reason=decoder_not_xdrop_compatible` — use a BGP action for L3-aggregate attacks.
+
+> **Auto-paired actions:** Creating an xDrop (`filter_l4`/`rate_limit`) or BGP `on_detected` action automatically creates a matching `on_expired` child action (`unblock` / withdraw). The child cannot be edited directly; edit the parent. Creating an `xdrop` or `bgp` action with `trigger_phase=on_expired` is rejected with HTTP 400.
 
 ### xDrop Targets
 
@@ -484,8 +495,9 @@ P95 baseline and recommended thresholds for all enabled prefixes.
 | GET | `/api/attacks/active` | List currently active attacks |
 | GET | `/api/attacks/:id` | Get attack details with action execution log |
 | POST | `/api/attacks/:id/expire` | Force-expire an active attack |
-| GET | `/api/attacks/:id/action-log` | Get action execution log for an attack |
+| GET | `/api/attacks/:id/action-log` | Get action execution log for an attack (v1.2: includes `bgp_role`) |
 | GET | `/api/attacks/:id/sensor-logs` | Get flow-level sensor logs for an attack |
+| GET | `/api/attacks/:id/mitigation-summary` | Aggregated mitigation view for an attack (v1.2) |
 
 ### List Attacks -- GET /api/attacks
 
@@ -524,6 +536,88 @@ Returns per-flow records from the `flow_logs` table for the attack's target IP a
 | `limit` | int | Max flow records (default: 1000, max: 10000) |
 
 **Response:** `{ "flows": [...], "total": N, "expired": bool, "window": "full"|"last_1h" }`
+
+### Action Log -- GET /api/attacks/:id/action-log
+
+Returns every `action_execution_log` row for this attack. BGP `on_detected` entries are enriched with v1.2 announcement-level fields so the UI can distinguish which attack actually triggered vtysh from attacks that joined an existing shared announcement.
+
+**Response (array element shape):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id`, `attack_id`, `action_id`, `action_type`, `trigger_phase`, `status`, `external_rule_id`, `connector_id`, `skip_reason`, `scheduled_for`, `started_at`, `completed_at`, `duration_ms`, `error_message` | — | Base fields from `action_execution_log`. |
+| `bgp_role` | string | BGP `on_detected` only. `"triggered"` = this attack was first to attach in the current cycle (the vtysh announce fired for this attack). `"attached_shared"` = this attack joined an existing active announcement (no vtysh side effect). Empty otherwise. |
+| `announcement_id` | int | BGP `on_detected` only. ID of the `bgp_announcements` row this log entry is attached to. |
+| `announcement_refcount` | int | BGP `on_detected` only. Current refcount on the announcement at query time. |
+
+### Mitigation Summary -- GET /api/attacks/:id/mitigation-summary (v1.2)
+
+Aggregated view of every mitigation outcome the attack produced, backed by the v1.2 Action State Layer. Used by the Attack Detail page to render the BGP Role column, per-attack Force Remove buttons, and per-attack mitigation counters without forcing the UI to re-stitch state from raw logs.
+
+**Response:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_evaluated` | int | Total action logs for this attack |
+| `success` | int | Action logs with `status=success` |
+| `failed` | int | Action logs with `status=failed` |
+| `skipped` | int | Action logs with `status=skipped` |
+| `timeout` | int | Action logs with `status=timeout` |
+| `skip_reasons` | map[string]int | Breakdown of `skipped` entries by `skip_reason` |
+| `action_logs` | array | Same shape as `/action-log` response (including `bgp_role`, `announcement_id`, `announcement_refcount`) |
+| `xdrop_rules` | array | Rows from `xdrop_active_rules` for this attack: `id`, `connector_id`, `external_rule_id`, `status`, `delay_started_at`, `delay_minutes`, `withdrawn_at`, `created_at`, `error_message` |
+| `bgp_announcements` | array | Per-announcement attachments: `announcement` (full `bgp_announcements` row), `attached_at`, `detached_at`, `attack_delay_minutes`, `attack_action_id` |
+
+---
+
+## Active Mitigations (v1.2)
+
+Real-time view of BGP routes and xDrop rules that xSight is currently maintaining, plus operator actions to force-remove or resolve orphan announcements.
+
+### Lists
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/active-actions/bgp` | List active BGP announcements (all statuses except `withdrawn`/`dismissed`) |
+| GET | `/api/active-actions/xdrop` | List active xDrop rules (all statuses except `withdrawn`/`failed`) |
+| GET | `/api/active-actions/timeline` | Get the Execution Timeline for a single artifact (detail drawer) |
+
+**Timeline query params:**
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `artifact_type` | string | `bgp` or `xdrop` |
+| `announcement_id` | int | For BGP only |
+| `attack_id`, `action_id`, `connector_id`, `external_rule_id` | — | For xDrop only (together identify the rule) |
+
+### Force Remove (per-attack / per-artifact)
+
+```
+POST /api/active-actions/force-remove
+```
+
+Force-removes a specific mitigation artifact. For BGP this detaches the attack from the announcement (and withdraws via vtysh when refcount drops to 0); for xDrop it DELETEs the rule. In both cases a `manual_override` audit row is written so the natural on_expired cleanup skips this artifact.
+
+**Body:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `artifact_type` | string | **Required.** `bgp` or `xdrop` |
+| `attack_id` | int | **Required.** |
+| `action_id` | int | **Required.** |
+| `connector_id` | int | **Required.** |
+| `external_rule_id` | string | **Required.** |
+
+### Orphan BGP Announcements
+
+Orphan announcements are FRR routes that `BootstrapBGPOrphans` found on controller startup with no backing active attack. First-boot v1.2 upgrade routes are recorded as `dismissed_on_upgrade`; subsequently-observed orphans are `orphan` and require operator resolution.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/active-actions/bgp/orphan-force-withdraw` | Withdraw an orphan announcement via vtysh. Body: `{ "announcement_id": N }`. Rejects non-orphan rows with 400 — use `/force-remove` instead. |
+| POST | `/api/active-actions/bgp/orphan-dismiss` | Mark an orphan as operator-acknowledged without withdrawing. Body: `{ "announcement_id": N }` |
+| GET | `/api/active-actions/bgp/dismissed-orphans` | List announcements in `dismissed` / `dismissed_on_upgrade` status |
+| POST | `/api/active-actions/bgp/orphan-undismiss` | Re-surface a dismissed orphan. Body: `{ "announcement_id": N }` |
 
 ---
 

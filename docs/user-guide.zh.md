@@ -374,6 +374,8 @@ Nodes 页面显示：
 | Target Nodes | 目标 xDrop 连接器（空 = 全部） |
 | Unblock Delay (min) | 攻击过期后，等待多少分钟再移除规则（0-1440） |
 
+> **xDrop decoder 适用范围 (v1.2.1)：** xDrop 动作只对 decoder 为 `tcp`、`tcp_syn`、`udp`、`icmp` 或 `fragment` 的攻击下发。decoder 为 `ip`（L3 聚合）的攻击会被跳过——这类攻击请使用 BGP 动作。跳过在动作日志中记录为 `skip_reason=decoder_not_xdrop_compatible`。
+
 **BGP 专属字段：**
 
 | 字段 | 说明 |
@@ -538,7 +540,7 @@ Dashboard 提供实时概览，包含四个统计卡片：
 
 **Attack Detail**（点击任意攻击行）：
 - 摘要：IP、Decoder、严重等级、峰值、开始/结束时间、上报节点
-- **Actions Log**：该攻击触发的所有动作及其状态、连接器、耗时、错误信息
+- **Actions Log**：该攻击触发的所有动作及其状态、连接器、耗时、错误信息。对 BGP `on_detected` 条目，**BGP Role** 列会标明本攻击是真正触发 vtysh 的那一个（`triggered`），还是加入了别的攻击已建立的共享公告（`attached`）。逐攻击 **Force Remove** 按钮允许在不影响其他 attach 攻击的情况下，把本攻击从共享 BGP 公告解绑，或删除其 xDrop 规则（见 [§ 7.4 Active Mitigations](#74-active-mitigations)）。
 - **Sensor Logs**：采样流数据 — Top 源 IP、源端口、目标端口及五元组流量明细
 
 ### 7.4 Active Mitigations
@@ -571,7 +573,35 @@ Dashboard 提供实时概览，包含四个统计卡片：
 
 **强制移除：** 点击 **Force Withdraw**（BGP）或 **Force Unblock**（xDrop）立即移除缓解措施。强制移除后，该特定制品的自动 on_expired 动作将被抑制。
 
-### 7.5 审计日志
+> **共享 BGP 公告 (v1.2)：** 多个攻击触发同一 `(prefix, route_map)` 组合时，它们共享同一条 BGP 公告。公告的 refcount 表示当前 attach 的攻击数量。在 Active Mitigations 页面执行 Force Withdraw 会**把所有 attach 攻击一起解绑**并撤回公告。若只想解绑单个攻击而不影响共享路由，请在 Attack Detail 页面使用逐攻击的 Force Remove 按钮。
+
+**Orphan 公告 (v1.2)：** Controller 启动时会扫 FRR 路由，找出 xSight 里没有对应攻击的条目（v1.2 升级前遗留 或 崩溃残留）。这些条目在 BGP tab 中以 `Orphan` 状态出现。v1.2 首次升级时原有路由会被标为 `Dismissed on Upgrade`——xSight 不会声明所有权。可通过行菜单的 **Force Withdraw** / **Dismiss** 操作处理它们。
+
+### 7.5 可观测性（`/metrics`）
+
+Controller 在 `GET /metrics`（端口 8080，**无需认证**——依赖网络层隔离）暴露 Prometheus 抓取端点。在 Prometheus 中添加抓取配置：
+
+```yaml
+scrape_configs:
+  - job_name: xsight-controller
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["controller-ip:8080"]
+```
+
+适合配告警的关键指标：
+
+| 指标 | 告警思路 |
+|------|----------|
+| `xsight_attacks_evicted_total` | 非零 → 需要调大 `max_active_attacks` |
+| `xsight_scheduled_actions_recovered_total{outcome="executing_retried"}` | 重启后非零 → MarkExecuting / Complete 间崩溃（事故信号） |
+| `xsight_action_skip_total{skip_reason="decoder_not_xdrop_compatible"}` | 激增 → 运维把 `ip` decoder 攻击配给了 xDrop（应改用 BGP） |
+| `xsight_bgp_announcements{status="orphan"}` | 非零 → FRR 里有 xSight 不认识的路由，需在 UI 中处理 |
+| `xsight_vtysh_ops_total{result="failed"}` | 速率告警 → FRR 连通性故障 |
+
+完整指标目录见 [architecture.zh.md § 7 可观测性](architecture.zh.md#7-可观测性-v121)。
+
+### 7.6 审计日志
 
 路径：**侧边栏 > SETTINGS > Audit Log**
 
@@ -696,3 +726,10 @@ xSight 提供完整的 REST API 用于自动化和集成。
 - 检查连接器 API URL 和密钥。
 - 如 xDrop 有同步延迟，增大超时时间（建议 30000ms）。
 - 查看执行日志中的 HTTP 错误码。
+- **v1.2.1：** decoder 为 `ip`（L3 聚合）的攻击会被跳过。检查动作日志是否有 `skip_reason=decoder_not_xdrop_compatible`。请改用 BGP 动作，或在规则上加 decoder 相关前置条件，把合适的攻击引到合适的动作上。
+- **v1.2：** `action_engine.mode: observe`（默认）时所有 xDrop 动作也会被跳过。在 `config.yaml` 中改为 `action_engine.mode: auto` 并重启 Controller 才会真正下发。BGP、Webhook、Shell 不受此设置影响。
+
+### 验证 metrics 抓取
+- `curl -s http://controller-ip:8080/metrics | grep ^xsight_` — 应该返回 ~15 个 metric family。
+- 返回为空：metrics 可能未注册；检查 Controller 启动日志中是否有 `metrics.Register failed`。
+- 抓取超时：某个 custom collector 命中了 5s DB 超时 — 检查 PostgreSQL 负载。

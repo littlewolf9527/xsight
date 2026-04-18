@@ -29,7 +29,10 @@ import (
 	"github.com/littlewolf9527/xsight/controller/internal/engine/classifier"
 	"github.com/littlewolf9527/xsight/controller/internal/engine/dedup"
 	"github.com/littlewolf9527/xsight/controller/internal/engine/threshold"
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/littlewolf9527/xsight/controller/internal/ingestion"
+	"github.com/littlewolf9527/xsight/controller/internal/metrics"
 	"github.com/littlewolf9527/xsight/controller/internal/retention"
 	"github.com/littlewolf9527/xsight/controller/internal/tracker"
 	"github.com/littlewolf9527/xsight/controller/internal/watchdog"
@@ -213,9 +216,16 @@ func main() {
 		MaxActiveAttacks:       cfg.Detection.MaxActiveAttacks,
 	}
 	// --- Phase 5: Action Engine ---
-	actionEngine := action.NewEngine(db, cfg.Action.Mode)
+	// Wrap the concrete postgres store with a metrics-instrumented decorator
+	// so every ActionExecLog().Create transparently increments
+	// xsight_action_executions_total{action_type,status}. The wrapper is a
+	// pass-through for every other repo, so subsequent code using `iStore`
+	// behaves identically to `db` at the Store interface level.
+	// Postgres-specific methods (AutoMigrate, Close) still use `db` directly.
+	iStore := metrics.InstrumentStore(db)
+	actionEngine := action.NewEngine(iStore, cfg.Action.Mode)
 
-	attackTracker := tracker.New(trackerCfg, db, rings, alertDedup, actionEngine.HandleEvent)
+	attackTracker := tracker.New(trackerCfg, iStore, rings, alertDedup, actionEngine.HandleEvent)
 	attackTracker.SetRebreachCallback(actionEngine.CancelDelaysForAttack)
 
 	// v1.2 PR-3/PR-4 crash recovery: run before serving traffic.
@@ -234,12 +244,20 @@ func main() {
 	}
 
 	// BGP recovery: re-inject ephemeral routes for active attacks (FRR state lost on restart)
-	action.RecoverBGPRoutes(ctx, db)
+	action.RecoverBGPRoutes(ctx, iStore)
 
 	// BGP bootstrap: scan FRR for routes not represented in bgp_announcements
 	// and mark them as orphan / dismissed_on_upgrade. See bgp_bootstrap.go for
 	// the first-boot vs. runtime semantics.
-	action.BootstrapBGPOrphans(ctx, db)
+	action.BootstrapBGPOrphans(ctx, iStore)
+
+	// Prometheus metrics: register v1.2.1 custom collectors + counters with
+	// the default registry (the /metrics HTTP route uses promhttp.Handler()
+	// which reads from the default registry). Go runtime + process metrics
+	// are auto-registered by the prometheus library.
+	if err := metrics.Register(prometheus.DefaultRegisterer, iStore, attackTracker); err != nil {
+		log.Fatalf("metrics register: %v", err)
+	}
 
 	// --- Phase 1: gRPC ingestion layer ---
 	nodeState := ingestion.NewNodeState()
@@ -362,7 +380,7 @@ func main() {
 	}
 
 	handler := ingestion.NewGRPCHandler(ingestion.GRPCHandlerConfig{
-		Store:      db,
+		Store:      iStore,
 		NodeState:  nodeState,
 		SamplePool: samplePool,
 		OnStats:    onStats,
@@ -377,13 +395,13 @@ func main() {
 	}()
 
 	// --- Phase 6: Config Publisher ---
-	configPub := configpub.New(db, handler, nodeState.ConnectedNodes)
+	configPub := configpub.New(iStore, handler, nodeState.ConnectedNodes)
 	go configPub.RunDriftChecker(ctx)
 
 	// --- Phase 7: REST API ---
 	jwtSecret := cfg.Auth.APIKey + "-jwt" // derive JWT secret from API key
 	router := api.NewRouter(api.Dependencies{
-		Store:         db,
+		Store:         iStore,
 		ConfigPub:     configPub,
 		NodeState:     nodeState,
 		ThreshTree:    threshTree,

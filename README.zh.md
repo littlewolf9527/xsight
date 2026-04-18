@@ -78,8 +78,20 @@ xSight 是一套分布式 DDoS 检测与响应平台，融合了 XDP/eBPF 线速
 | **Webhook** | HTTP 回调至外部系统（SIEM、Slack、PagerDuty 等） |
 | **Shell** | 执行本地脚本，用于自定义自动化 |
 
+- **自动配对动作** — 创建 xDrop/BGP `on_detected` 动作时自动创建对应的 `on_expired` 清理动作（unblock / withdraw），跟随父动作的生命周期同步
 - **自动 `tcp_flags` 注入** — SYN Flood 事件自动为 xDrop 规则添加 `tcp_flags=SYN`，精准封堵而不误伤正常流量
-- **动态过期** — 响应规则自动过期，每个检测周期重新评估
+- **xDrop decoder 兼容闸门** — xDrop 仅限 L4；`ip`（L3 聚合）攻击会以 `decoder_not_xdrop_compatible` 跳过，避免退化为整前缀黑洞。这类攻击请使用 BGP
+- **共享 BGP 公告（Wanguard 风格）** — 多个攻击落到同一 `(prefix, route_map)` 时复用同一条 FRR 路由。所有 attach 攻击的 MAX 延迟、`SELECT FOR UPDATE` 下的原子 attach/detach
+- **持久化延迟任务** — `scheduled_actions` 表跨 Controller 重启；启动时 re-arm pending timer、立即 fire 逾期任务、retry 执行中途崩溃的任务
+- **FRR 孤儿检测** — 启动扫 FRR，发现没有对应攻击的残留路由并交给运维处理
+
+### 活跃缓解与逐攻击下钻
+- 独立的 `Active Mitigations` 页面，BGP Routing + xDrop Filtering 两个标签页，每条制品带详情抽屉（摘要 / 配置 / 执行时间线）。
+- Attack Detail 提供 `BGP Role` 列（`triggered` vs `attached` 到共享公告）和逐攻击 Force Remove，可在不撤回共享路由的情况下解绑单个攻击。
+
+### 可观测性
+- Prometheus `/metrics` 端点，约 15 个 xSight 专用指标（vtysh 操作、动作分派、skip 原因、scheduled-action 恢复结果、状态表 gauge、攻击追踪计数器），还免费附带 Go runtime / process 指标。
+- Custom collector 在 scrape 时直接读 DB——永远新鲜，无陈旧窗口，也无需后台刷新 goroutine。
 
 ### 流量分析
 - **Flow 指纹** — 攻击期间进行五元组采样，捕获 Top Talker 和协议分布

@@ -6,6 +6,8 @@ import (
 
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/littlewolf9527/xsight/controller/internal/action"
 	"github.com/littlewolf9527/xsight/controller/internal/configpub"
 	"github.com/littlewolf9527/xsight/controller/internal/engine/baseline"
@@ -43,6 +45,11 @@ func NewRouter(deps Dependencies) *gin.Engine {
 
 	// Public endpoints
 	r.POST("/api/login", loginHandler(deps))
+	// Prometheus scrape endpoint — unauthenticated by convention (rely on
+	// network-level isolation, same as kube-apiserver/etcd/etc.). Uses the
+	// default registry which metrics.Register() populates at startup, so
+	// Go runtime + process metrics are included automatically.
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// API group — requires auth
 	api := r.Group("/api")

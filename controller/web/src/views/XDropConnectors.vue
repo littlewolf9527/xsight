@@ -4,6 +4,14 @@
       <h2>{{ t('xdropConnectors.title') }}</h2>
       <el-button type="primary" @click="openCreate">{{ t('xdropConnectors.add') }}</el-button>
     </div>
+    <!-- v1.2.1: help operators understand which threshold decoders are
+         compatible with xDrop. Surfaces the L4-only limitation before they
+         configure a response action that won't fire for `ip`-decoder rules. -->
+    <el-alert type="info" :closable="false" show-icon style="margin-bottom: 16px;" :title="t('xdropConnectors.decoderScopeTitle')">
+      <template #default>
+        <div style="font-size: 13px;">{{ t('xdropConnectors.decoderScopeBody') }}</div>
+      </template>
+    </el-alert>
     <el-table :data="items" stripe :empty-text="t('common.noData')">
       <el-table-column prop="id" :label="t('common.id')" width="60" />
       <el-table-column prop="name" :label="t('common.name')" />
