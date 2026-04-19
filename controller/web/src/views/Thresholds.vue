@@ -30,7 +30,7 @@
         </el-form-item>
         <el-form-item :label="$t('thresholds.decoder')">
           <el-select v-model="form.decoder">
-            <el-option v-for="d in ['ip','tcp','tcp_syn','udp','icmp','fragment']" :key="d" :label="d" :value="d" />
+            <el-option v-for="d in ['ip','tcp','tcp_syn','udp','icmp','fragment','tcp_ack','tcp_rst','tcp_fin','gre','esp','igmp','ip_other','bad_fragment','invalid']" :key="d" :label="d" :value="d" />
           </el-select>
         </el-form-item>
         <el-form-item :label="$t('thresholds.unit')">

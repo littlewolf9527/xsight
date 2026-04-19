@@ -191,7 +191,12 @@ const baselineData = ref([])
 const createForm = reactive({ name: '', description: '' })
 const renameForm = reactive({ id: 0, name: '', description: '' })
 const ruleForm = reactive({ domain: 'internal_ip', direction: 'receives', decoder: 'tcp_syn', unit: 'pps', comparison: 'over', value: 500, inheritable: true })
-const decoders = ['ip', 'tcp', 'tcp_syn', 'udp', 'icmp', 'fragment']
+const decoders = [
+  'ip', 'tcp', 'tcp_syn', 'udp', 'icmp', 'fragment',
+  'tcp_ack', 'tcp_rst', 'tcp_fin',
+  'gre', 'esp', 'igmp', 'ip_other',
+  'bad_fragment', 'invalid',
+]
 
 // Auto-adjust value when switching to/from pct unit
 watch(() => ruleForm.unit, (newUnit, oldUnit) => {
