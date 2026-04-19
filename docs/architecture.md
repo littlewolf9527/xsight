@@ -132,8 +132,17 @@ L4 protocol decoding:
 | 1 | tcp_syn | TCP packets with SYN flag set and ACK cleared |
 | 2 | udp | All UDP packets |
 | 3 | icmp | ICMP and ICMPv6 |
-| 4 | fragment | IP fragments |
-| 5-15 | (reserved) | Future decoders (array is pre-allocated to avoid BPF map rebuilds) |
+| 4 | fragment | IP fragments (any `MF=1` or `offset≠0`) |
+| 5 | tcp_ack | TCP packets with ACK bit and no SYN — stateless ACK flood identification |
+| 6 | tcp_rst | TCP packets with RST bit — RST flood |
+| 7 | tcp_fin | TCP packets with FIN bit — FIN flood / scan |
+| 8 | gre | IP protocol 47 |
+| 9 | esp | IP protocol 50 |
+| 10 | igmp | IP protocol 2 |
+| 11 | ip_other | Catch-all for IP protocols not otherwise counted |
+| 12 | bad_fragment | Ping-of-Death signature (`offset×8 + payload > 65535`) or tiny first-fragment (too small to hold L4 header) |
+| 13 | invalid | `IHL < 5` / `IP total_length < IHL×4` / TCP `doff < 5` |
+| 14-15 | (reserved) | Future decoders — array is pre-allocated to avoid BPF map rebuilds |
 
 > **Note:** There is no separate `ip` decoder slot. Aggregate IP-level statistics (total packets/bytes) are tracked in the parent `pkt_count` / `byte_count` fields, not via a decoder index. The `ip` decoder name used in threshold rules maps to the aggregate counters, not to a decoder_counts slot.
 
@@ -287,7 +296,7 @@ The engine iterates over the response's actions, sorted by `(trigger_phase, prio
 1. **`action_engine.mode` gate** — the global `action_engine.mode` config value (`observe` | `auto`, default `observe`) gates xDrop actions only. In `observe` mode all xDrop actions are skipped with `skip_reason=mode_observe`; BGP / webhook / shell are never gated by this setting. Set `mode: auto` in `config.yaml` to enable xDrop blocking.
 2. **Phase matching**: `on_detected` actions fire on attack confirmation; `on_expired` actions fire on expiry.
 3. **Run mode**: `once` (fire once per attack), `periodic` (fire every N seconds while active), `retry_until_success`.
-4. **Precondition evaluation**: Each action can have preconditions that filter by 12 attributes (decoder, severity, domain, cidr, node, pps, bps, attack_type, dominant ports, unique source IPs). All conditions use AND logic — every condition must be satisfied.
+4. **Precondition evaluation**: Each action can have preconditions that filter by attributes such as `decoder`, `severity`, `domain`, `carpet_bomb` (alias for `domain eq subnet`), `cidr`, `node`, `pps`, `bps`, `attack_type`, dominant ports, unique source IPs. All conditions use AND logic — every condition must be satisfied.
 5. **First-match ACL**: For non-webhook types (xDrop, BGP, Shell), only the first matching action per type executes. Webhook actions all execute (multi-channel notification).
 6. **xDrop decoder gate (v1.2.1)**: After the first-match mark, if `action_type=xdrop` and the attack's `decoder_family` is not in the xDrop-compatible whitelist (`tcp`, `tcp_syn`, `udp`, `icmp`, `fragment`), the action is skipped with `skip_reason=decoder_not_xdrop_compatible`. The `ip` decoder is intentionally excluded — it is an L3 aggregate and would degrade to a full-prefix blackhole. Operators should use BGP null-route for L3-aggregate attacks.
 7. **Execution**: The action is dispatched to the appropriate handler (webhook POST, shell exec, xDrop API call, vtysh command).

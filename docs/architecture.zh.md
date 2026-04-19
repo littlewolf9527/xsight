@@ -132,8 +132,17 @@ L4 protocol decoding:
 | 1 | tcp_syn | 设置了 SYN 标志且 ACK 未设置的 TCP 数据包 |
 | 2 | udp | 所有 UDP 数据包 |
 | 3 | icmp | ICMP 和 ICMPv6 |
-| 4 | fragment | IP 分片 |
-| 5-15 | (reserved) | 预留给未来的解码器（数组预分配以避免重建 BPF Map） |
+| 4 | fragment | IP 分片（任意 `MF=1` 或 `offset≠0`） |
+| 5 | tcp_ack | 设置了 ACK 但未设置 SYN 的 TCP 数据包 — 无状态 ACK flood 识别 |
+| 6 | tcp_rst | 设置了 RST 位的 TCP 数据包 — RST flood |
+| 7 | tcp_fin | 设置了 FIN 位的 TCP 数据包 — FIN flood / 扫描 |
+| 8 | gre | IP 协议号 47 |
+| 9 | esp | IP 协议号 50 |
+| 10 | igmp | IP 协议号 2 |
+| 11 | ip_other | 其他未单独计数的 IP 协议兜底 |
+| 12 | bad_fragment | Ping of Death 特征（`offset×8 + payload > 65535`）或首片过小（塞不下 L4 头） |
+| 13 | invalid | `IHL < 5` / `IP total_length < IHL×4` / TCP `doff < 5` |
+| 14-15 | (reserved) | 预留给未来的解码器 — 数组预分配以避免重建 BPF Map |
 
 > **注意：** 不存在单独的 `ip` 解码器槽位。IP 层聚合统计（总包数/字节数）通过父级的 `pkt_count` / `byte_count` 字段跟踪，而非解码器索引。阈值规则中使用的 `ip` 解码器名称映射到聚合计数器，而非 decoder_counts 槽位。
 
@@ -287,7 +296,7 @@ Controller 通过双向 `ControlStream` 向 Node 推送配置：
 1. **`action_engine.mode` 闸门**——全局 `action_engine.mode` 配置（`observe` | `auto`，默认 `observe`）仅对 xDrop 动作生效。`observe` 模式下所有 xDrop 动作以 `skip_reason=mode_observe` 跳过；BGP / Webhook / Shell 不受此设置影响。要启用 xDrop 封锁，需在 `config.yaml` 中显式设置 `mode: auto`。
 2. **阶段匹配**：`on_detected` 动作在攻击确认时触发；`on_expired` 动作在攻击过期时触发。
 3. **运行模式**：`once`（每次攻击触发一次）、`periodic`（在攻击存续期间每 N 秒触发一次）、`retry_until_success`（重试直到成功）。
-4. **前置条件评估**：每个动作可以设置前置条件，按 12 个属性过滤（decoder、severity、domain、cidr、node、pps、bps、attack_type、dominant ports、unique source IPs）。所有条件使用 AND 逻辑——必须全部满足。
+4. **前置条件评估**：每个动作可以设置前置条件，按 `decoder`、`severity`、`domain`、`carpet_bomb`（`domain eq subnet` 的别名）、`cidr`、`node`、`pps`、`bps`、`attack_type`、dominant ports、unique source IPs 等属性过滤。所有条件使用 AND 逻辑——必须全部满足。
 5. **首次匹配 ACL**：对于非 Webhook 类型（xDrop、BGP、Shell），每种类型仅执行第一个匹配的动作。Webhook 动作全部执行（多通道通知）。
 6. **xDrop decoder 兼容闸门 (v1.2.1)**：首次匹配后，若 `action_type=xdrop` 且攻击的 `decoder_family` 不在 xDrop 兼容白名单（`tcp`、`tcp_syn`、`udp`、`icmp`、`fragment`）中，则以 `skip_reason=decoder_not_xdrop_compatible` 跳过该动作。`ip` decoder 被有意排除——它是 L3 聚合，若下发会退化为整前缀黑洞。此类攻击应使用 BGP null-route。
 7. **执行**：动作分派到对应的处理器（Webhook POST、Shell 执行、xDrop API 调用、vtysh 命令）。

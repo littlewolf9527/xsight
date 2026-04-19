@@ -64,7 +64,7 @@ xSight 是一套分布式 DDoS 检测与响应平台，融合了 XDP/eBPF 线速
 | **Flow** | sFlow、NetFlow v5/v9、IPFIX 接收器，支持多源 | 路由器/交换机集成，无内核依赖 |
 
 ### 检测引擎
-- **硬阈值检测** — 按协议解码器（TCP、TCP SYN、UDP、ICMP、IP）独立设置 PPS 和 BPS 阈值
+- **硬阈值检测** — 按协议解码器独立设置 PPS 和 BPS 阈值。内置解码器：TCP、TCP SYN、UDP、ICMP、fragment、TCP ACK/RST/FIN、GRE、ESP、IGMP、`ip_other`、`bad_fragment`、`invalid`——共 14 个，可扩展到 16
 - **动态基线检测** — EWMA 算法，168 槽位周循环画像（每小时一个槽位），基于学习到的基线百分比偏差告警
 - **双向检测** — 独立监控入向和出向流量
 - **全局地毯式轰炸检测** — 0.0.0.0/0 聚合阈值，捕获分散在大量 IP 上的分布式攻击

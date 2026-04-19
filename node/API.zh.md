@@ -139,7 +139,7 @@ per-IP 流量计数器，出现在 `StatsReport.ip_stats` 和 `StatsReport.src_i
 | `dst_ip` | bytes | IP 地址（IPv4 为 4 字节，IPv6 为 16 字节） |
 | `pkt_count` | uint64 | 总包数 |
 | `byte_count` | uint64 | 总字节数 |
-| `decoder_counts` | uint32[] | 按解码器 ID 索引的包计数（TCP=0, TCP_SYN=1, UDP=2, ICMP=3, FRAG=4, ...） |
+| `decoder_counts` | uint32[] | 按解码器 ID 索引的包计数。槽位 0-4：TCP / TCP_SYN / UDP / ICMP / FRAGMENT。槽位 5-13：TCP_ACK / TCP_RST / TCP_FIN / GRE / ESP / IGMP / IP_OTHER / BAD_FRAGMENT / INVALID。权威注册表见 [`shared/decoder/decoder.go`](../shared/decoder/decoder.go)。 |
 | `decoder_byte_counts` | uint64[] | 按解码器 ID 索引的字节计数 |
 | `small_pkt` | uint32 | < 128 字节的包数 |
 | `medium_pkt` | uint32 | 128-512 字节的包数 |

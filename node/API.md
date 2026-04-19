@@ -139,7 +139,7 @@ Per-IP traffic counters reported in `StatsReport.ip_stats` and `StatsReport.src_
 | `dst_ip` | bytes | IP address (4 bytes IPv4, 16 bytes IPv6) |
 | `pkt_count` | uint64 | Total packets |
 | `byte_count` | uint64 | Total bytes |
-| `decoder_counts` | uint32[] | Packet counts indexed by decoder ID (TCP=0, TCP_SYN=1, UDP=2, ICMP=3, FRAG=4, ...) |
+| `decoder_counts` | uint32[] | Packet counts indexed by decoder ID. Slots 0-4: TCP / TCP_SYN / UDP / ICMP / FRAGMENT. Slots 5-13: TCP_ACK / TCP_RST / TCP_FIN / GRE / ESP / IGMP / IP_OTHER / BAD_FRAGMENT / INVALID. See [`shared/decoder/decoder.go`](../shared/decoder/decoder.go) for the canonical registry. |
 | `decoder_byte_counts` | uint64[] | Byte counts indexed by decoder ID |
 | `small_pkt` | uint32 | Packets < 128 bytes |
 | `medium_pkt` | uint32 | Packets 128-512 bytes |

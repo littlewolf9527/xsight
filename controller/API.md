@@ -172,7 +172,7 @@ Reusable threshold rule sets that can be assigned to multiple prefixes.
 |-------|------|-------------|
 | `domain` | string | `internal_ip` or `subnet` (default: `internal_ip`) |
 | `direction` | string | `receives` or `sends` (default: `receives`) |
-| `decoder` | string | Protocol filter: `ip`, `tcp`, `tcp_syn`, `udp`, `icmp`, `frag`, etc. |
+| `decoder` | string | Protocol filter. Available: `ip` (L3 aggregate), `tcp`, `tcp_syn`, `udp`, `icmp`, `fragment`, `tcp_ack`, `tcp_rst`, `tcp_fin`, `gre`, `esp`, `igmp`, `ip_other`, `bad_fragment`, `invalid`. See user-guide §8.2 for semantics. |
 | `unit` | string | `pps`, `bps`, or `pct` (percentage of total). `pct` requires a specific decoder. |
 | `comparison` | string | `over` (default: `over`) |
 | `value` | int | Threshold value. For `pct` unit: 1-100. |
@@ -293,7 +293,9 @@ Conditional execution rules for actions.
 }
 ```
 
-Supported attributes: `cidr`, `decoder`, `attack_type`, `severity`, `pps`, `bps`, `peak_pps`, `peak_bps`, `node`, `domain`, `dominant_src_port`, `dominant_src_port_pct`, `dominant_dst_port`, `dominant_dst_port_pct`, `unique_src_ips`.
+Supported attributes: `cidr`, `decoder`, `attack_type`, `severity`, `pps`, `bps`, `peak_pps`, `peak_bps`, `node`, `domain`, `carpet_bomb`, `dominant_src_port`, `dominant_src_port_pct`, `dominant_dst_port`, `dominant_dst_port_pct`, `unique_src_ips`.
+
+`carpet_bomb eq true` is a readability alias for `domain eq subnet` — matches attacks whose `DstIP` is a subnet (aggregate-at-destination pattern). Accepts `true` / `false` / `1` / `yes` (case-insensitive). Operators: `eq`, `neq`.
 
 Supported operators: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`.
 

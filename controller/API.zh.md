@@ -172,7 +172,7 @@ JWT 令牌有效期 24 小时。
 |------|------|------|
 | `domain` | string | `internal_ip` 或 `subnet`（默认：`internal_ip`） |
 | `direction` | string | `receives` 或 `sends`（默认：`receives`） |
-| `decoder` | string | 协议过滤：`ip`, `tcp`, `tcp_syn`, `udp`, `icmp`, `frag` 等 |
+| `decoder` | string | 协议过滤。可用：`ip`（L3 聚合）、`tcp`、`tcp_syn`、`udp`、`icmp`、`fragment`、`tcp_ack`、`tcp_rst`、`tcp_fin`、`gre`、`esp`、`igmp`、`ip_other`、`bad_fragment`、`invalid`。语义见 user-guide §8.2。 |
 | `unit` | string | `pps`, `bps` 或 `pct`（占比百分比）。`pct` 需指定具体 decoder。 |
 | `comparison` | string | `over`（默认：`over`） |
 | `value` | int | 阈值。`pct` 单位时范围 1-100。 |
@@ -293,7 +293,9 @@ JWT 令牌有效期 24 小时。
 }
 ```
 
-支持的属性：`cidr`, `decoder`, `attack_type`, `severity`, `pps`, `bps`, `peak_pps`, `peak_bps`, `node`, `domain`, `dominant_src_port`, `dominant_src_port_pct`, `dominant_dst_port`, `dominant_dst_port_pct`, `unique_src_ips`。
+支持的属性：`cidr`, `decoder`, `attack_type`, `severity`, `pps`, `bps`, `peak_pps`, `peak_bps`, `node`, `domain`, `carpet_bomb`, `dominant_src_port`, `dominant_src_port_pct`, `dominant_dst_port`, `dominant_dst_port_pct`, `unique_src_ips`。
+
+`carpet_bomb eq true` 是 `domain eq subnet` 的可读性别名——匹配 DstIP 为子网的攻击（aggregate-at-destination 模式）。接受 `true` / `false` / `1` / `yes`（大小写不敏感）。操作符：`eq`、`neq`。
 
 支持的操作符：`eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`。
 

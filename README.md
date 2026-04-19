@@ -64,7 +64,7 @@ The system has two components:
 | **Flow** | sFlow, NetFlow v5/v9, IPFIX receiver with multi-source support | Router/switch integration, no kernel dependency |
 
 ### Detection Engine
-- **Hard threshold detection** — per-decoder limits for TCP, TCP SYN, UDP, ICMP, and IP (both PPS and BPS)
+- **Hard threshold detection** — per-decoder limits (PPS + BPS). Built-in decoders: TCP, TCP SYN, UDP, ICMP, fragment, TCP ACK/RST/FIN, GRE, ESP, IGMP, `ip_other`, `bad_fragment`, `invalid` — 14 total, expandable to 16
 - **Dynamic baseline detection** — EWMA with 168-slot weekly profile (one slot per hour); alerts on percentage deviation from learned baseline
 - **Bidirectional detection** — monitors both inbound and outbound traffic independently
 - **Global carpet bomb detection** — 0.0.0.0/0 aggregate threshold catches distributed attacks spread across many IPs
