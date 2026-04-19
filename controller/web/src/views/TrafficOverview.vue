@@ -81,6 +81,36 @@
               <el-radio-button label="pps">PPS</el-radio-button>
               <el-radio-button label="bps">BPS</el-radio-button>
             </el-radio-group>
+            <el-popover placement="bottom-end" :width="280" trigger="click">
+              <template #reference>
+                <el-button size="small">Decoders ({{ visibleDecoders.length }}/{{ ALL_DECODERS.length }})</el-button>
+              </template>
+              <div style="max-height: 380px; overflow-y: auto;">
+                <div style="display: flex; gap: 4px; margin-bottom: 8px;">
+                  <el-button size="small" @click="selectAll">All</el-button>
+                  <el-button size="small" @click="selectNone">None</el-button>
+                  <el-button size="small" @click="resetDefaults">Default</el-button>
+                </div>
+                <el-divider style="margin: 4px 0;" />
+                <el-checkbox-group v-model="visibleDecoders" @change="onFilterChange">
+                  <div v-for="g in DECODER_GROUPS" :key="g.label" style="margin-bottom: 8px;">
+                    <div style="font-size: 11px; color: #909399; margin-bottom: 2px;">{{ g.label }}</div>
+                    <div style="display: flex; flex-direction: column; gap: 2px;">
+                      <el-checkbox
+                        v-for="d in g.decoders"
+                        :key="d.key"
+                        :value="d.key"
+                        :disabled="metric === 'bps' && !d.hasBPS"
+                      >
+                        <span :style="{ color: d.color, fontWeight: 600 }">■</span>
+                        {{ d.label }}
+                        <span v-if="metric === 'bps' && !d.hasBPS" style="color: #c0c4cc; font-size: 10px;">(PPS only)</span>
+                      </el-checkbox>
+                    </div>
+                  </div>
+                </el-checkbox-group>
+              </div>
+            </el-popover>
           </div>
         </div>
       </template>
@@ -195,6 +225,15 @@ import { LineChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent, DataZoomComponent } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import api from '../api'
+import {
+  ALL_DECODERS,
+  DECODER_GROUPS,
+  DEFAULT_VISIBLE,
+  loadVisibleFromStorage,
+  saveVisibleToStorage,
+  decoderValue,
+  visibleNeedsExtras,
+} from '../config/decoders'
 
 use([LineChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, CanvasRenderer])
 
@@ -209,9 +248,42 @@ const filterNodeId = ref('')
 const nodeList = ref([])
 const chartOption = ref(null)
 const tsLoading = ref(false)
+const visibleDecoders = ref(loadVisibleFromStorage())
 let cachedPoints = null
 let cachedInbound = null
 let cachedOutbound = null
+let cachedHasExtras = false
+
+const needsExtras = computed(() => visibleNeedsExtras(visibleDecoders.value))
+
+function selectAll()     { visibleDecoders.value = ALL_DECODERS.map(d => d.key); onFilterChange() }
+function selectNone()    { visibleDecoders.value = []; onFilterChange() }
+function resetDefaults() { visibleDecoders.value = [...DEFAULT_VISIBLE]; onFilterChange() }
+
+async function onFilterChange() {
+  saveVisibleToStorage(visibleDecoders.value)
+  if (needsExtras.value !== cachedHasExtras) {
+    await loadTimeseries()
+  } else {
+    renderChart()
+  }
+}
+
+function buildSeries(points, isPPS) {
+  const out = []
+  for (const key of visibleDecoders.value) {
+    const d = ALL_DECODERS.find(x => x.key === key)
+    if (!d) continue
+    if (!isPPS && !d.hasBPS) continue
+    out.push({
+      name: d.label,
+      color: d.color,
+      data: points.map(p => decoderValue(p, d, isPPS)),
+      width: 1,
+    })
+  }
+  return out
+}
 // Merged prefix table for Both mode: combine in/out top_prefixes
 const topPrefixData = computed(() => {
   if (direction.value !== 'both' || !overviewOut.value) {
@@ -277,7 +349,8 @@ function fmtBps(v) {
   return v
 }
 
-// Align two timeseries by timestamp — union all timestamps, fill missing with zero-valued point
+// Align two timeseries by timestamp — union all timestamps, fill gaps with bare point.
+// decoderValue() handles missing fields by returning 0, so we don't prefill flat columns.
 function alignTimeseries(inPts, outPts) {
   const inMap = new Map()
   const outMap = new Map()
@@ -285,11 +358,10 @@ function alignTimeseries(inPts, outPts) {
   for (const p of inPts) { inMap.set(p.time, p); allTimes.add(p.time) }
   for (const p of outPts) { outMap.set(p.time, p); allTimes.add(p.time) }
   const sorted = [...allTimes].sort()
-  const zero = { pps: 0, bps: 0, tcp_pps: 0, tcp_syn_pps: 0, udp_pps: 0, icmp_pps: 0, tcp_bps: 0, udp_bps: 0, icmp_bps: 0 }
   return {
     times: sorted,
-    inPts: sorted.map(t => inMap.get(t) || { time: t, ...zero }),
-    outPts: sorted.map(t => outMap.get(t) || { time: t, ...zero }),
+    inPts: sorted.map(t => inMap.get(t) || { time: t }),
+    outPts: sorted.map(t => outMap.get(t) || { time: t }),
   }
 }
 
@@ -342,20 +414,22 @@ async function loadTimeseries() {
     const hours = { '1h': 1, '6h': 6, '24h': 24 }[timeRange.value] || 1
     const resolution = hours <= 6 ? '5min' : '1h'
     const from = new Date(Date.now() - hours * 3600000).toISOString()
+    const wantExtras = needsExtras.value
+    cachedHasExtras = wantExtras
+    const baseParams = { from, resolution }
+    if (wantExtras) baseParams.include_extras = 'true'
 
     if (direction.value === 'both') {
-      // Wanguard-style: fetch both directions
       const [inPts, outPts] = await Promise.all([
-        api.get('/stats/total-timeseries', { params: { from, resolution, direction: 'receives' } }),
-        api.get('/stats/total-timeseries', { params: { from, resolution, direction: 'sends' } }),
+        api.get('/stats/total-timeseries', { params: { ...baseParams, direction: 'receives' } }),
+        api.get('/stats/total-timeseries', { params: { ...baseParams, direction: 'sends' } }),
       ])
       cachedInbound = inPts && inPts.length ? inPts : null
       cachedOutbound = outPts && outPts.length ? outPts : null
       cachedPoints = null
     } else {
-      // Single direction: per-decoder chart
       const points = await api.get('/stats/total-timeseries', {
-        params: { from, resolution, direction: direction.value }
+        params: { ...baseParams, direction: direction.value }
       })
       cachedPoints = points && points.length ? points : null
       cachedInbound = null
@@ -380,138 +454,80 @@ function renderChart() {
   const fmt = isPPS ? fmtVal : fmtBps
   const primaryColor = isAmber ? '#1a8a28' : '#533afd'
 
-  // === Both mode: Wanguard-style dual grid (top=in, bottom=out) with per-decoder ===
+  // === Both mode: dual grid with per-decoder ===
   if (direction.value === 'both') {
     if (!cachedInbound && !cachedOutbound) { chartOption.value = null; return }
     const aligned = alignTimeseries(cachedInbound || [], cachedOutbound || [])
-    const inPts = aligned.inPts
-    const outPts = aligned.outPts
     const times = aligned.times.map(t => new Date(t).toLocaleTimeString())
+    const totalField = isPPS ? 'pps' : 'bps'
+    const totalName = isPPS ? 'PPS' : 'BPS'
+    const inTotal = aligned.inPts.map(p => p[totalField] || 0)
+    const outTotal = aligned.outPts.map(p => p[totalField] || 0)
+    const inDecoderSeries = buildSeries(aligned.inPts, isPPS)
+    const outDecoderSeries = buildSeries(aligned.outPts, isPPS)
+    const sharedMax = Math.max(Math.max(...inTotal, 0), Math.max(...outTotal, 0)) * 1.1 || 1
     const axisLabelStyle = { color: '#909399', fontSize: 10 }
     const splitLineStyle = { lineStyle: { color: '#e4e7ed' } }
 
-    const names = isPPS ? ['PPS', 'TCP', 'UDP', 'ICMP'] : ['BPS', 'TCP', 'UDP', 'ICMP']
-    const inSeries = isPPS
-      ? [
-          { name: names[0], data: inPts.map(p => p.pps), w: 2 },
-          { name: names[1], data: inPts.map(p => p.tcp_pps), w: 1 },
-          { name: names[2], data: inPts.map(p => p.udp_pps), w: 1 },
-          { name: names[3], data: inPts.map(p => p.icmp_pps), w: 1 },
-        ]
-      : [
-          { name: names[0], data: inPts.map(p => p.bps), w: 2 },
-          { name: names[1], data: inPts.map(p => p.tcp_bps), w: 1 },
-          { name: names[2], data: inPts.map(p => p.udp_bps), w: 1 },
-          { name: names[3], data: inPts.map(p => p.icmp_bps), w: 1 },
-        ]
-    const outSeries = isPPS
-      ? [
-          { name: names[0], data: outPts.map(p => p.pps), w: 2 },
-          { name: names[1], data: outPts.map(p => p.tcp_pps), w: 1 },
-          { name: names[2], data: outPts.map(p => p.udp_pps), w: 1 },
-          { name: names[3], data: outPts.map(p => p.icmp_pps), w: 1 },
-        ]
-      : [
-          { name: names[0], data: outPts.map(p => p.bps), w: 2 },
-          { name: names[1], data: outPts.map(p => p.tcp_bps), w: 1 },
-          { name: names[2], data: outPts.map(p => p.udp_bps), w: 1 },
-          { name: names[3], data: outPts.map(p => p.icmp_bps), w: 1 },
-        ]
-
-    const colors = [primaryColor, '#e6a23c', '#67c23a', '#909399']
+    // Inbound and outbound share the SAME series name per decoder so the legend
+    // toggles both at once. Grid/axis indexes handle visual separation. Do NOT
+    // alias with a trailing space — that broke legend toggling in the first
+    // v1.3.2 iteration.
+    const allSeries = [
+      { name: totalName, type: 'line', data: inTotal, smooth: true, xAxisIndex: 0, yAxisIndex: 0, lineStyle: { width: 2 }, symbol: 'none', itemStyle: { color: primaryColor } },
+      ...inDecoderSeries.map(s => ({ name: s.name, type: 'line', data: s.data, smooth: true, xAxisIndex: 0, yAxisIndex: 0, lineStyle: { width: s.width }, symbol: 'none', itemStyle: { color: s.color } })),
+      { name: totalName, type: 'line', data: outTotal, smooth: true, xAxisIndex: 1, yAxisIndex: 1, lineStyle: { width: 2 }, symbol: 'none', itemStyle: { color: primaryColor } },
+      ...outDecoderSeries.map(s => ({ name: s.name, type: 'line', data: s.data, smooth: true, xAxisIndex: 1, yAxisIndex: 1, lineStyle: { width: s.width }, symbol: 'none', itemStyle: { color: s.color } })),
+    ]
+    const legendNames = [totalName, ...inDecoderSeries.map(s => s.name)]
+    const allColors = [primaryColor, ...inDecoderSeries.map(s => s.color)]
 
     chartOption.value = {
       backgroundColor: 'transparent',
       textStyle: { color: '#303133' },
-      tooltip: {
-        trigger: 'axis',
-        axisPointer: { type: 'cross', label: { formatter: p => p.axisDimension === 'y' ? fmt(p.value) : p.value } },
-        formatter: params => {
-          let s = params[0].axisValue + '<br/>'
-          params.forEach(p => { s += `${p.marker} ${p.seriesName}: ${fmt(p.value)}<br/>` })
-          return s
-        }
-      },
-      legend: { data: names, textStyle: { color: '#606266' } },
-      grid: [
-        { left: 70, right: 20, top: 40, height: '35%' },
-        { left: 70, right: 20, top: '58%', height: '28%' },
-      ],
+      tooltip: { trigger: 'axis', axisPointer: { type: 'cross', label: { formatter: p => p.axisDimension === 'y' ? fmt(p.value) : p.value } }, formatter: params => { let s = params[0].axisValue + '<br/>'; params.forEach(p => { s += `${p.marker} ${p.seriesName}: ${fmt(p.value)}<br/>` }); return s } },
+      legend: { data: legendNames, textStyle: { color: '#606266' } },
+      color: allColors,
+      grid: [{ left: 70, right: 20, top: 40, height: '35%' }, { left: 70, right: 20, top: '58%', height: '28%' }],
       dataZoom: [{ type: 'inside', xAxisIndex: [0, 1] }, { type: 'slider', height: 20, bottom: 5, xAxisIndex: [0, 1] }],
       xAxis: [
         { type: 'category', data: times, gridIndex: 0, axisLabel: { show: false } },
         { type: 'category', data: times, gridIndex: 1, axisLabel: axisLabelStyle },
       ],
-      yAxis: (() => {
-        const allIn = inSeries[0].data || []
-        const allOut = outSeries[0].data || []
-        const sharedMax = Math.max(Math.max(...allIn, 0), Math.max(...allOut, 0)) * 1.1 || 1
-        return [
-          { type: 'value', gridIndex: 0, max: sharedMax, axisLabel: { ...axisLabelStyle, formatter: v => fmt(v) }, splitLine: splitLineStyle, name: '↓ Inbound', nameTextStyle: { color: '#606266', fontSize: 11 } },
-          { type: 'value', gridIndex: 1, max: sharedMax, axisLabel: { ...axisLabelStyle, formatter: v => fmt(v) }, splitLine: splitLineStyle, name: '↑ Outbound', nameTextStyle: { color: '#606266', fontSize: 11 } },
-        ]
-      })(),
-      color: colors,
-      series: [
-        ...inSeries.map((s, i) => ({
-          name: s.name, type: 'line', data: s.data, smooth: true,
-          xAxisIndex: 0, yAxisIndex: 0,
-          lineStyle: { width: s.w }, symbol: 'none', itemStyle: { color: colors[i] }
-        })),
-        ...outSeries.map((s, i) => ({
-          name: s.name, type: 'line', data: s.data, smooth: true,
-          xAxisIndex: 1, yAxisIndex: 1,
-          lineStyle: { width: s.w }, symbol: 'none', itemStyle: { color: colors[i] }
-        })),
-      ]
+      yAxis: [
+        { type: 'value', gridIndex: 0, max: sharedMax, axisLabel: { ...axisLabelStyle, formatter: v => fmt(v) }, splitLine: splitLineStyle, name: '↓ Inbound', nameTextStyle: { color: '#606266', fontSize: 11 } },
+        { type: 'value', gridIndex: 1, max: sharedMax, axisLabel: { ...axisLabelStyle, formatter: v => fmt(v) }, splitLine: splitLineStyle, name: '↑ Outbound', nameTextStyle: { color: '#606266', fontSize: 11 } },
+      ],
+      series: allSeries,
     }
     return
   }
 
-  // === Single direction: per-decoder chart ===
+  // === Single direction ===
   if (!cachedPoints) { chartOption.value = null; return }
   const points = cachedPoints
   const times = points.map(p => new Date(p.time).toLocaleTimeString())
-
-  const seriesData = isPPS
-    ? [
-        { name: 'PPS', data: points.map(p => p.pps), width: 2 },
-        { name: 'TCP', data: points.map(p => p.tcp_pps), width: 1 },
-        { name: 'TCP SYN', data: points.map(p => p.tcp_syn_pps), width: 1 },
-        { name: 'UDP', data: points.map(p => p.udp_pps), width: 1 },
-        { name: 'ICMP', data: points.map(p => p.icmp_pps), width: 1 },
-      ]
-    : [
-        { name: 'BPS', data: points.map(p => p.bps), width: 2 },
-        { name: 'TCP', data: points.map(p => p.tcp_bps), width: 1 },
-        { name: 'UDP', data: points.map(p => p.udp_bps), width: 1 },
-        { name: 'ICMP', data: points.map(p => p.icmp_bps), width: 1 },
-      ]
-
-  const colors = isPPS
-    ? [primaryColor, '#e6a23c', '#f56c6c', '#67c23a', '#909399']
-    : [primaryColor, '#e6a23c', '#67c23a', '#909399']
+  const totalField = isPPS ? 'pps' : 'bps'
+  const totalName = isPPS ? 'PPS' : 'BPS'
+  const total = points.map(p => p[totalField] || 0)
+  const decoderSeries = buildSeries(points, isPPS)
+  const seriesData = [
+    { name: totalName, data: total, width: 2, color: primaryColor },
+    ...decoderSeries,
+  ]
 
   chartOption.value = {
     backgroundColor: 'transparent',
     textStyle: { color: '#303133' },
-    tooltip: {
-      trigger: 'axis',
-      axisPointer: { type: 'cross', label: { formatter: p => p.axisDimension === 'y' ? fmt(p.value) : p.value } },
-      formatter: params => {
-        let s = params[0].axisValue + '<br/>'
-        params.forEach(p => { s += `${p.marker} ${p.seriesName}: ${fmt(p.value)}<br/>` })
-        return s
-      }
-    },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'cross', label: { formatter: p => p.axisDimension === 'y' ? fmt(p.value) : p.value } }, formatter: params => { let s = params[0].axisValue + '<br/>'; params.forEach(p => { s += `${p.marker} ${p.seriesName}: ${fmt(p.value)}<br/>` }); return s } },
     legend: { data: seriesData.map(s => s.name), textStyle: { color: '#606266' } },
     grid: { left: 70, right: 20, top: 40, bottom: 60 },
     dataZoom: [{ type: 'inside' }, { type: 'slider', height: 20, bottom: 5 }],
     xAxis: { type: 'category', data: times, axisLabel: { color: '#909399', fontSize: 10 } },
     yAxis: { type: 'value', axisLabel: { color: '#909399', formatter: v => fmt(v) }, splitLine: { lineStyle: { color: '#e4e7ed' } } },
-    series: seriesData.map((s, i) => ({
+    series: seriesData.map(s => ({
       name: s.name, type: 'line', data: s.data, smooth: true,
-      lineStyle: { width: s.width }, symbol: 'none', itemStyle: { color: colors[i] }
+      lineStyle: { width: s.width }, symbol: 'none', itemStyle: { color: s.color }
     }))
   }
 }

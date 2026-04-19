@@ -27,11 +27,12 @@ func queryTimeseries(deps Dependencies) gin.HandlerFunc {
 			return
 		}
 		filter := store.TimeseriesFilter{
-			Prefix:     c.Query("prefix"),
-			NodeID:     c.Query("node_id"),
-			Resolution: resolution,
-			Direction:  dir,
-			Limit:      limit,
+			Prefix:        c.Query("prefix"),
+			NodeID:        c.Query("node_id"),
+			Resolution:    resolution,
+			Direction:     dir,
+			Limit:         limit,
+			IncludeExtras: c.Query("include_extras") == "true",
 		}
 		if from := c.Query("from"); from != "" {
 			if t, err := time.Parse(time.RFC3339, from); err == nil {

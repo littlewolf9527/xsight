@@ -692,6 +692,10 @@ actions:
 
 xSight 独立统计这些（`tcp_syn` 不受影响）—— 一个 `SYN+ACK` 包只会增加 `tcp` 计数，不会增加 `tcp_syn` 或 `tcp_ack`，因此每个 flag 计数器反映真实攻击意图。
 
+**为什么健康流量里 `tcp_ack` 通常占 TCP 总量的 50–80%？** 计数规则是 "ACK 位置位 AND SYN 位清零"，几乎命中任何已建连接里的所有数据包 —— 数据段带 `PSH+ACK`（捎带 ack）、纯 `ACK` 包出现在延迟 / 累积 ack、`FIN+ACK` / `RST+ACK` 关闭包也都命中。任何对外提供 TCP 服务的服务器，`tcp_ack ≈ tcp × 60–80%` 是正常稳态，**不是** ACK flood。检测依靠相对基线的偏差（动态基线 / 高的硬阈值），而不是绝对数量。
+
+对于经典的纯 ACK flood 识别（只有 ACK，无其他 flag），当前规则加上足够高的 PPS 阈值已经够用 —— 攻击流量会明显高于稳态 established-connection 基线。未来版本可以增加 `tcp_ack_only` decoder（仅 ACK 位），v1.3 还不需要。
+
 ### 8.2.3 非 TCP/UDP/ICMP 协议洪水（v1.3）
 
 **症状：** GRE、ESP 或 IGMP 流量异常激增。这些协议有合法用途但可被利用做反射或带宽耗尽攻击。

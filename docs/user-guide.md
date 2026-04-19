@@ -692,6 +692,10 @@ actions:
 
 xSight counts these independently of `tcp_syn` — a packet with `SYN+ACK` only increments `tcp` (not `tcp_syn` or `tcp_ack`), so the per-flag counters reflect true attack intent.
 
+**Why `tcp_ack` is normally 50–80% of total TCP on healthy traffic.** The rule is "ACK bit set AND SYN bit clear", which matches essentially every packet in an established TCP connection — data segments carry `PSH+ACK` (piggybacked acknowledgements), pure `ACK` packets appear as delayed/cumulative acks, and `FIN+ACK` / `RST+ACK` close-out packets also match. `tcp_ack` ≈ 60–80% of `tcp` is the expected steady state for any server serving TCP traffic; it is **not** an ACK flood. Detection relies on deviation from baseline (dynamic-baseline or a high hard threshold), not on the absolute count.
+
+For classic pure-ACK flood identification (ACK only, no other flags), the existing rule is already sensitive enough via a high PPS threshold — attack traffic still spikes well above the steady-state established-connection baseline. A dedicated `tcp_ack_only` decoder is possible in a future version but not needed for v1.3.
+
 ### 8.2.3 Non-TCP/UDP/ICMP Protocol Floods (v1.3)
 
 **Symptoms:** GRE, ESP, or IGMP flood traffic volumes. These protocols have legitimate uses but can be weaponized for reflection or bandwidth exhaustion.

@@ -232,27 +232,53 @@ func (s *PGStore) applyCompressionPolicy(ctx context.Context, table string, days
 //   v3: PPS + BPS protocol columns
 //   v4: PPS + BPS + direction dimension (Phase 3)
 //   v5: v4 + avg_frag_pps + avg_frag_bps (v1.3 Phase 1a — fix frag missing from aggregates)
+//   v6: v5 + 18 extra decoder aggregates (v1.3.2 — tcp_ack/rst/fin, gre/esp/igmp/ip_other,
+//       bad_fragment/invalid) so chart queries beyond the raw retention window can still
+//       render new decoder lines. SUPERSEDED by v7 because v6 extracted JSONB without
+//       COALESCE, so avg() skipped NULL rows and inflated sparse decoders.
+//   v7: v6 + COALESCE(NULL, 0) around every JSONB extract (v1.3.2 audit fix). Missing keys
+//       now count as 0 in the per-bucket average, matching the semantics of the fixed columns.
 //
-// v5 does NOT aggregate extra_decoder_pps/bps JSONB — new decoders (v1.3) are intentionally
-// only queryable from raw ts_stats within the 7-day retention window.
+// Extra decoders live in ts_stats.extra_decoder_pps/bps JSONB; v7 extracts each known
+// key as `avg(COALESCE((extra_decoder_pps->>'X')::int, 0))`. Rows where the JSONB is
+// NULL or missing the key contribute 0, so a prefix with sporadic tcp_ack is averaged
+// against the whole observation window — not just the intervals where it was present.
 func (s *PGStore) ensureCagg(ctx context.Context) {
-	// Probe current cagg version by checking for frag_bps aggregate column (v5 marker)
-	var hasFragBPS bool
+	// Probe current cagg version. v7 marker is COALESCE in the original user SQL
+	// exposed by TimescaleDB. The CAGG is a regular view in pg_class (relkind='v')
+	// that projects columns from a hidden _materialized_hypertable_N, so:
+	//   - pg_matviews has no row (CAGG is not a matview from PG's perspective)
+	//   - information_schema.views shows only the projection SELECT, not the user SQL
+	// The only catalog that preserves the original CAGG SELECT is
+	// timescaledb_information.continuous_aggregates.view_definition — that's where
+	// the COALESCE sentinel lives.
+	var hasV7 bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT EXISTS (
-			SELECT 1 FROM information_schema.columns
-			WHERE table_name = 'ts_stats_5min' AND column_name = 'avg_frag_bps'
-		)`).Scan(&hasFragBPS)
+			SELECT 1 FROM timescaledb_information.continuous_aggregates
+			WHERE view_name = 'ts_stats_5min'
+			  AND view_definition LIKE '%COALESCE%'
+		)`).Scan(&hasV7)
 	if err != nil {
 		log.Printf("WARNING: cagg check failed: %v", err)
 		return
 	}
-	if hasFragBPS {
-		return // cagg already v5 (with frag aggregates)
+	if hasV7 {
+		return // cagg already v7
 	}
 
-	// Check prior version markers for logging clarity
-	var hasDirection, hasBPS bool
+	// Check prior version markers for logging clarity.
+	var hasExtras, hasFragBPS, hasDirection, hasBPS bool
+	_ = s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'ts_stats_5min' AND column_name = 'avg_tcp_ack_pps'
+		)`).Scan(&hasExtras)
+	_ = s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'ts_stats_5min' AND column_name = 'avg_frag_bps'
+		)`).Scan(&hasFragBPS)
 	_ = s.pool.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM information_schema.columns
@@ -265,20 +291,26 @@ func (s *PGStore) ensureCagg(ctx context.Context) {
 		)`).Scan(&hasBPS)
 
 	switch {
+	case hasExtras:
+		log.Printf("cagg: upgrading ts_stats_5min from v6 to v7 (COALESCE missing JSONB keys to 0)")
+	case hasFragBPS:
+		log.Printf("cagg: upgrading ts_stats_5min from v5 to v7 (adding extra decoder aggregates with COALESCE)")
 	case hasDirection:
-		log.Printf("cagg: upgrading ts_stats_5min from v4 to v5 (adding frag aggregates)")
+		log.Printf("cagg: upgrading ts_stats_5min from v4 to v7 (adding frag + extra decoder aggregates with COALESCE)")
 	case hasBPS:
-		log.Printf("cagg: upgrading ts_stats_5min from v3 to v5 (adding direction + frag aggregates)")
+		log.Printf("cagg: upgrading ts_stats_5min from v3 to v7 (adding direction + frag + extra decoder aggregates with COALESCE)")
 	default:
-		log.Printf("cagg: creating ts_stats_5min v5 (fresh)")
+		log.Printf("cagg: creating ts_stats_5min v7 (fresh)")
 	}
 
 	// Drop old cagg and recreate.
-	// NOTE: this permanently loses cagg history beyond raw retention (7 days).
-	// Accepted tradeoff — frag aggregates are cheap to backfill from raw.
+	// NOTE: this permanently loses cagg history beyond raw retention.
+	// Accepted tradeoff — backfill from raw below restores last 7 days with correct math.
 	_, _ = s.pool.Exec(ctx, `DROP MATERIALIZED VIEW IF EXISTS ts_stats_5min CASCADE`)
 
-	// Create v5 cagg: v4 + avg_frag_pps + avg_frag_bps
+	// Create v7 cagg. Critical change vs v6: every JSONB extract wrapped in COALESCE
+	// so rows without the key count as 0 instead of NULL (NULL was being skipped by
+	// avg(), inflating sparse-decoder averages). See audit 2026-04-20.
 	_, err = s.pool.Exec(ctx, `
 		CREATE MATERIALIZED VIEW ts_stats_5min
 		WITH (timescaledb.continuous) AS
@@ -294,19 +326,37 @@ func (s *PGStore) ensureCagg(ctx context.Context) {
 			   avg(tcp_bps)::BIGINT AS avg_tcp_bps,
 			   avg(udp_bps)::BIGINT AS avg_udp_bps,
 			   avg(icmp_bps)::BIGINT AS avg_icmp_bps,
-			   avg(frag_bps)::BIGINT AS avg_frag_bps
+			   avg(frag_bps)::BIGINT AS avg_frag_bps,
+			   avg(COALESCE((extra_decoder_pps->>'tcp_ack')::int, 0))::INT      AS avg_tcp_ack_pps,
+			   avg(COALESCE((extra_decoder_pps->>'tcp_rst')::int, 0))::INT      AS avg_tcp_rst_pps,
+			   avg(COALESCE((extra_decoder_pps->>'tcp_fin')::int, 0))::INT      AS avg_tcp_fin_pps,
+			   avg(COALESCE((extra_decoder_pps->>'gre')::int, 0))::INT          AS avg_gre_pps,
+			   avg(COALESCE((extra_decoder_pps->>'esp')::int, 0))::INT          AS avg_esp_pps,
+			   avg(COALESCE((extra_decoder_pps->>'igmp')::int, 0))::INT         AS avg_igmp_pps,
+			   avg(COALESCE((extra_decoder_pps->>'ip_other')::int, 0))::INT     AS avg_ip_other_pps,
+			   avg(COALESCE((extra_decoder_pps->>'bad_fragment')::int, 0))::INT AS avg_bad_fragment_pps,
+			   avg(COALESCE((extra_decoder_pps->>'invalid')::int, 0))::INT      AS avg_invalid_pps,
+			   avg(COALESCE((extra_decoder_bps->>'tcp_ack')::bigint, 0))::BIGINT      AS avg_tcp_ack_bps,
+			   avg(COALESCE((extra_decoder_bps->>'tcp_rst')::bigint, 0))::BIGINT      AS avg_tcp_rst_bps,
+			   avg(COALESCE((extra_decoder_bps->>'tcp_fin')::bigint, 0))::BIGINT      AS avg_tcp_fin_bps,
+			   avg(COALESCE((extra_decoder_bps->>'gre')::bigint, 0))::BIGINT          AS avg_gre_bps,
+			   avg(COALESCE((extra_decoder_bps->>'esp')::bigint, 0))::BIGINT          AS avg_esp_bps,
+			   avg(COALESCE((extra_decoder_bps->>'igmp')::bigint, 0))::BIGINT         AS avg_igmp_bps,
+			   avg(COALESCE((extra_decoder_bps->>'ip_other')::bigint, 0))::BIGINT     AS avg_ip_other_bps,
+			   avg(COALESCE((extra_decoder_bps->>'bad_fragment')::bigint, 0))::BIGINT AS avg_bad_fragment_bps,
+			   avg(COALESCE((extra_decoder_bps->>'invalid')::bigint, 0))::BIGINT      AS avg_invalid_bps
 		FROM ts_stats
 		WHERE dst_ip IS NULL
 		GROUP BY bucket, node_id, prefix, direction
 		WITH NO DATA
 	`)
 	if err != nil {
-		log.Printf("WARNING: cagg v5 create failed: %v", err)
+		log.Printf("WARNING: cagg v7 create failed: %v", err)
 		return
 	}
-	log.Printf("cagg: created ts_stats_5min v5 with frag aggregates")
+	log.Printf("cagg: created ts_stats_5min v7 (COALESCE-corrected extras)")
 
-	// Synchronous backfill last 7 days (= raw retention window)
+	// Synchronous backfill last 7 days (= raw retention window).
 	_, err = s.pool.Exec(ctx, `CALL refresh_continuous_aggregate('ts_stats_5min', now() - INTERVAL '7 days', now() + INTERVAL '1 hour')`)
 	if err != nil {
 		log.Printf("cagg: backfill warning (non-fatal): %v", err)

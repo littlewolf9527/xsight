@@ -50,10 +50,12 @@ func TestMigrations_ExtraDecoderJSONBColumns(t *testing.T) {
 	}
 }
 
-// TestCaggV5_IncludesFragAggregates asserts that ensureCagg creates a v5 cagg
-// with frag_pps and frag_bps aggregates. The source file is string-grepped
-// because CREATE MATERIALIZED VIEW lives in Go code, not the migrations slice.
-func TestCaggV5_IncludesFragAggregates(t *testing.T) {
+// TestCaggV7_IncludesExtraDecoderAggregatesWithCoalesce asserts that ensureCagg
+// creates a v7 cagg with frag + 9 extra decoder aggregates (18 new columns), AND
+// that each JSONB extraction is wrapped in COALESCE so missing keys count as 0
+// in per-bucket averages (the audit fix over v6, which over-estimated sparse
+// decoders because avg() skipped NULL rows).
+func TestCaggV7_IncludesExtraDecoderAggregatesWithCoalesce(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	srcPath := filepath.Join(filepath.Dir(thisFile), "postgres.go")
 	src, err := os.ReadFile(srcPath)
@@ -61,16 +63,50 @@ func TestCaggV5_IncludesFragAggregates(t *testing.T) {
 		t.Fatalf("read postgres.go: %v", err)
 	}
 	content := string(src)
+
+	// v5 baseline still required
 	for _, want := range []string{
 		"avg(frag_pps)::INT AS avg_frag_pps",
 		"avg(frag_bps)::BIGINT AS avg_frag_bps",
 	} {
 		if !strings.Contains(content, want) {
-			t.Errorf("ensureCagg v5 missing %q — frag aggregates were the reason v4→v5 was done", want)
+			t.Errorf("ensureCagg missing %q — frag aggregates are still required in v7", want)
 		}
 	}
-	if !strings.Contains(content, "avg_frag_bps") {
-		t.Error("ensureCagg version probe should use avg_frag_bps (the v5 marker column)")
+
+	// v7: 9 decoders × 2 (pps + bps) aggregate columns
+	extraDecoders := []string{"tcp_ack", "tcp_rst", "tcp_fin", "gre", "esp", "igmp", "ip_other", "bad_fragment", "invalid"}
+	for _, d := range extraDecoders {
+		wantPPS := "avg_" + d + "_pps"
+		wantBPS := "avg_" + d + "_bps"
+		if !strings.Contains(content, wantPPS) {
+			t.Errorf("CAGG v7 missing %s aggregate column", wantPPS)
+		}
+		if !strings.Contains(content, wantBPS) {
+			t.Errorf("CAGG v7 missing %s aggregate column", wantBPS)
+		}
+	}
+
+	// v7 audit fix: each JSONB extraction must be inside COALESCE so missing keys
+	// count as 0 in per-bucket averages. Spot-check 3 decoders (PPS + BPS).
+	for _, d := range []string{"tcp_ack", "gre", "bad_fragment"} {
+		wantPPS := "COALESCE((extra_decoder_pps->>'" + d + "')"
+		wantBPS := "COALESCE((extra_decoder_bps->>'" + d + "')"
+		if !strings.Contains(content, wantPPS) {
+			t.Errorf("CAGG v7 must wrap %s PPS extraction in COALESCE (audit fix): missing %q", d, wantPPS)
+		}
+		if !strings.Contains(content, wantBPS) {
+			t.Errorf("CAGG v7 must wrap %s BPS extraction in COALESCE (audit fix): missing %q", d, wantBPS)
+		}
+	}
+
+	// v7 marker probe: the CAGG is a regular view (pg_class.relkind='v') whose
+	// user-facing definition is rewritten by TimescaleDB to project from a
+	// hidden materialization hypertable — so pg_matviews and
+	// information_schema.views can't see the COALESCE sentinel. The only catalog
+	// that preserves the original user SQL is timescaledb_information.continuous_aggregates.
+	if !strings.Contains(content, "timescaledb_information.continuous_aggregates") {
+		t.Error("ensureCagg v7 probe must query timescaledb_information.continuous_aggregates (not pg_matviews or information_schema.views — those don't contain the original CAGG SELECT)")
 	}
 }
 

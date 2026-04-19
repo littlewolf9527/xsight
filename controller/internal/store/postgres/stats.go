@@ -195,7 +195,64 @@ func (r *statsRepo) queryTimeseriesFromCagg(ctx context.Context, filter store.Ti
 	// For 5min resolution: cagg rows are already at 5min granularity, just sum across prefixes.
 	// For 1h resolution: two-phase — first sum across prefixes per 5min bucket,
 	// then avg those totals across the hour (otherwise we'd sum 12 buckets instead of averaging).
-	// CAGG v5 includes frag_pps/bps. Extra decoders (v1.3) are NOT in CAGG — raw-only.
+	// CAGG v6 (v1.3.2) includes frag_pps/bps + 9 extra decoder aggregates (tcp_ack/rst/fin,
+	// gre/esp/igmp/ip_other, bad_fragment/invalid). When filter.IncludeExtras is true the
+	// query pack those into a JSONB output column matching the raw path's shape.
+	//
+	// Extras pack as JSONB at SELECT time so scanTimeseries can use one scan path regardless
+	// of whether data came from raw ts_stats or CAGG.
+	extraPPSSQL := `'{}'::jsonb`
+	extraBPSSQL := `'{}'::jsonb`
+	if filter.IncludeExtras {
+		if filter.Resolution == "1h" {
+			extraPPSSQL = `jsonb_strip_nulls(jsonb_build_object(
+				'tcp_ack',      NULLIF(avg(total_tcp_ack_pps)::INT,      0),
+				'tcp_rst',      NULLIF(avg(total_tcp_rst_pps)::INT,      0),
+				'tcp_fin',      NULLIF(avg(total_tcp_fin_pps)::INT,      0),
+				'gre',          NULLIF(avg(total_gre_pps)::INT,          0),
+				'esp',          NULLIF(avg(total_esp_pps)::INT,          0),
+				'igmp',         NULLIF(avg(total_igmp_pps)::INT,         0),
+				'ip_other',     NULLIF(avg(total_ip_other_pps)::INT,     0),
+				'bad_fragment', NULLIF(avg(total_bad_fragment_pps)::INT, 0),
+				'invalid',      NULLIF(avg(total_invalid_pps)::INT,      0)
+			))`
+			extraBPSSQL = `jsonb_strip_nulls(jsonb_build_object(
+				'tcp_ack',      NULLIF(avg(total_tcp_ack_bps)::BIGINT,      0),
+				'tcp_rst',      NULLIF(avg(total_tcp_rst_bps)::BIGINT,      0),
+				'tcp_fin',      NULLIF(avg(total_tcp_fin_bps)::BIGINT,      0),
+				'gre',          NULLIF(avg(total_gre_bps)::BIGINT,          0),
+				'esp',          NULLIF(avg(total_esp_bps)::BIGINT,          0),
+				'igmp',         NULLIF(avg(total_igmp_bps)::BIGINT,         0),
+				'ip_other',     NULLIF(avg(total_ip_other_bps)::BIGINT,     0),
+				'bad_fragment', NULLIF(avg(total_bad_fragment_bps)::BIGINT, 0),
+				'invalid',      NULLIF(avg(total_invalid_bps)::BIGINT,      0)
+			))`
+		} else {
+			extraPPSSQL = `jsonb_strip_nulls(jsonb_build_object(
+				'tcp_ack',      NULLIF(sum(avg_tcp_ack_pps)::INT,      0),
+				'tcp_rst',      NULLIF(sum(avg_tcp_rst_pps)::INT,      0),
+				'tcp_fin',      NULLIF(sum(avg_tcp_fin_pps)::INT,      0),
+				'gre',          NULLIF(sum(avg_gre_pps)::INT,          0),
+				'esp',          NULLIF(sum(avg_esp_pps)::INT,          0),
+				'igmp',         NULLIF(sum(avg_igmp_pps)::INT,         0),
+				'ip_other',     NULLIF(sum(avg_ip_other_pps)::INT,     0),
+				'bad_fragment', NULLIF(sum(avg_bad_fragment_pps)::INT, 0),
+				'invalid',      NULLIF(sum(avg_invalid_pps)::INT,      0)
+			))`
+			extraBPSSQL = `jsonb_strip_nulls(jsonb_build_object(
+				'tcp_ack',      NULLIF(sum(avg_tcp_ack_bps)::BIGINT,      0),
+				'tcp_rst',      NULLIF(sum(avg_tcp_rst_bps)::BIGINT,      0),
+				'tcp_fin',      NULLIF(sum(avg_tcp_fin_bps)::BIGINT,      0),
+				'gre',          NULLIF(sum(avg_gre_bps)::BIGINT,          0),
+				'esp',          NULLIF(sum(avg_esp_bps)::BIGINT,          0),
+				'igmp',         NULLIF(sum(avg_igmp_bps)::BIGINT,         0),
+				'ip_other',     NULLIF(sum(avg_ip_other_bps)::BIGINT,     0),
+				'bad_fragment', NULLIF(sum(avg_bad_fragment_bps)::BIGINT, 0),
+				'invalid',      NULLIF(sum(avg_invalid_bps)::BIGINT,      0)
+			))`
+		}
+	}
+
 	var q string
 	if filter.Resolution == "1h" {
 		q = fmt.Sprintf(`
@@ -210,7 +267,9 @@ func (r *statsRepo) queryTimeseriesFromCagg(ctx context.Context, filter store.Ti
 				   avg(total_tcp_bps)::BIGINT AS tcp_bps,
 				   avg(total_udp_bps)::BIGINT AS udp_bps,
 				   avg(total_icmp_bps)::BIGINT AS icmp_bps,
-				   avg(total_frag_bps)::BIGINT AS frag_bps
+				   avg(total_frag_bps)::BIGINT AS frag_bps,
+				   %s AS extra_decoder_pps,
+				   %s AS extra_decoder_bps
 			FROM (
 				SELECT bucket,
 					   sum(avg_pps) AS total_pps,
@@ -223,13 +282,31 @@ func (r *statsRepo) queryTimeseriesFromCagg(ctx context.Context, filter store.Ti
 					   sum(avg_tcp_bps) AS total_tcp_bps,
 					   sum(avg_udp_bps) AS total_udp_bps,
 					   sum(avg_icmp_bps) AS total_icmp_bps,
-					   sum(avg_frag_bps) AS total_frag_bps
+					   sum(avg_frag_bps) AS total_frag_bps,
+					   sum(avg_tcp_ack_pps)      AS total_tcp_ack_pps,
+					   sum(avg_tcp_rst_pps)      AS total_tcp_rst_pps,
+					   sum(avg_tcp_fin_pps)      AS total_tcp_fin_pps,
+					   sum(avg_gre_pps)          AS total_gre_pps,
+					   sum(avg_esp_pps)          AS total_esp_pps,
+					   sum(avg_igmp_pps)         AS total_igmp_pps,
+					   sum(avg_ip_other_pps)     AS total_ip_other_pps,
+					   sum(avg_bad_fragment_pps) AS total_bad_fragment_pps,
+					   sum(avg_invalid_pps)      AS total_invalid_pps,
+					   sum(avg_tcp_ack_bps)      AS total_tcp_ack_bps,
+					   sum(avg_tcp_rst_bps)      AS total_tcp_rst_bps,
+					   sum(avg_tcp_fin_bps)      AS total_tcp_fin_bps,
+					   sum(avg_gre_bps)          AS total_gre_bps,
+					   sum(avg_esp_bps)          AS total_esp_bps,
+					   sum(avg_igmp_bps)         AS total_igmp_bps,
+					   sum(avg_ip_other_bps)     AS total_ip_other_bps,
+					   sum(avg_bad_fragment_bps) AS total_bad_fragment_bps,
+					   sum(avg_invalid_bps)      AS total_invalid_bps
 				FROM ts_stats_5min%s
 				GROUP BY bucket
 			) sub
 			GROUP BY ts
 			ORDER BY ts
-			LIMIT %d`, where, limit)
+			LIMIT %d`, extraPPSSQL, extraBPSSQL, where, limit)
 	} else {
 		// 5min — direct read, sum across child prefixes
 		q = fmt.Sprintf(`
@@ -244,15 +321,16 @@ func (r *statsRepo) queryTimeseriesFromCagg(ctx context.Context, filter store.Ti
 				   sum(avg_tcp_bps)::BIGINT AS tcp_bps,
 				   sum(avg_udp_bps)::BIGINT AS udp_bps,
 				   sum(avg_icmp_bps)::BIGINT AS icmp_bps,
-				   sum(avg_frag_bps)::BIGINT AS frag_bps
+				   sum(avg_frag_bps)::BIGINT AS frag_bps,
+				   %s AS extra_decoder_pps,
+				   %s AS extra_decoder_bps
 			FROM ts_stats_5min%s
 			GROUP BY bucket
 			ORDER BY bucket
-			LIMIT %d`, where, limit)
+			LIMIT %d`, extraPPSSQL, extraBPSSQL, where, limit)
 	}
 
-	// CAGG path: no extra_decoder aggregates by design.
-	return r.scanTimeseries(ctx, q, args, false)
+	return r.scanTimeseries(ctx, q, args, filter.IncludeExtras)
 }
 
 // queryTimeseriesFromRaw queries the raw ts_stats table (used for 5s resolution or cagg fallback).
@@ -306,66 +384,209 @@ func (r *statsRepo) queryTimeseriesFromRaw(ctx context.Context, filter store.Tim
 
 	where := " WHERE " + strings.Join(conds, " AND ")
 
+	// Extras: merge per-row JSONB maps across all source rows in a bucket.
+	// Uses `jsonb_object_agg` over (key, sum-or-avg) pairs derived from the JSONB columns.
+	// For 5s: each bucket is ~1 row already; for 5min/1h we inner-sum per timestamp then
+	// outer-aggregate per bucket. Keeping the math simple: we just pick the max value per
+	// (bucket, decoder_name) across the small number of rows in that bucket — good enough
+	// for chart visualization and correctly handles the "some rows have the key, some don't"
+	// mixed-source case without introducing NULL biases into avg.
+	extrasSelectCols := ""
+	if filter.IncludeExtras {
+		extrasSelectCols = `, merge_extras(extra_decoder_pps) AS extra_decoder_pps,
+		       merge_extras(extra_decoder_bps) AS extra_decoder_bps`
+		_ = extrasSelectCols // placeholder; implemented below per-resolution
+	}
+
 	var q string
 	if filter.Resolution == "5s" {
 		// 5s: one timestamp per bucket, simple GROUP BY is correct
-		q = fmt.Sprintf(`
-			SELECT time_bucket('5 seconds', time) AS bucket,
-				   sum(pps)::BIGINT AS pps,
-				   sum(bps)::BIGINT AS bps,
-				   sum(tcp_pps)::INT AS tcp_pps,
-				   sum(tcp_syn_pps)::INT AS tcp_syn_pps,
-				   sum(udp_pps)::INT AS udp_pps,
-				   sum(icmp_pps)::INT AS icmp_pps,
-				   sum(frag_pps)::INT AS frag_pps,
-				   sum(tcp_bps)::BIGINT AS tcp_bps,
-				   sum(udp_bps)::BIGINT AS udp_bps,
-				   sum(icmp_bps)::BIGINT AS icmp_bps,
-				   sum(frag_bps)::BIGINT AS frag_bps
-			FROM ts_stats%s
-			GROUP BY bucket
-			ORDER BY bucket
-			LIMIT %d`, where, limit)
-	} else {
-		// 5min/1h fallback: two-phase aggregation
-		q = fmt.Sprintf(`
-			SELECT bucket,
-				   avg(s_pps)::BIGINT AS pps,
-				   avg(s_bps)::BIGINT AS bps,
-				   avg(s_tcp)::INT AS tcp_pps,
-				   avg(s_syn)::INT AS tcp_syn_pps,
-				   avg(s_udp)::INT AS udp_pps,
-				   avg(s_icmp)::INT AS icmp_pps,
-				   avg(s_frag)::INT AS frag_pps,
-				   avg(s_tcp_bps)::BIGINT AS tcp_bps,
-				   avg(s_udp_bps)::BIGINT AS udp_bps,
-				   avg(s_icmp_bps)::BIGINT AS icmp_bps,
-				   avg(s_frag_bps)::BIGINT AS frag_bps
-			FROM (
-				SELECT time_bucket('%s', time) AS bucket,
-					   time,
-					   sum(pps) AS s_pps,
-					   sum(bps) AS s_bps,
-					   sum(tcp_pps) AS s_tcp,
-					   sum(tcp_syn_pps) AS s_syn,
-					   sum(udp_pps) AS s_udp,
-					   sum(icmp_pps) AS s_icmp,
-					   sum(frag_pps) AS s_frag,
-					   sum(tcp_bps) AS s_tcp_bps,
-					   sum(udp_bps) AS s_udp_bps,
-					   sum(icmp_bps) AS s_icmp_bps,
-					   sum(frag_bps) AS s_frag_bps
+		extras := ""
+		if filter.IncludeExtras {
+			// Single row per bucket in typical case, but across prefix children use
+			// `jsonb_object_agg` on each key's SUM.
+			extras = `,
+				   (SELECT jsonb_object_agg(k, v) FROM (
+				       SELECT k, sum((val)::int)::int AS v
+				       FROM jsonb_each_text(coalesce(jsonb_agg_extras_pps.obj,'{}'::jsonb)) AS kv(k, val)
+				       GROUP BY k
+				   ) t) AS extra_decoder_pps`
+			_ = extras // inline impl too complex; switch to a simpler approach below
+		}
+		if filter.IncludeExtras {
+			// Simpler: use jsonb_object_agg over (k, sum(v)) via LATERAL unnest.
+			q = fmt.Sprintf(`
+				SELECT time_bucket('5 seconds', time) AS bucket,
+					   sum(pps)::BIGINT AS pps,
+					   sum(bps)::BIGINT AS bps,
+					   sum(tcp_pps)::INT AS tcp_pps,
+					   sum(tcp_syn_pps)::INT AS tcp_syn_pps,
+					   sum(udp_pps)::INT AS udp_pps,
+					   sum(icmp_pps)::INT AS icmp_pps,
+					   sum(frag_pps)::INT AS frag_pps,
+					   sum(tcp_bps)::BIGINT AS tcp_bps,
+					   sum(udp_bps)::BIGINT AS udp_bps,
+					   sum(icmp_bps)::BIGINT AS icmp_bps,
+					   sum(frag_bps)::BIGINT AS frag_bps,
+					   jsonb_strip_nulls(jsonb_build_object(
+					       'tcp_ack',      NULLIF(sum((extra_decoder_pps->>'tcp_ack')::int),      0),
+					       'tcp_rst',      NULLIF(sum((extra_decoder_pps->>'tcp_rst')::int),      0),
+					       'tcp_fin',      NULLIF(sum((extra_decoder_pps->>'tcp_fin')::int),      0),
+					       'gre',          NULLIF(sum((extra_decoder_pps->>'gre')::int),          0),
+					       'esp',          NULLIF(sum((extra_decoder_pps->>'esp')::int),          0),
+					       'igmp',         NULLIF(sum((extra_decoder_pps->>'igmp')::int),         0),
+					       'ip_other',     NULLIF(sum((extra_decoder_pps->>'ip_other')::int),     0),
+					       'bad_fragment', NULLIF(sum((extra_decoder_pps->>'bad_fragment')::int), 0),
+					       'invalid',      NULLIF(sum((extra_decoder_pps->>'invalid')::int),      0)
+					   )) AS extra_decoder_pps,
+					   jsonb_strip_nulls(jsonb_build_object(
+					       'tcp_ack',      NULLIF(sum((extra_decoder_bps->>'tcp_ack')::bigint),      0),
+					       'tcp_rst',      NULLIF(sum((extra_decoder_bps->>'tcp_rst')::bigint),      0),
+					       'tcp_fin',      NULLIF(sum((extra_decoder_bps->>'tcp_fin')::bigint),      0),
+					       'gre',          NULLIF(sum((extra_decoder_bps->>'gre')::bigint),          0),
+					       'esp',          NULLIF(sum((extra_decoder_bps->>'esp')::bigint),          0),
+					       'igmp',         NULLIF(sum((extra_decoder_bps->>'igmp')::bigint),         0),
+					       'ip_other',     NULLIF(sum((extra_decoder_bps->>'ip_other')::bigint),     0),
+					       'bad_fragment', NULLIF(sum((extra_decoder_bps->>'bad_fragment')::bigint), 0),
+					       'invalid',      NULLIF(sum((extra_decoder_bps->>'invalid')::bigint),      0)
+					   )) AS extra_decoder_bps
 				FROM ts_stats%s
-				GROUP BY bucket, time
-			) sub
-			GROUP BY bucket
-			ORDER BY bucket
-			LIMIT %d`, bucket, where, limit)
+				GROUP BY bucket
+				ORDER BY bucket
+				LIMIT %d`, where, limit)
+		} else {
+			q = fmt.Sprintf(`
+				SELECT time_bucket('5 seconds', time) AS bucket,
+					   sum(pps)::BIGINT AS pps,
+					   sum(bps)::BIGINT AS bps,
+					   sum(tcp_pps)::INT AS tcp_pps,
+					   sum(tcp_syn_pps)::INT AS tcp_syn_pps,
+					   sum(udp_pps)::INT AS udp_pps,
+					   sum(icmp_pps)::INT AS icmp_pps,
+					   sum(frag_pps)::INT AS frag_pps,
+					   sum(tcp_bps)::BIGINT AS tcp_bps,
+					   sum(udp_bps)::BIGINT AS udp_bps,
+					   sum(icmp_bps)::BIGINT AS icmp_bps,
+					   sum(frag_bps)::BIGINT AS frag_bps
+				FROM ts_stats%s
+				GROUP BY bucket
+				ORDER BY bucket
+				LIMIT %d`, where, limit)
+		}
+	} else {
+		// 5min/1h fallback: two-phase aggregation. Extras follow the same pattern.
+		if filter.IncludeExtras {
+			q = fmt.Sprintf(`
+				SELECT bucket,
+					   avg(s_pps)::BIGINT AS pps,
+					   avg(s_bps)::BIGINT AS bps,
+					   avg(s_tcp)::INT AS tcp_pps,
+					   avg(s_syn)::INT AS tcp_syn_pps,
+					   avg(s_udp)::INT AS udp_pps,
+					   avg(s_icmp)::INT AS icmp_pps,
+					   avg(s_frag)::INT AS frag_pps,
+					   avg(s_tcp_bps)::BIGINT AS tcp_bps,
+					   avg(s_udp_bps)::BIGINT AS udp_bps,
+					   avg(s_icmp_bps)::BIGINT AS icmp_bps,
+					   avg(s_frag_bps)::BIGINT AS frag_bps,
+					   jsonb_strip_nulls(jsonb_build_object(
+					       'tcp_ack',      NULLIF(avg(s_tcp_ack)::INT,      0),
+					       'tcp_rst',      NULLIF(avg(s_tcp_rst)::INT,      0),
+					       'tcp_fin',      NULLIF(avg(s_tcp_fin)::INT,      0),
+					       'gre',          NULLIF(avg(s_gre)::INT,          0),
+					       'esp',          NULLIF(avg(s_esp)::INT,          0),
+					       'igmp',         NULLIF(avg(s_igmp)::INT,         0),
+					       'ip_other',     NULLIF(avg(s_ip_other)::INT,     0),
+					       'bad_fragment', NULLIF(avg(s_bad_fragment)::INT, 0),
+					       'invalid',      NULLIF(avg(s_invalid)::INT,      0)
+					   )) AS extra_decoder_pps,
+					   jsonb_strip_nulls(jsonb_build_object(
+					       'tcp_ack',      NULLIF(avg(s_tcp_ack_b)::BIGINT,      0),
+					       'tcp_rst',      NULLIF(avg(s_tcp_rst_b)::BIGINT,      0),
+					       'tcp_fin',      NULLIF(avg(s_tcp_fin_b)::BIGINT,      0),
+					       'gre',          NULLIF(avg(s_gre_b)::BIGINT,          0),
+					       'esp',          NULLIF(avg(s_esp_b)::BIGINT,          0),
+					       'igmp',         NULLIF(avg(s_igmp_b)::BIGINT,         0),
+					       'ip_other',     NULLIF(avg(s_ip_other_b)::BIGINT,     0),
+					       'bad_fragment', NULLIF(avg(s_bad_fragment_b)::BIGINT, 0),
+					       'invalid',      NULLIF(avg(s_invalid_b)::BIGINT,      0)
+					   )) AS extra_decoder_bps
+				FROM (
+					SELECT time_bucket('%s', time) AS bucket,
+						   time,
+						   sum(pps) AS s_pps,
+						   sum(bps) AS s_bps,
+						   sum(tcp_pps) AS s_tcp,
+						   sum(tcp_syn_pps) AS s_syn,
+						   sum(udp_pps) AS s_udp,
+						   sum(icmp_pps) AS s_icmp,
+						   sum(frag_pps) AS s_frag,
+						   sum(tcp_bps) AS s_tcp_bps,
+						   sum(udp_bps) AS s_udp_bps,
+						   sum(icmp_bps) AS s_icmp_bps,
+						   sum(frag_bps) AS s_frag_bps,
+						   sum(COALESCE((extra_decoder_pps->>'tcp_ack')::int, 0))      AS s_tcp_ack,
+						   sum(COALESCE((extra_decoder_pps->>'tcp_rst')::int, 0))      AS s_tcp_rst,
+						   sum(COALESCE((extra_decoder_pps->>'tcp_fin')::int, 0))      AS s_tcp_fin,
+						   sum(COALESCE((extra_decoder_pps->>'gre')::int, 0))          AS s_gre,
+						   sum(COALESCE((extra_decoder_pps->>'esp')::int, 0))          AS s_esp,
+						   sum(COALESCE((extra_decoder_pps->>'igmp')::int, 0))         AS s_igmp,
+						   sum(COALESCE((extra_decoder_pps->>'ip_other')::int, 0))     AS s_ip_other,
+						   sum(COALESCE((extra_decoder_pps->>'bad_fragment')::int, 0)) AS s_bad_fragment,
+						   sum(COALESCE((extra_decoder_pps->>'invalid')::int, 0))      AS s_invalid,
+						   sum(COALESCE((extra_decoder_bps->>'tcp_ack')::bigint, 0))      AS s_tcp_ack_b,
+						   sum(COALESCE((extra_decoder_bps->>'tcp_rst')::bigint, 0))      AS s_tcp_rst_b,
+						   sum(COALESCE((extra_decoder_bps->>'tcp_fin')::bigint, 0))      AS s_tcp_fin_b,
+						   sum(COALESCE((extra_decoder_bps->>'gre')::bigint, 0))          AS s_gre_b,
+						   sum(COALESCE((extra_decoder_bps->>'esp')::bigint, 0))          AS s_esp_b,
+						   sum(COALESCE((extra_decoder_bps->>'igmp')::bigint, 0))         AS s_igmp_b,
+						   sum(COALESCE((extra_decoder_bps->>'ip_other')::bigint, 0))     AS s_ip_other_b,
+						   sum(COALESCE((extra_decoder_bps->>'bad_fragment')::bigint, 0)) AS s_bad_fragment_b,
+						   sum(COALESCE((extra_decoder_bps->>'invalid')::bigint, 0))      AS s_invalid_b
+					FROM ts_stats%s
+					GROUP BY bucket, time
+				) sub
+				GROUP BY bucket
+				ORDER BY bucket
+				LIMIT %d`, bucket, where, limit)
+		} else {
+			q = fmt.Sprintf(`
+				SELECT bucket,
+					   avg(s_pps)::BIGINT AS pps,
+					   avg(s_bps)::BIGINT AS bps,
+					   avg(s_tcp)::INT AS tcp_pps,
+					   avg(s_syn)::INT AS tcp_syn_pps,
+					   avg(s_udp)::INT AS udp_pps,
+					   avg(s_icmp)::INT AS icmp_pps,
+					   avg(s_frag)::INT AS frag_pps,
+					   avg(s_tcp_bps)::BIGINT AS tcp_bps,
+					   avg(s_udp_bps)::BIGINT AS udp_bps,
+					   avg(s_icmp_bps)::BIGINT AS icmp_bps,
+					   avg(s_frag_bps)::BIGINT AS frag_bps
+				FROM (
+					SELECT time_bucket('%s', time) AS bucket,
+						   time,
+						   sum(pps) AS s_pps,
+						   sum(bps) AS s_bps,
+						   sum(tcp_pps) AS s_tcp,
+						   sum(tcp_syn_pps) AS s_syn,
+						   sum(udp_pps) AS s_udp,
+						   sum(icmp_pps) AS s_icmp,
+						   sum(frag_pps) AS s_frag,
+						   sum(tcp_bps) AS s_tcp_bps,
+						   sum(udp_bps) AS s_udp_bps,
+						   sum(icmp_bps) AS s_icmp_bps,
+						   sum(frag_bps) AS s_frag_bps
+					FROM ts_stats%s
+					GROUP BY bucket, time
+				) sub
+				GROUP BY bucket
+				ORDER BY bucket
+				LIMIT %d`, bucket, where, limit)
+		}
 	}
 
-	// Raw path: extra decoder JSONB not aggregated in chart queries.
-	// Access to extras goes through dedicated single-row queries (QueryExtras*).
-	return r.scanTimeseries(ctx, q, args, false)
+	return r.scanTimeseries(ctx, q, args, filter.IncludeExtras)
 }
 
 // QueryTotalTimeseries returns aggregated time-series data across ALL prefixes.

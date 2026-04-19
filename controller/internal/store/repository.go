@@ -511,6 +511,11 @@ type TimeseriesFilter struct {
 	Resolution string // "5s" | "5min" | "1h" (ts_stats granularity is ~5s)
 	Direction  string // "receives" | "sends" | "both" | "" (empty = receives)
 	Limit      int
+	// IncludeExtras controls whether the response TimeseriesPoints populate
+	// ExtraDecoderPPS / ExtraDecoderBPS. Default false preserves the pre-v1.3.2
+	// 12-field JSON shape; set to true when the caller (chart UI) wants the
+	// 9 v1.3 decoders merged in. Applies to both raw ts_stats and CAGG paths.
+	IncludeExtras bool
 }
 
 // TimeseriesPoint is a single aggregated time-series data point.

@@ -181,9 +181,10 @@ func totalTimeseries(deps Dependencies) gin.HandlerFunc {
 			return
 		}
 		filter := store.TimeseriesFilter{
-			Resolution: resolution,
-			Direction:  dir,
-			Limit:      limit,
+			Resolution:    resolution,
+			Direction:     dir,
+			Limit:         limit,
+			IncludeExtras: c.Query("include_extras") == "true",
 		}
 		if from := c.Query("from"); from != "" {
 			if t, err := time.Parse(time.RFC3339, from); err == nil {
