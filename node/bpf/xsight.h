@@ -48,12 +48,34 @@
 // Decoder Index — append-only, never reorder.
 // IMPORTANT: keep in sync with shared/decoder/decoder.go
 // ---------------------------------------------------------------------------
-#define DECODER_TCP     0
-#define DECODER_TCP_SYN 1
-#define DECODER_UDP     2
-#define DECODER_ICMP    3
-#define DECODER_FRAG    4
-#define MAX_DECODERS    16
+#define DECODER_TCP       0
+#define DECODER_TCP_SYN   1
+#define DECODER_UDP       2
+#define DECODER_ICMP      3
+#define DECODER_FRAG      4
+// v1.3 Phase 1b — TCP flag subdivisions
+#define DECODER_TCP_ACK   5
+#define DECODER_TCP_RST   6
+#define DECODER_TCP_FIN   7
+// v1.3 Phase 1b — Non-TCP/UDP/ICMP protocols
+#define DECODER_GRE       8
+#define DECODER_ESP       9
+#define DECODER_IGMP      10
+#define DECODER_IP_OTHER  11
+// v1.3 Phase 1b (追加) — Packet-level anomalies (stateless detection)
+#define DECODER_BAD_FRAGMENT 12  // Ping of Death / tiny fragment
+#define DECODER_INVALID      13  // IP IHL<5, TCP doff<5, header length anomalies
+// Slots 14-15 reserved for future decoders (explicit additions only).
+#define MAX_DECODERS      16
+
+// IP protocol numbers used by v1.3 Phase 1b dispatch (not all present in vmlinux.h)
+#ifndef IPPROTO_ESP
+#define IPPROTO_ESP       50
+#endif
+#ifndef IPPROTO_IGMP
+#define IPPROTO_IGMP      2
+#endif
+// IPPROTO_GRE already defined above (line 28)
 
 // ---------------------------------------------------------------------------
 // Data Structures — must match Go-side definitions exactly

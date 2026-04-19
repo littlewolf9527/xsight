@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -15,6 +16,74 @@ import (
 
 type statsRepo struct{ pool *pgxpool.Pool }
 
+// buildExtraDecoderPPS collects decoder PPS values with index >= StandardCount into a
+// name-keyed map. Returns nil when all extra indices are zero — stored as SQL NULL to
+// save space on rows without v1.3+ decoders.
+func buildExtraDecoderPPS(decoderPPS [decoder.MaxDecoders]int32) map[string]int32 {
+	var out map[string]int32
+	for i := decoder.StandardCount; i < decoder.MaxDecoders; i++ {
+		v := decoderPPS[i]
+		if v == 0 {
+			continue
+		}
+		name := decoder.Names[i]
+		if name == "" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]int32)
+		}
+		out[name] = v
+	}
+	return out
+}
+
+// buildExtraDecoderBPS is the BPS variant of buildExtraDecoderPPS.
+func buildExtraDecoderBPS(decoderBPS [decoder.MaxDecoders]int64) map[string]int64 {
+	var out map[string]int64
+	for i := decoder.StandardCount; i < decoder.MaxDecoders; i++ {
+		v := decoderBPS[i]
+		if v == 0 {
+			continue
+		}
+		name := decoder.Names[i]
+		if name == "" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]int64)
+		}
+		out[name] = v
+	}
+	return out
+}
+
+// encodeJSONB marshals a map into []byte for pgx; nil map → SQL NULL.
+func encodeJSONB(m any) any {
+	// Handle both int32 and int64 maps by checking reflectively via type switch.
+	switch v := m.(type) {
+	case map[string]int32:
+		if len(v) == 0 {
+			return nil
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil
+		}
+		return b
+	case map[string]int64:
+		if len(v) == 0 {
+			return nil
+		}
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil
+		}
+		return b
+	}
+	return nil
+}
+
 // BulkInsert writes stat points into ts_stats using pgx.CopyFrom for maximum throughput.
 func (r *statsRepo) BulkInsert(ctx context.Context, points []store.StatPoint) error {
 	if len(points) == 0 {
@@ -24,7 +93,8 @@ func (r *statsRepo) BulkInsert(ctx context.Context, points []store.StatPoint) er
 	columns := []string{
 		"time", "node_id", "dst_ip", "prefix", "direction",
 		"pps", "bps", "tcp_pps", "tcp_syn_pps", "udp_pps", "icmp_pps", "frag_pps",
-		"tcp_bps", "udp_bps", "icmp_bps",
+		"tcp_bps", "udp_bps", "icmp_bps", "frag_bps",
+		"extra_decoder_pps", "extra_decoder_bps",
 	}
 
 	rows := make([][]any, len(points))
@@ -33,11 +103,14 @@ func (r *statsRepo) BulkInsert(ctx context.Context, points []store.StatPoint) er
 		if dir == "" {
 			dir = "receives"
 		}
+		extraPPS := encodeJSONB(buildExtraDecoderPPS(p.DecoderPPS))
+		extraBPS := encodeJSONB(buildExtraDecoderBPS(p.DecoderBPS))
 		rows[i] = []any{
 			p.Time, p.NodeID, p.DstIP, p.Prefix, dir,
 			p.PPS, p.BPS,
-			p.DecoderPPS[0], p.DecoderPPS[1], p.DecoderPPS[2], p.DecoderPPS[3], p.DecoderPPS[4],
-			p.DecoderBPS[decoder.TCP], p.DecoderBPS[decoder.UDP], p.DecoderBPS[decoder.ICMP],
+			p.DecoderPPS[decoder.TCP], p.DecoderPPS[decoder.TCPSyn], p.DecoderPPS[decoder.UDP], p.DecoderPPS[decoder.ICMP], p.DecoderPPS[decoder.Frag],
+			p.DecoderBPS[decoder.TCP], p.DecoderBPS[decoder.UDP], p.DecoderBPS[decoder.ICMP], p.DecoderBPS[decoder.Frag],
+			extraPPS, extraBPS,
 		}
 	}
 
@@ -122,6 +195,7 @@ func (r *statsRepo) queryTimeseriesFromCagg(ctx context.Context, filter store.Ti
 	// For 5min resolution: cagg rows are already at 5min granularity, just sum across prefixes.
 	// For 1h resolution: two-phase — first sum across prefixes per 5min bucket,
 	// then avg those totals across the hour (otherwise we'd sum 12 buckets instead of averaging).
+	// CAGG v5 includes frag_pps/bps. Extra decoders (v1.3) are NOT in CAGG — raw-only.
 	var q string
 	if filter.Resolution == "1h" {
 		q = fmt.Sprintf(`
@@ -132,9 +206,11 @@ func (r *statsRepo) queryTimeseriesFromCagg(ctx context.Context, filter store.Ti
 				   avg(total_syn)::INT AS tcp_syn_pps,
 				   avg(total_udp)::INT AS udp_pps,
 				   avg(total_icmp)::INT AS icmp_pps,
+				   avg(total_frag)::INT AS frag_pps,
 				   avg(total_tcp_bps)::BIGINT AS tcp_bps,
 				   avg(total_udp_bps)::BIGINT AS udp_bps,
-				   avg(total_icmp_bps)::BIGINT AS icmp_bps
+				   avg(total_icmp_bps)::BIGINT AS icmp_bps,
+				   avg(total_frag_bps)::BIGINT AS frag_bps
 			FROM (
 				SELECT bucket,
 					   sum(avg_pps) AS total_pps,
@@ -143,9 +219,11 @@ func (r *statsRepo) queryTimeseriesFromCagg(ctx context.Context, filter store.Ti
 					   sum(avg_tcp_syn_pps) AS total_syn,
 					   sum(avg_udp_pps) AS total_udp,
 					   sum(avg_icmp_pps) AS total_icmp,
+					   sum(avg_frag_pps) AS total_frag,
 					   sum(avg_tcp_bps) AS total_tcp_bps,
 					   sum(avg_udp_bps) AS total_udp_bps,
-					   sum(avg_icmp_bps) AS total_icmp_bps
+					   sum(avg_icmp_bps) AS total_icmp_bps,
+					   sum(avg_frag_bps) AS total_frag_bps
 				FROM ts_stats_5min%s
 				GROUP BY bucket
 			) sub
@@ -162,16 +240,19 @@ func (r *statsRepo) queryTimeseriesFromCagg(ctx context.Context, filter store.Ti
 				   sum(avg_tcp_syn_pps)::INT AS tcp_syn_pps,
 				   sum(avg_udp_pps)::INT AS udp_pps,
 				   sum(avg_icmp_pps)::INT AS icmp_pps,
+				   sum(avg_frag_pps)::INT AS frag_pps,
 				   sum(avg_tcp_bps)::BIGINT AS tcp_bps,
 				   sum(avg_udp_bps)::BIGINT AS udp_bps,
-				   sum(avg_icmp_bps)::BIGINT AS icmp_bps
+				   sum(avg_icmp_bps)::BIGINT AS icmp_bps,
+				   sum(avg_frag_bps)::BIGINT AS frag_bps
 			FROM ts_stats_5min%s
 			GROUP BY bucket
 			ORDER BY bucket
 			LIMIT %d`, where, limit)
 	}
 
-	return r.scanTimeseries(ctx, q, args)
+	// CAGG path: no extra_decoder aggregates by design.
+	return r.scanTimeseries(ctx, q, args, false)
 }
 
 // queryTimeseriesFromRaw queries the raw ts_stats table (used for 5s resolution or cagg fallback).
@@ -236,9 +317,11 @@ func (r *statsRepo) queryTimeseriesFromRaw(ctx context.Context, filter store.Tim
 				   sum(tcp_syn_pps)::INT AS tcp_syn_pps,
 				   sum(udp_pps)::INT AS udp_pps,
 				   sum(icmp_pps)::INT AS icmp_pps,
+				   sum(frag_pps)::INT AS frag_pps,
 				   sum(tcp_bps)::BIGINT AS tcp_bps,
 				   sum(udp_bps)::BIGINT AS udp_bps,
-				   sum(icmp_bps)::BIGINT AS icmp_bps
+				   sum(icmp_bps)::BIGINT AS icmp_bps,
+				   sum(frag_bps)::BIGINT AS frag_bps
 			FROM ts_stats%s
 			GROUP BY bucket
 			ORDER BY bucket
@@ -253,9 +336,11 @@ func (r *statsRepo) queryTimeseriesFromRaw(ctx context.Context, filter store.Tim
 				   avg(s_syn)::INT AS tcp_syn_pps,
 				   avg(s_udp)::INT AS udp_pps,
 				   avg(s_icmp)::INT AS icmp_pps,
+				   avg(s_frag)::INT AS frag_pps,
 				   avg(s_tcp_bps)::BIGINT AS tcp_bps,
 				   avg(s_udp_bps)::BIGINT AS udp_bps,
-				   avg(s_icmp_bps)::BIGINT AS icmp_bps
+				   avg(s_icmp_bps)::BIGINT AS icmp_bps,
+				   avg(s_frag_bps)::BIGINT AS frag_bps
 			FROM (
 				SELECT time_bucket('%s', time) AS bucket,
 					   time,
@@ -265,9 +350,11 @@ func (r *statsRepo) queryTimeseriesFromRaw(ctx context.Context, filter store.Tim
 					   sum(tcp_syn_pps) AS s_syn,
 					   sum(udp_pps) AS s_udp,
 					   sum(icmp_pps) AS s_icmp,
+					   sum(frag_pps) AS s_frag,
 					   sum(tcp_bps) AS s_tcp_bps,
 					   sum(udp_bps) AS s_udp_bps,
-					   sum(icmp_bps) AS s_icmp_bps
+					   sum(icmp_bps) AS s_icmp_bps,
+					   sum(frag_bps) AS s_frag_bps
 				FROM ts_stats%s
 				GROUP BY bucket, time
 			) sub
@@ -276,7 +363,9 @@ func (r *statsRepo) queryTimeseriesFromRaw(ctx context.Context, filter store.Tim
 			LIMIT %d`, bucket, where, limit)
 	}
 
-	return r.scanTimeseries(ctx, q, args)
+	// Raw path: extra decoder JSONB not aggregated in chart queries.
+	// Access to extras goes through dedicated single-row queries (QueryExtras*).
+	return r.scanTimeseries(ctx, q, args, false)
 }
 
 // QueryTotalTimeseries returns aggregated time-series data across ALL prefixes.
@@ -298,7 +387,10 @@ func clampLimit(v int) int {
 }
 
 // scanTimeseries executes the query and scans into TimeseriesPoint slice.
-func (r *statsRepo) scanTimeseries(ctx context.Context, q string, args []any) ([]store.TimeseriesPoint, error) {
+// withExtras controls whether the query returns extra_decoder_pps/bps JSONB columns
+// at the end of SELECT; when false (current chart queries), only the 12 standard fields
+// are scanned. JSONB scanning path reserved for future dedicated extras-access API.
+func (r *statsRepo) scanTimeseries(ctx context.Context, q string, args []any, withExtras bool) ([]store.TimeseriesPoint, error) {
 	rows, err := r.pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -308,8 +400,30 @@ func (r *statsRepo) scanTimeseries(ctx context.Context, q string, args []any) ([
 	var points []store.TimeseriesPoint
 	for rows.Next() {
 		var p store.TimeseriesPoint
-		if err := rows.Scan(&p.Time, &p.PPS, &p.BPS, &p.TCPPPS, &p.TCPSynPPS, &p.UDPPPS, &p.ICMPPPS, &p.TCPBPS, &p.UDPBPS, &p.ICMPBPS); err != nil {
-			return nil, err
+		if withExtras {
+			var extraPPSRaw, extraBPSRaw []byte
+			if err := rows.Scan(
+				&p.Time, &p.PPS, &p.BPS,
+				&p.TCPPPS, &p.TCPSynPPS, &p.UDPPPS, &p.ICMPPPS, &p.FragPPS,
+				&p.TCPBPS, &p.UDPBPS, &p.ICMPBPS, &p.FragBPS,
+				&extraPPSRaw, &extraBPSRaw,
+			); err != nil {
+				return nil, err
+			}
+			if len(extraPPSRaw) > 0 {
+				_ = json.Unmarshal(extraPPSRaw, &p.ExtraDecoderPPS)
+			}
+			if len(extraBPSRaw) > 0 {
+				_ = json.Unmarshal(extraBPSRaw, &p.ExtraDecoderBPS)
+			}
+		} else {
+			if err := rows.Scan(
+				&p.Time, &p.PPS, &p.BPS,
+				&p.TCPPPS, &p.TCPSynPPS, &p.UDPPPS, &p.ICMPPPS, &p.FragPPS,
+				&p.TCPBPS, &p.UDPBPS, &p.ICMPBPS, &p.FragBPS,
+			); err != nil {
+				return nil, err
+			}
 		}
 		points = append(points, p)
 	}

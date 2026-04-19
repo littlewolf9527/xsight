@@ -121,3 +121,66 @@ func TestEvaluateRule(t *testing.T) {
 		})
 	}
 }
+
+// TestEvaluateRule_V13Decoders asserts the new v1.3 Phase 1b decoders (TCP ACK/RST/FIN
+// and GRE/ESP/IGMP/ip_other) route through evaluateRule correctly via decoder.Index().
+// No detector-side changes were needed for v1.3 Phase 1b thanks to the v2.9.0 array
+// refactor — this test confirms that invariant still holds.
+func TestEvaluateRule_V13Decoders(t *testing.T) {
+	// Populate DecoderPPS / DecoderBPS at the exact v1.3 slot indices.
+	var dp ring.DataPoint
+	dp.DecoderPPS[decoder.TCPAck] = 11000
+	dp.DecoderPPS[decoder.TCPRst] = 7000
+	dp.DecoderPPS[decoder.TCPFin] = 3000
+	dp.DecoderPPS[decoder.GRE] = 1500
+	dp.DecoderPPS[decoder.ESP] = 200
+	dp.DecoderPPS[decoder.IGMP] = 50
+	dp.DecoderPPS[decoder.IPOther] = 900
+	dp.DecoderPPS[decoder.BadFragment] = 400
+	dp.DecoderPPS[decoder.Invalid] = 250
+	dp.DecoderBPS[decoder.TCPAck] = 11_000_000
+	dp.DecoderBPS[decoder.GRE] = 12_000_000
+	dp.DecoderBPS[decoder.BadFragment] = 320_000
+	dp.DecoderBPS[decoder.Invalid] = 10_000
+
+	tests := []struct {
+		name    string
+		rule    engine.ResolvedThreshold
+		wantVal int64
+		wantHit bool
+	}{
+		// ACK flood: TCP ACK pps > threshold
+		{"tcp_ack pps over hit", engine.ResolvedThreshold{Decoder: "tcp_ack", Unit: "pps", Comparison: "over", Value: 10000}, 11000, true},
+		{"tcp_ack pps over miss", engine.ResolvedThreshold{Decoder: "tcp_ack", Unit: "pps", Comparison: "over", Value: 20000}, 11000, false},
+		{"tcp_ack bps over hit", engine.ResolvedThreshold{Decoder: "tcp_ack", Unit: "bps", Comparison: "over", Value: 10_000_000}, 11_000_000, true},
+		// RST flood
+		{"tcp_rst pps over hit", engine.ResolvedThreshold{Decoder: "tcp_rst", Unit: "pps", Comparison: "over", Value: 5000}, 7000, true},
+		// FIN flood / scan
+		{"tcp_fin pps over hit", engine.ResolvedThreshold{Decoder: "tcp_fin", Unit: "pps", Comparison: "over", Value: 1000}, 3000, true},
+		{"tcp_fin pps over miss", engine.ResolvedThreshold{Decoder: "tcp_fin", Unit: "pps", Comparison: "over", Value: 5000}, 3000, false},
+		// Non-TCP/UDP/ICMP protocols
+		{"gre pps over hit", engine.ResolvedThreshold{Decoder: "gre", Unit: "pps", Comparison: "over", Value: 1000}, 1500, true},
+		{"gre bps over hit", engine.ResolvedThreshold{Decoder: "gre", Unit: "bps", Comparison: "over", Value: 10_000_000}, 12_000_000, true},
+		{"esp pps over miss", engine.ResolvedThreshold{Decoder: "esp", Unit: "pps", Comparison: "over", Value: 300}, 200, false},
+		{"igmp pps under hit", engine.ResolvedThreshold{Decoder: "igmp", Unit: "pps", Comparison: "under", Value: 100}, 50, true},
+		{"ip_other pps over hit", engine.ResolvedThreshold{Decoder: "ip_other", Unit: "pps", Comparison: "over", Value: 500}, 900, true},
+		// v1.3 Phase 1b (追加): bad_fragment + invalid decoder threshold matches
+		{"bad_fragment pps over hit", engine.ResolvedThreshold{Decoder: "bad_fragment", Unit: "pps", Comparison: "over", Value: 100}, 400, true},
+		{"bad_fragment pps over miss", engine.ResolvedThreshold{Decoder: "bad_fragment", Unit: "pps", Comparison: "over", Value: 500}, 400, false},
+		{"bad_fragment bps over hit", engine.ResolvedThreshold{Decoder: "bad_fragment", Unit: "bps", Comparison: "over", Value: 300_000}, 320_000, true},
+		{"invalid pps over hit", engine.ResolvedThreshold{Decoder: "invalid", Unit: "pps", Comparison: "over", Value: 100}, 250, true},
+		{"invalid pps under hit", engine.ResolvedThreshold{Decoder: "invalid", Unit: "pps", Comparison: "under", Value: 300}, 250, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			val, hit := evaluateRule(tt.rule, dp)
+			if val != tt.wantVal {
+				t.Errorf("actual = %d, want %d", val, tt.wantVal)
+			}
+			if hit != tt.wantHit {
+				t.Errorf("breached = %v, want %v", hit, tt.wantHit)
+			}
+		})
+	}
+}

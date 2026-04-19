@@ -1149,6 +1149,24 @@ func evaluateStructuredPrecondition(p store.ActionPrecondition, attack *store.At
 		return matchStringInSlice(p.Operator, p.Value, attack.NodeSources)
 	case "domain":
 		return matchStringOp(p.Operator, p.Value, attackDomain(attack.DstIP))
+	case "carpet_bomb":
+		// v1.3 Phase 1c: semantic alias for subnet-scope attacks. Equivalent to
+		// `domain eq subnet` but named after the attack pattern it targets, for
+		// readability in Response configs ("precondition: carpet_bomb eq true").
+		//
+		// Value is "true" / "false". Operators: eq / neq.
+		isCarpet := attackDomain(attack.DstIP) == "subnet"
+		wantStr := strings.ToLower(strings.TrimSpace(p.Value))
+		want := wantStr == "true" || wantStr == "1" || wantStr == "yes"
+		switch p.Operator {
+		case "eq":
+			return isCarpet == want
+		case "neq":
+			return isCarpet != want
+		default:
+			log.Printf("action: carpet_bomb precondition only supports eq/neq, got %q", p.Operator)
+			return false
+		}
 	case "dominant_src_port":
 		fa := getFA()
 		if fa == nil {

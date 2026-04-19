@@ -231,42 +231,54 @@ func (s *PGStore) applyCompressionPolicy(ctx context.Context, table string, days
 //   v1/v2: PPS only
 //   v3: PPS + BPS protocol columns
 //   v4: PPS + BPS + direction dimension (Phase 3)
+//   v5: v4 + avg_frag_pps + avg_frag_bps (v1.3 Phase 1a — fix frag missing from aggregates)
+//
+// v5 does NOT aggregate extra_decoder_pps/bps JSONB — new decoders (v1.3) are intentionally
+// only queryable from raw ts_stats within the 7-day retention window.
 func (s *PGStore) ensureCagg(ctx context.Context) {
-	// Probe current cagg version by checking for specific columns
-	var hasDirection bool
+	// Probe current cagg version by checking for frag_bps aggregate column (v5 marker)
+	var hasFragBPS bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM information_schema.columns
-			WHERE table_name = 'ts_stats_5min' AND column_name = 'direction'
-		)`).Scan(&hasDirection)
+			WHERE table_name = 'ts_stats_5min' AND column_name = 'avg_frag_bps'
+		)`).Scan(&hasFragBPS)
 	if err != nil {
 		log.Printf("WARNING: cagg check failed: %v", err)
 		return
 	}
-	if hasDirection {
-		return // cagg already v4 (with direction)
+	if hasFragBPS {
+		return // cagg already v5 (with frag aggregates)
 	}
 
-	// Check if we need v3→v4 upgrade or fresh creation
-	var hasBPS bool
+	// Check prior version markers for logging clarity
+	var hasDirection, hasBPS bool
+	_ = s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'ts_stats_5min' AND column_name = 'direction'
+		)`).Scan(&hasDirection)
 	_ = s.pool.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM information_schema.columns
 			WHERE table_name = 'ts_stats_5min' AND column_name = 'avg_tcp_bps'
 		)`).Scan(&hasBPS)
 
-	if hasBPS {
-		log.Printf("cagg: upgrading ts_stats_5min from v3 to v4 (adding direction)")
-	} else {
-		log.Printf("cagg: creating ts_stats_5min v4 (fresh)")
+	switch {
+	case hasDirection:
+		log.Printf("cagg: upgrading ts_stats_5min from v4 to v5 (adding frag aggregates)")
+	case hasBPS:
+		log.Printf("cagg: upgrading ts_stats_5min from v3 to v5 (adding direction + frag aggregates)")
+	default:
+		log.Printf("cagg: creating ts_stats_5min v5 (fresh)")
 	}
 
-	// Drop old cagg and recreate with direction dimension
+	// Drop old cagg and recreate.
 	// NOTE: this permanently loses cagg history beyond raw retention (7 days).
-	// Accepted tradeoff — old cagg has no direction info anyway.
+	// Accepted tradeoff — frag aggregates are cheap to backfill from raw.
 	_, _ = s.pool.Exec(ctx, `DROP MATERIALIZED VIEW IF EXISTS ts_stats_5min CASCADE`)
 
-	// Create v4 cagg: prefix-only (WHERE dst_ip IS NULL) + direction dimension
+	// Create v5 cagg: v4 + avg_frag_pps + avg_frag_bps
 	_, err = s.pool.Exec(ctx, `
 		CREATE MATERIALIZED VIEW ts_stats_5min
 		WITH (timescaledb.continuous) AS
@@ -278,19 +290,21 @@ func (s *PGStore) ensureCagg(ctx context.Context) {
 			   avg(tcp_syn_pps)::INT AS avg_tcp_syn_pps,
 			   avg(udp_pps)::INT AS avg_udp_pps,
 			   avg(icmp_pps)::INT AS avg_icmp_pps,
+			   avg(frag_pps)::INT AS avg_frag_pps,
 			   avg(tcp_bps)::BIGINT AS avg_tcp_bps,
 			   avg(udp_bps)::BIGINT AS avg_udp_bps,
-			   avg(icmp_bps)::BIGINT AS avg_icmp_bps
+			   avg(icmp_bps)::BIGINT AS avg_icmp_bps,
+			   avg(frag_bps)::BIGINT AS avg_frag_bps
 		FROM ts_stats
 		WHERE dst_ip IS NULL
 		GROUP BY bucket, node_id, prefix, direction
 		WITH NO DATA
 	`)
 	if err != nil {
-		log.Printf("WARNING: cagg v4 create failed: %v", err)
+		log.Printf("WARNING: cagg v5 create failed: %v", err)
 		return
 	}
-	log.Printf("cagg: created ts_stats_5min v4 with direction dimension")
+	log.Printf("cagg: created ts_stats_5min v5 with frag aggregates")
 
 	// Synchronous backfill last 7 days (= raw retention window)
 	_, err = s.pool.Exec(ctx, `CALL refresh_continuous_aggregate('ts_stats_5min', now() - INTERVAL '7 days', now() + INTERVAL '1 hour')`)
@@ -494,6 +508,24 @@ var migrations = []string{
 
 	// v2.11 Phase 3: direction column for bidirectional time series
 	`DO $$ BEGIN ALTER TABLE ts_stats ADD COLUMN direction TEXT NOT NULL DEFAULT 'receives'; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+
+	// v1.3 Phase 1a: frag_bps fixed column (v2.10.x added tcp/udp/icmp bps but missed frag)
+	`DO $$ BEGIN ALTER TABLE ts_stats ADD COLUMN frag_bps BIGINT DEFAULT 0; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+
+	// v1.3 Phase 1a: JSONB columns for decoders with index >= StandardCount (5).
+	// Written by db_writer when non-zero; NULL when all extra indices are zero.
+	// Key = decoder.Names[i] (e.g., "tcp_ack"), value = int for pps / int64 for bps.
+	`DO $$ BEGIN ALTER TABLE ts_stats ADD COLUMN extra_decoder_pps JSONB DEFAULT NULL; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+	`DO $$ BEGIN ALTER TABLE ts_stats ADD COLUMN extra_decoder_bps JSONB DEFAULT NULL; EXCEPTION WHEN duplicate_column THEN NULL; END $$`,
+
+	// v1.3 Phase 1c.2/1c.3 REVERTED (2026-04-20): SYN cookie scope removed after
+	// architectural reassessment — xSight's scrub-and-return (ingress-only) xdrop
+	// topology cannot support stateless SYN cookie without synproxy-style state
+	// that contradicts pure-XDP. Customer kernel-level SYN cookies + xdrop pps
+	// rate_limit provide the correct layered defense instead.
+	// These DROP statements clean up objects left by the earlier (reverted) migration.
+	`DROP TABLE IF EXISTS xdrop_syn_cookie_secrets`,
+	`DO $$ BEGIN ALTER TABLE xdrop_connectors DROP COLUMN nat_declared; EXCEPTION WHEN undefined_column THEN NULL; END $$`,
 
 	// Config audit log
 	`CREATE TABLE IF NOT EXISTS config_audit_log (

@@ -115,7 +115,9 @@ func CloseSyntheticXDropRuleLocal(
 // Matches xDrop's RuleRequest format — any field left empty/zero is treated as wildcard.
 type xdropRuleRequest struct {
 	DstIP     string  `json:"dst_ip,omitempty"`
+	DstCIDR   string  `json:"dst_cidr,omitempty"` // v1.3: subnet-scope rule (carpet bombing)
 	SrcIP     string  `json:"src_ip,omitempty"`
+	SrcCIDR   string  `json:"src_cidr,omitempty"`
 	DstPort   int     `json:"dst_port,omitempty"`
 	SrcPort   int     `json:"src_port,omitempty"`
 	Protocol  string  `json:"protocol,omitempty"`
@@ -124,6 +126,30 @@ type xdropRuleRequest struct {
 	RateLimit int     `json:"rate_limit,omitempty"` // PPS, required if action=rate_limit
 	Source    string  `json:"source"`               // "xsight"
 	Comment   string  `json:"comment,omitempty"`
+}
+
+// splitIPOrCIDR separates "10.0.0.1" vs "10.0.0.0/24".
+// Returns (ip, cidr) where exactly one is populated: ip for /32|/128|bare,
+// cidr for anything shorter. Used to route subnet-scope attacks (carpet bombing)
+// to xDrop's dst_cidr match field instead of exact dst_ip.
+func splitIPOrCIDR(s string) (ip, cidr string) {
+	idx := strings.IndexByte(s, '/')
+	if idx < 0 {
+		return s, ""
+	}
+	host := s[:idx]
+	plStr := s[idx+1:]
+	// IPv4 /32 and IPv6 /128 are effectively exact IPs; route to dst_ip.
+	if strings.Contains(host, ":") {
+		if plStr == "128" {
+			return host, ""
+		}
+	} else {
+		if plStr == "32" {
+			return host, ""
+		}
+	}
+	return "", s
 }
 
 // executeXDrop executes an xDrop action by calling the xDrop Controller API.
@@ -192,13 +218,17 @@ func executeXDrop(
 		// still wins when decoder=tcp_syn.
 		body = injectTcpFlags(body, attack)
 	} else {
-		// Default payload: dst_ip drop/rate_limit based on xdrop_action
+		// Default payload: dst_ip drop/rate_limit based on xdrop_action.
+		// v1.3 Phase 1c.1: subnet-scope attacks (carpet bombing) use dst_cidr
+		// instead of dst_ip so xDrop matches on the whole subnet.
 		actionStr := "drop"
 		if xdropAction == "rate_limit" {
 			actionStr = "rate_limit"
 		}
+		dstIP, dstCIDR := splitIPOrCIDR(attack.DstIP)
 		payload := xdropRuleRequest{
-			DstIP:   attack.DstIP,
+			DstIP:   dstIP,
+			DstCIDR: dstCIDR,
 			Action:  actionStr,
 			Source:  "xsight",
 			Comment: fmt.Sprintf("attack #%d %s", attack.ID, attack.AttackType),

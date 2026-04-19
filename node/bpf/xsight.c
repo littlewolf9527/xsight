@@ -12,48 +12,101 @@
 // DECODER_SWITCH — single source of truth for protocol → decoder index mapping.
 // To add a new decoder: add one case here + one constant in xsight.h + one in shared/decoder/decoder.go.
 // All 4 call sites (ip_stats, prefix_stats, global inbound, global outbound) use this macro.
+//
+// TCP flag bits (RFC 793): FIN=0x01, SYN=0x02, RST=0x04, PSH=0x08, ACK=0x10.
+// For DDoS detection we subdivide TCP into:
+//   - TCP_SYN: SYN set, ACK not set (client-initiated handshake — SYN flood signature)
+//   - TCP_ACK: ACK set, SYN not set (stateless ACK flood signature, excludes SYN-ACK)
+//   - TCP_RST: RST set (RST flood / abort signal spam)
+//   - TCP_FIN: FIN set (FIN scan / FIN flood)
+// Packets may increment multiple sub-counters (e.g., FIN+ACK → FIN + ACK).
 // ---------------------------------------------------------------------------
-#define DECODER_SWITCH(counts, byte_counts, pkt_len, l4_proto, is_syn, is_frag) \
-do {                                                                            \
-    switch (l4_proto) {                                                         \
-    case IPPROTO_TCP:                                                           \
-        __sync_fetch_and_add(&(counts)[DECODER_TCP], 1);                        \
-        __sync_fetch_and_add(&(byte_counts)[DECODER_TCP], pkt_len);             \
-        if (is_syn) {                                                           \
-            __sync_fetch_and_add(&(counts)[DECODER_TCP_SYN], 1);                \
-            __sync_fetch_and_add(&(byte_counts)[DECODER_TCP_SYN], pkt_len);     \
-        }                                                                       \
-        break;                                                                  \
-    case IPPROTO_UDP:                                                           \
-        __sync_fetch_and_add(&(counts)[DECODER_UDP], 1);                        \
-        __sync_fetch_and_add(&(byte_counts)[DECODER_UDP], pkt_len);             \
-        break;                                                                  \
-    case IPPROTO_ICMP:                                                          \
-    case IPPROTO_ICMPV6:                                                        \
-        __sync_fetch_and_add(&(counts)[DECODER_ICMP], 1);                       \
-        __sync_fetch_and_add(&(byte_counts)[DECODER_ICMP], pkt_len);            \
-        break;                                                                  \
-    }                                                                           \
-    if (is_frag) {                                                              \
-        __sync_fetch_and_add(&(counts)[DECODER_FRAG], 1);                       \
-        __sync_fetch_and_add(&(byte_counts)[DECODER_FRAG], pkt_len);            \
-    }                                                                           \
+#define DECODER_SWITCH(counts, byte_counts, pkt_len, l4_proto, tcp_flags, is_frag, is_bad_fragment, is_invalid) \
+do {                                                                               \
+    switch (l4_proto) {                                                            \
+    case IPPROTO_TCP:                                                              \
+        __sync_fetch_and_add(&(counts)[DECODER_TCP], 1);                           \
+        __sync_fetch_and_add(&(byte_counts)[DECODER_TCP], pkt_len);                \
+        if (((tcp_flags) & 0x02) && !((tcp_flags) & 0x10)) {                       \
+            __sync_fetch_and_add(&(counts)[DECODER_TCP_SYN], 1);                   \
+            __sync_fetch_and_add(&(byte_counts)[DECODER_TCP_SYN], pkt_len);        \
+        }                                                                          \
+        if (((tcp_flags) & 0x10) && !((tcp_flags) & 0x02)) {                       \
+            __sync_fetch_and_add(&(counts)[DECODER_TCP_ACK], 1);                   \
+            __sync_fetch_and_add(&(byte_counts)[DECODER_TCP_ACK], pkt_len);        \
+        }                                                                          \
+        if ((tcp_flags) & 0x04) {                                                  \
+            __sync_fetch_and_add(&(counts)[DECODER_TCP_RST], 1);                   \
+            __sync_fetch_and_add(&(byte_counts)[DECODER_TCP_RST], pkt_len);        \
+        }                                                                          \
+        if ((tcp_flags) & 0x01) {                                                  \
+            __sync_fetch_and_add(&(counts)[DECODER_TCP_FIN], 1);                   \
+            __sync_fetch_and_add(&(byte_counts)[DECODER_TCP_FIN], pkt_len);        \
+        }                                                                          \
+        break;                                                                     \
+    case IPPROTO_UDP:                                                              \
+        __sync_fetch_and_add(&(counts)[DECODER_UDP], 1);                           \
+        __sync_fetch_and_add(&(byte_counts)[DECODER_UDP], pkt_len);                \
+        break;                                                                     \
+    case IPPROTO_ICMP:                                                             \
+    case IPPROTO_ICMPV6:                                                           \
+        __sync_fetch_and_add(&(counts)[DECODER_ICMP], 1);                          \
+        __sync_fetch_and_add(&(byte_counts)[DECODER_ICMP], pkt_len);               \
+        break;                                                                     \
+    case IPPROTO_GRE:                                                              \
+        __sync_fetch_and_add(&(counts)[DECODER_GRE], 1);                           \
+        __sync_fetch_and_add(&(byte_counts)[DECODER_GRE], pkt_len);                \
+        break;                                                                     \
+    case IPPROTO_ESP:                                                              \
+        __sync_fetch_and_add(&(counts)[DECODER_ESP], 1);                           \
+        __sync_fetch_and_add(&(byte_counts)[DECODER_ESP], pkt_len);                \
+        break;                                                                     \
+    case IPPROTO_IGMP:                                                             \
+        __sync_fetch_and_add(&(counts)[DECODER_IGMP], 1);                          \
+        __sync_fetch_and_add(&(byte_counts)[DECODER_IGMP], pkt_len);               \
+        break;                                                                     \
+    default:                                                                       \
+        /* Catch-all for IP protocols not explicitly tracked. */                   \
+        __sync_fetch_and_add(&(counts)[DECODER_IP_OTHER], 1);                      \
+        __sync_fetch_and_add(&(byte_counts)[DECODER_IP_OTHER], pkt_len);           \
+        break;                                                                     \
+    }                                                                              \
+    if (is_frag) {                                                                 \
+        __sync_fetch_and_add(&(counts)[DECODER_FRAG], 1);                          \
+        __sync_fetch_and_add(&(byte_counts)[DECODER_FRAG], pkt_len);               \
+    }                                                                              \
+    /* v1.3 Phase 1b (追加): anomaly decoders are additive to protocol counters. \
+     * A single bad fragment packet increments both its protocol (e.g., UDP) AND  \
+     * DECODER_FRAG AND DECODER_BAD_FRAGMENT — gives operators a baseline-vs-attack \
+     * ratio on the same chart. */                                                 \
+    if (is_bad_fragment) {                                                         \
+        __sync_fetch_and_add(&(counts)[DECODER_BAD_FRAGMENT], 1);                  \
+        __sync_fetch_and_add(&(byte_counts)[DECODER_BAD_FRAGMENT], pkt_len);       \
+    }                                                                              \
+    if (is_invalid) {                                                              \
+        __sync_fetch_and_add(&(counts)[DECODER_INVALID], 1);                       \
+        __sync_fetch_and_add(&(byte_counts)[DECODER_INVALID], pkt_len);            \
+    }                                                                              \
 } while (0)
 
 // Helper: update per-IP stats (protocol distribution + packet size)
+// v1.3 Phase 1b: tcp_flags threaded through to DECODER_SWITCH for ACK/RST/FIN detection.
+// v1.3 Phase 1b (追加): is_bad_fragment + is_invalid also threaded for anomaly counters.
 // ---------------------------------------------------------------------------
 static __always_inline void update_ip_stats(
     struct dst_ip_stats *st,
     __u32 pkt_len,
     __u8  l4_proto,
-    bool  is_syn,
-    bool  is_frag)
+    __u8  tcp_flags,
+    bool  is_frag,
+    bool  is_bad_fragment,
+    bool  is_invalid)
 {
     __sync_fetch_and_add(&st->pkt_count, 1);
     __sync_fetch_and_add(&st->byte_count, pkt_len);
 
     DECODER_SWITCH(st->decoder_counts, st->decoder_byte_counts,
-                   pkt_len, l4_proto, is_syn, is_frag);
+                   pkt_len, l4_proto, tcp_flags, is_frag, is_bad_fragment, is_invalid);
 
     if (pkt_len < PKT_SMALL_THRESHOLD)
         __sync_fetch_and_add(&st->small_pkt, 1);
@@ -70,11 +123,13 @@ static __always_inline void update_prefix_decoders(
     struct prefix_stats *ps,
     __u32 pkt_len,
     __u8  l4_proto,
-    bool  is_syn,
-    bool  is_frag)
+    __u8  tcp_flags,
+    bool  is_frag,
+    bool  is_bad_fragment,
+    bool  is_invalid)
 {
     DECODER_SWITCH(ps->decoder_counts, ps->decoder_byte_counts,
-                   pkt_len, l4_proto, is_syn, is_frag);
+                   pkt_len, l4_proto, tcp_flags, is_frag, is_bad_fragment, is_invalid);
 }
 
 // MACRO: build prefix_key, mask host bits, lookup in map.
@@ -104,44 +159,50 @@ do {                                                                          \
 // Must be a macro (not function) because BPF map references must be
 // compile-time constants — cannot pass maps through void* parameters.
 // ---------------------------------------------------------------------------
-#define PROCESS_DIRECTION(prefix_map, ip_map_a, ip_map_b, active_slot,     \
-                          ip_key, matched_prefixlen, pkt_len,               \
-                          l4_proto, is_syn, is_frag)                        \
-do {                                                                        \
-    struct prefix_stats *_ps;                                               \
-    LOOKUP_PREFIX_STATS(_ps, prefix_map, ip_key, matched_prefixlen);        \
-    if (_ps) {                                                              \
-        __sync_fetch_and_add(&_ps->pkt_count, 1);                          \
-        __sync_fetch_and_add(&_ps->byte_count, pkt_len);                   \
-        update_prefix_decoders(_ps, pkt_len, l4_proto, is_syn, is_frag);   \
-    }                                                                       \
-    struct dst_ip_stats *_ist;                                              \
-    if (active_slot == 0)                                                   \
-        _ist = bpf_map_lookup_elem(&ip_map_a, ip_key);                     \
-    else                                                                    \
-        _ist = bpf_map_lookup_elem(&ip_map_b, ip_key);                     \
-    if (_ist) {                                                             \
-        update_ip_stats(_ist, pkt_len, l4_proto, is_syn, is_frag);         \
-    } else {                                                                \
-        struct dst_ip_stats _new = {};                                      \
-        update_ip_stats(&_new, pkt_len, l4_proto, is_syn, is_frag);        \
-        int _ret;                                                           \
-        if (active_slot == 0)                                               \
-            _ret = bpf_map_update_elem(&ip_map_a, ip_key, &_new,           \
-                                       BPF_NOEXIST);                        \
-        else                                                                \
-            _ret = bpf_map_update_elem(&ip_map_b, ip_key, &_new,           \
-                                       BPF_NOEXIST);                        \
-        if (_ret != 0 && _ps)                                               \
-            __sync_fetch_and_add(&_ps->overflow_count, 1);                  \
-    }                                                                       \
+#define PROCESS_DIRECTION(prefix_map, ip_map_a, ip_map_b, active_slot,       \
+                          ip_key, matched_prefixlen, pkt_len,                 \
+                          l4_proto, tcp_flags, is_frag,                       \
+                          is_bad_fragment, is_invalid)                        \
+do {                                                                          \
+    struct prefix_stats *_ps;                                                 \
+    LOOKUP_PREFIX_STATS(_ps, prefix_map, ip_key, matched_prefixlen);          \
+    if (_ps) {                                                                \
+        __sync_fetch_and_add(&_ps->pkt_count, 1);                             \
+        __sync_fetch_and_add(&_ps->byte_count, pkt_len);                      \
+        update_prefix_decoders(_ps, pkt_len, l4_proto, tcp_flags, is_frag,    \
+                               is_bad_fragment, is_invalid);                  \
+    }                                                                         \
+    struct dst_ip_stats *_ist;                                                \
+    if (active_slot == 0)                                                     \
+        _ist = bpf_map_lookup_elem(&ip_map_a, ip_key);                        \
+    else                                                                      \
+        _ist = bpf_map_lookup_elem(&ip_map_b, ip_key);                        \
+    if (_ist) {                                                               \
+        update_ip_stats(_ist, pkt_len, l4_proto, tcp_flags, is_frag,          \
+                        is_bad_fragment, is_invalid);                         \
+    } else {                                                                  \
+        struct dst_ip_stats _new = {};                                        \
+        update_ip_stats(&_new, pkt_len, l4_proto, tcp_flags, is_frag,         \
+                        is_bad_fragment, is_invalid);                         \
+        int _ret;                                                             \
+        if (active_slot == 0)                                                 \
+            _ret = bpf_map_update_elem(&ip_map_a, ip_key, &_new,              \
+                                       BPF_NOEXIST);                          \
+        else                                                                  \
+            _ret = bpf_map_update_elem(&ip_map_b, ip_key, &_new,              \
+                                       BPF_NOEXIST);                          \
+        if (_ret != 0 && _ps)                                                 \
+            __sync_fetch_and_add(&_ps->overflow_count, 1);                    \
+    }                                                                         \
 } while (0)
 
 // UPDATE_GLOBAL_DECODERS — thin wrapper around DECODER_SWITCH for global_stats arrays.
 // Kept as a named macro for readability at call sites.
-#define UPDATE_GLOBAL_DECODERS(dec_counts, dec_byte_counts,                 \
-                               pkt_len, l4_proto, is_syn, is_frag)          \
-    DECODER_SWITCH(dec_counts, dec_byte_counts, pkt_len, l4_proto, is_syn, is_frag)
+#define UPDATE_GLOBAL_DECODERS(dec_counts, dec_byte_counts,                   \
+                               pkt_len, l4_proto, tcp_flags, is_frag,         \
+                               is_bad_fragment, is_invalid)                   \
+    DECODER_SWITCH(dec_counts, dec_byte_counts, pkt_len, l4_proto, tcp_flags, \
+                   is_frag, is_bad_fragment, is_invalid)
 
 // ---------------------------------------------------------------------------
 // Helper: read __u64 from config map with default
@@ -215,10 +276,29 @@ static __always_inline void emit_sample(struct xdp_md *ctx, struct global_stats 
 // ---------------------------------------------------------------------------
 // parse_ip extracts dst_ip key + L4 protocol info from IP header.
 // src_key is extracted separately in xsight_main to avoid verifier pointer issues.
+// v1.3 Phase 1b: replaced `is_syn bool` output with full `tcp_flags` byte so
+// downstream DECODER_SWITCH can subdivide TCP into SYN/ACK/RST/FIN decoders.
+// Output `tcp_flags` is the full RFC 793 flags byte (FIN=0x01, SYN=0x02, RST=0x04,
+// PSH=0x08, ACK=0x10, URG=0x20); 0 for non-TCP packets.
+//
+// v1.3 Phase 1b (追加): added stateless anomaly detection.
+//   *is_bad_fragment set when:
+//     - fragment_end (offset*8 + payload) > 65535  (Ping of Death pattern)
+//     - first fragment (MF=1, offset=0) with payload too small to contain L4 header
+//       (tiny fragment: < 20B for TCP, < 8B for UDP) — indicates fragment-based IDS evasion
+//   *is_invalid set when:
+//     - IPv4 IHL < 5 (header shorter than minimum 20 bytes)
+//     - IP total_length < IHL*4 (header says length less than header size)
+//     - TCP doff < 5 (TCP header shorter than minimum 20 bytes)
+//   IPv6 anomaly detection is intentionally limited in v1.3 (no IHL, fragment
+//   extension headers require option walking). Only `is_invalid` is set for
+//   IPv6 based on L4 header checks; IPv6 fragmentation anomalies defer to v1.4.
 static __always_inline int parse_ip(
     void *l3_hdr, void *data_end,
     struct lpm_key *key, __u8 *l4_proto,
-    bool *is_frag, bool *is_syn, __u16 eth_type)
+    bool *is_frag, __u8 *tcp_flags,
+    bool *is_bad_fragment, bool *is_invalid,
+    __u16 eth_type)
 {
     if (eth_type == ETH_P_IP) {
         struct iphdr *iph = l3_hdr;
@@ -230,14 +310,56 @@ static __always_inline int parse_ip(
 
         *l4_proto = iph->protocol;
 
+        // v1.3 INVALID: IHL must be ≥ 5 (20 bytes minimum).
+        // Bounded to ihl ≥ 5 below so downstream ihl*4 arithmetic is safe.
+        __u8 ihl = iph->ihl;
+        if (ihl < 5) {
+            *is_invalid = true;
+            return 0;  // Can't trust header → return early (l4_hdr offset undefined)
+        }
+
+        // v1.3 INVALID: total_length must be ≥ header size.
+        __u16 tot_len = bpf_ntohs(iph->tot_len);
+        __u16 hdr_bytes = (__u16)ihl * 4;
+        if (tot_len < hdr_bytes) {
+            *is_invalid = true;
+        }
+
         __u16 frag_off = bpf_ntohs(iph->frag_off);
-        *is_frag = (frag_off & 0x2000) || (frag_off & 0x1FFF);
+        __u16 mf       = frag_off & 0x2000;   // More Fragments flag
+        __u16 offset13 = frag_off & 0x1FFF;   // Fragment offset in 8-byte units
+        *is_frag = mf || offset13;
+
+        if (*is_frag) {
+            // v1.3 BAD_FRAGMENT — Ping of Death pattern: offset*8 + payload > 65535.
+            // Clamp payload to avoid unsigned underflow if tot_len < hdr_bytes.
+            __u16 payload = (tot_len > hdr_bytes) ? (tot_len - hdr_bytes) : 0;
+            __u32 frag_end = ((__u32)offset13 * 8) + (__u32)payload;
+            if (frag_end > 65535) {
+                *is_bad_fragment = true;
+            }
+            // v1.3 BAD_FRAGMENT — Tiny fragment: first fragment (MF=1, offset=0)
+            // must be big enough to contain L4 header to not hide flags/ports.
+            if (mf && offset13 == 0) {
+                if (*l4_proto == IPPROTO_TCP && payload < 20) {
+                    *is_bad_fragment = true;
+                }
+                if (*l4_proto == IPPROTO_UDP && payload < 8) {
+                    *is_bad_fragment = true;
+                }
+            }
+        }
 
         if (*l4_proto == IPPROTO_TCP && !(*is_frag)) {
-            void *l4_hdr = l3_hdr + (iph->ihl * 4);
+            void *l4_hdr = l3_hdr + hdr_bytes;
             if (l4_hdr + 14 <= data_end) {
-                __u8 flags = *((__u8 *)l4_hdr + 13);
-                *is_syn = (flags & 0x02) && !(flags & 0x10);
+                *tcp_flags = *((__u8 *)l4_hdr + 13);
+                // v1.3 INVALID — TCP doff must be ≥ 5 (20 bytes minimum).
+                // byte 12 upper 4 bits = data offset.
+                __u8 doff = (*((__u8 *)l4_hdr + 12)) >> 4;
+                if (doff < 5) {
+                    *is_invalid = true;
+                }
             }
         }
         return 0;
@@ -255,8 +377,12 @@ static __always_inline int parse_ip(
         if (*l4_proto == IPPROTO_TCP) {
             void *l4_hdr = (void *)(ip6h + 1);
             if (l4_hdr + 14 <= data_end) {
-                __u8 flags = *((__u8 *)l4_hdr + 13);
-                *is_syn = (flags & 0x02) && !(flags & 0x10);
+                *tcp_flags = *((__u8 *)l4_hdr + 13);
+                // v1.3 INVALID — TCP doff check (same as IPv4)
+                __u8 doff = (*((__u8 *)l4_hdr + 12)) >> 4;
+                if (doff < 5) {
+                    *is_invalid = true;
+                }
             }
         }
         return 0;
@@ -395,11 +521,14 @@ int xsight_main(struct xdp_md *ctx)
     // ③ Parse IP — dst_key via parse_ip, src_key via separate extract (avoids verifier pointer issues)
     struct lpm_key dst_key = {};
     struct lpm_key src_key = {};
-    __u8  l4_proto = 0;
-    bool  is_frag  = false;
-    bool  is_syn   = false;
+    __u8  l4_proto        = 0;
+    bool  is_frag         = false;
+    __u8  tcp_flags       = 0;  // v1.3 Phase 1b: full TCP flags byte for SYN/ACK/RST/FIN dispatch
+    bool  is_bad_fragment = false;  // v1.3 Phase 1b (追加)
+    bool  is_invalid      = false;  // v1.3 Phase 1b (追加)
 
-    if (parse_ip(l3_hdr, data_end, &dst_key, &l4_proto, &is_frag, &is_syn, eth_type) != 0)
+    if (parse_ip(l3_hdr, data_end, &dst_key, &l4_proto, &is_frag, &tcp_flags,
+                 &is_bad_fragment, &is_invalid, eth_type) != 0)
         return XDP_DROP;
 
     // Extract src_ip for outbound detection (separate call to avoid verifier issues)
@@ -439,11 +568,13 @@ int xsight_main(struct xdp_md *ctx)
             __sync_fetch_and_add(&gs->matched_pkts, 1);
             __sync_fetch_and_add(&gs->matched_bytes, pkt_len);
             UPDATE_GLOBAL_DECODERS(gs->decoder_counts, gs->decoder_byte_counts,
-                                   pkt_len, l4_proto, is_syn, is_frag);
+                                   pkt_len, l4_proto, tcp_flags, is_frag,
+                                   is_bad_fragment, is_invalid);
         }
         PROCESS_DIRECTION(prefix_stats_map, ip_stats_a, ip_stats_b,
                           active, &dst_key, *dst_prefix_idx,
-                          pkt_len, l4_proto, is_syn, is_frag);
+                          pkt_len, l4_proto, tcp_flags, is_frag,
+                          is_bad_fragment, is_invalid);
     }
 
     // ====== OUTBOUND (src_ip matched) — same macro, different maps ======
@@ -452,11 +583,13 @@ int xsight_main(struct xdp_md *ctx)
             __sync_fetch_and_add(&gs->src_matched_pkts, 1);
             __sync_fetch_and_add(&gs->src_matched_bytes, pkt_len);
             UPDATE_GLOBAL_DECODERS(gs->src_decoder_counts, gs->src_decoder_byte_counts,
-                                   pkt_len, l4_proto, is_syn, is_frag);
+                                   pkt_len, l4_proto, tcp_flags, is_frag,
+                                   is_bad_fragment, is_invalid);
         }
         PROCESS_DIRECTION(src_prefix_stats_map, src_stats_a, src_stats_b,
                           active, &src_key, *src_prefix_idx,
-                          pkt_len, l4_proto, is_syn, is_frag);
+                          pkt_len, l4_proto, tcp_flags, is_frag,
+                          is_bad_fragment, is_invalid);
     }
 
     // ⑧ Ring buffer sampling — after trie match (either direction)

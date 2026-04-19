@@ -623,15 +623,116 @@ scrape_configs:
 
 **效果：** 攻击检测到 → BGP 路由宣告 + 为每个单主机目标创建 xDrop 丢弃规则。攻击结束 → 5 分钟延迟 → BGP 撤回 + xDrop 规则移除。
 
-### 8.2 SYN 洪水
+### 8.2 SYN 洪水（分层防御）
 
-**症状：** 大量 TCP SYN 包。
+**症状**：大量 TCP SYN 包打向服务，后端 SYN queue 被撑满，新连接建立失败。
+
+**架构说明**：xSight/xdrop **不**在清洗层做 SYN cookie。scrub-and-return 部署拓扑下（xdrop 只看 ingress，egress 从 ASN 内直接出公网），无状态 SYN cookie 会导致后端收到凭空的 ACK → RST，合法连接被断。分层防御才是正确做法：
+
+| 层 | 职责 | 谁做 |
+|---|---|---|
+| L1 pps 削峰（防 NIC / 上联被淹）| 把 SYN 速率削到后端能处理的量级 | **xdrop** (`rate_limit` / `drop` / CIDR blacklist) + **xSight** (BGP RTBH 核选项) |
+| L4 握手保护（防 SYN queue 耗尽）| Cookie 验证合法连接 | **客户 Linux 内核** (`net.ipv4.tcp_syncookies=1`，Debian/Ubuntu/RHEL 6 以来默认开) |
+| L7 应用层 | 应用级防护 | 客户 WAF / 应用 |
+
+**客户侧配置建议**：确认后端 `net.ipv4.tcp_syncookies=1`（执行 `sysctl net.ipv4.tcp_syncookies` 查；值 1 = "SYN queue 满时启用"，生产推荐；值 2 = "始终启用"，会无谓地损 TCP 选项，不推荐）。
+
+**配置（xSight 阶梯响应）**：
+1. **模板规则**：Decoder `tcp_syn`，Unit `pps`，Value `1000000`（按后端 SYN 处理能力调）
+2. **Response 带阶梯 action**（用 v1.1 auto-pair + delay 机制）：
+   - priority 1，on_detected，`xdrop rate_limit` 在阈值 ~50%（轻限速，误伤小）
+   - priority 2，on_detected，`action_delay_minutes: 2`，`xdrop drop` + precondition `tcp_flags: SYN,!ACK`（轻限没救就硬丢 SYN）
+   - priority 3，on_detected，`action_delay_minutes: 10`，`bgp announce` + RTBH route-map（核选项：上游把 victim IP 整个 blackhole）
+
+**效果**：当攻击 Decoder 为 `tcp_syn` 时，xSight 自动在 xDrop 规则中注入 `protocol: tcp` 和 `tcp_flags: SYN,!ACK`，无需手动配置标志位。阶梯响应让轻度缓解先试，不够再升级。
+
+### 8.2.1 反射攻击（DNS / NTP / Memcached / SSDP / CLDAP / Chargen）
+
+**症状：** 来自特定服务源端口的大量 UDP 流量。源端口模式标识反射类型。
+
+**配置（无专用 decoder — 通过 precondition 组合）：**
+反射攻击本质是"UDP + 特定源端口"，xSight 通过 `udp` decoder + `dominant_src_port` precondition 组合识别。不为每种反射引入专用 decoder（v1.3 设计决策：避免消耗稀缺的 BPF decoder 槽位）。
+
+| 攻击 | 模板规则 | 前置条件 |
+|---|---|---|
+| DNS 放大 | Decoder `udp`，Unit `pps`，Value `10000` | `dominant_src_port = 53` |
+| NTP monlist | Decoder `udp`，Unit `pps`，Value `5000` | `dominant_src_port = 123` |
+| Memcached | Decoder `udp`，Unit `pps`，Value `1000` | `dominant_src_port = 11211` |
+| SSDP | Decoder `udp`，Unit `pps`，Value `5000` | `dominant_src_port = 1900` |
+| CLDAP | Decoder `udp`,Unit `pps`，Value `2000` | `dominant_src_port = 389` |
+| Chargen | Decoder `udp`，Unit `pps`，Value `1000` | `dominant_src_port = 19` |
+
+**响应动作：** 对可精确识别的反射源（正常不会给你发包的外部服务），用 `drop` 最安全。如果你的服务器可能合法地从这些端口接收流量（例如你自己就在运行 DNS 服务器），改用 `rate_limit`。
+
+**示例 YAML：**
+```yaml
+threshold_template:
+  decoder: udp
+  unit: pps
+  value: 10000
+precondition:
+  - { attribute: dominant_src_port, operator: eq, value: "53" }
+actions:
+  - action_type: xdrop
+    xdrop_action: drop
+    xdrop_fields: [dst_ip, src_port]
+```
+
+### 8.2.2 无状态 ACK / RST / FIN 洪水（v1.3）
+
+**症状：** 不带 SYN 前文的 TCP ACK、RST、FIN 包洪水，能绕过基本的 SYN flood 防御。
+
+**配置：** v1.3 新增专用 decoder —— 不需要 precondition 技巧：
+
+| 攻击 | 模板规则 |
+|---|---|
+| 无状态 ACK flood | Decoder `tcp_ack`，Unit `pps`，Value `100000` |
+| RST flood | Decoder `tcp_rst`，Unit `pps`，Value `50000` |
+| FIN flood / 扫描 | Decoder `tcp_fin`，Unit `pps`，Value `10000` |
+
+xSight 独立统计这些（`tcp_syn` 不受影响）—— 一个 `SYN+ACK` 包只会增加 `tcp` 计数，不会增加 `tcp_syn` 或 `tcp_ack`，因此每个 flag 计数器反映真实攻击意图。
+
+### 8.2.3 非 TCP/UDP/ICMP 协议洪水（v1.3）
+
+**症状：** GRE、ESP 或 IGMP 流量异常激增。这些协议有合法用途但可被利用做反射或带宽耗尽攻击。
 
 **配置：**
-1. **模板规则：** Decoder `tcp_syn`，Unit `pps`，Value `1000000`。
-2. **xDrop 动作**，勾选 Dst IP 过滤字段。
 
-**效果：** 当攻击 Decoder 为 `tcp_syn` 时，xSight 自动在 xDrop 规则中注入 `protocol: tcp` 和 `tcp_flags: SYN,!ACK`，无需手动配置标志位。
+| 攻击 | 模板规则 |
+|---|---|
+| GRE 洪水 | Decoder `gre`，Unit `pps`，Value `10000` |
+| ESP 洪水 | Decoder `esp`，Unit `pps`，Value `5000` |
+| IGMP 洪水 | Decoder `igmp`，Unit `pps`，Value `1000` |
+| 其他 IP 协议洪水 | Decoder `ip_other`，Unit `pps`，Value `1000` |
+
+xDrop 的 L4 过滤按 `protocol` 匹配，对这些非标准协议，在 xDrop 侧用 `protocol=all` + precondition 捕获，或直接上 BGP null-route 更直接。
+
+### 8.2.4 畸形 / 异常包（v1.3 — `bad_fragment`, `invalid`）
+
+**症状**：攻击者构造带非法头字段组合或滥用 IP 分片机制的包。例子：Ping of Death（分片重组后超大）、tiny fragment（首个分片太小塞不下 L4 头，用于绕 IDS）、IHL/doff 畸形。
+
+**配置**：v1.3 新增两个**无状态**异常检测 decoder（BPF 级别位操作，不跟 flow state）：
+
+| 攻击 | 模板规则 |
+|---|---|
+| Ping of Death + tiny fragment | Decoder `bad_fragment`，Unit `pps`，Value `100` |
+| IP / TCP 头畸形（IHL<5 / doff<5 / total_length < 头长度）| Decoder `invalid`，Unit `pps`，Value `50` |
+
+**两个 decoder 的精确触发条件（BPF 无状态检测）：**
+
+| Decoder | 触发条件 |
+|---|---|
+| `bad_fragment` | offset×8 + payload > 65535（PoD）；首片（MF=1, offset=0）payload 小于 20 字节（TCP）或 8 字节（UDP）（tiny frag）|
+| `invalid` | IP IHL < 5；IP total_length < IHL×4；TCP data offset < 5 |
+
+**注：flag 异常组合（NULL/XMAS/SYN+FIN/SYN+RST）不归 `invalid`** —— 请在 xdrop 侧通过 `tcp_flags` 匹配写常驻规则（例如规则带 `tcp_flags: "SYN,FIN"` 丢 SYN+FIN 包）。decoder 只数**结构畸形**的包；flag 组合是匹配目标，不是计数目标。
+
+**与已有 `fragment` decoder 的关系：**
+- `fragment` = **任何** IP 分片包（baseline，可能是合法 MTU 分片）
+- `bad_fragment` = **带攻击特征**的分片（PoD 或 tiny frag）
+- 同一个 bad fragment 包会**同时**递增 `fragment` 和 `bad_fragment` —— 用来在同一张图上看攻击/正常比例
+
+Teardrop-style 分片重叠检测需要 stateful 跟踪 per-flow，v1.3 刻意不做。
 
 ### 8.3 地毯式轰炸（子网攻击）
 

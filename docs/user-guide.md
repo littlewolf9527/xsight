@@ -623,15 +623,116 @@ Records all configuration changes and manual operations. Filter by entity type, 
 
 **Result:** Attack detected → BGP route announced + xDrop drop rule created for each single-host target. Attack ends → 5-minute delay → BGP withdrawn + xDrop rules removed.
 
-### 8.2 SYN Flood
+### 8.2 SYN Flood (Layered Defense)
 
-**Symptoms:** High volume of TCP SYN packets.
+**Symptoms:** High volume of TCP SYN packets toward a service, SYN queue saturation on backend, new connections fail to establish.
+
+**Architecture note:** xSight/xdrop does **not** implement SYN cookie at the scrubbing layer. In scrub-and-return topology (xdrop sees ingress only, egress bypasses xdrop), stateless SYN cookie would orphan legitimate connections at the backend. Instead, SYN flood defense is layered:
+
+| Layer | Role | Who does it |
+|---|---|---|
+| L1 pps clamp (prevent NIC/uplink saturation) | Reduce raw SYN rate to what backend can process | **xdrop** (`rate_limit` / `drop` / CIDR blacklist) + **xSight** (BGP RTBH as nuclear option) |
+| L4 handshake protection (SYN queue exhaustion) | Cookie-validate legitimate connections | **Customer Linux kernel** (`net.ipv4.tcp_syncookies=1`, default-on since Debian/Ubuntu/RHEL 6) |
+| L7 application | App-level protection | Customer WAF / app |
+
+**Customer configuration recommendation:** Confirm backend has `net.ipv4.tcp_syncookies=1` (`sysctl net.ipv4.tcp_syncookies` — value 1 means "enable when SYN queue overflows", the correct production setting; value 2 means "always enabled" and degrades TCP options unnecessarily).
+
+**Setup (xSight tiered response):**
+1. **Template rule:** Decoder `tcp_syn`, Unit `pps`, Value `1000000` (tune to your backend's SYN-handling capacity).
+2. **Response with tiered actions** (uses v1.1 auto-pair + delay mechanics):
+   - Priority 1, on_detected, `xdrop rate_limit` at ~50% of threshold (light throttle, minimal legit impact)
+   - Priority 2, on_detected with `action_delay_minutes: 2`, `xdrop drop` with `tcp_flags: SYN,!ACK` precondition (if light throttle didn't resolve, harden to full SYN drop)
+   - Priority 3, on_detected with `action_delay_minutes: 10`, `bgp announce` with RTBH route-map (nuclear — blackhole victim IP at upstream)
+
+**Result:** When the attack decoder is `tcp_syn`, xSight automatically injects `protocol: tcp` and `tcp_flags: SYN,!ACK` into the xDrop rule. No manual flag configuration needed. The tiered response escalates if lower-severity mitigation isn't sufficient.
+
+### 8.2.1 Reflection Attacks (DNS / NTP / Memcached / SSDP / CLDAP / Chargen)
+
+**Symptoms:** High-volume UDP traffic arriving from a specific service port, spoofing legitimate responses. The source port pattern identifies the reflection type.
+
+**Setup (no dedicated decoder — composed via precondition):**
+Since reflection attacks are fundamentally "UDP + specific source port", xSight identifies them by combining the `udp` decoder with the `dominant_src_port` precondition. No dedicated `dns_reflect` / `ntp_reflect` decoder exists — composing via precondition keeps the BPF decoder slot budget open for genuinely new detection dimensions (v1.3 design decision).
+
+| Attack | Template Rule | Precondition |
+|---|---|---|
+| DNS amplification | Decoder `udp`, Unit `pps`, Value `10000` | `dominant_src_port = 53` |
+| NTP monlist | Decoder `udp`, Unit `pps`, Value `5000` | `dominant_src_port = 123` |
+| Memcached | Decoder `udp`, Unit `pps`, Value `1000` | `dominant_src_port = 11211` |
+| SSDP | Decoder `udp`, Unit `pps`, Value `5000` | `dominant_src_port = 1900` |
+| CLDAP | Decoder `udp`, Unit `pps`, Value `2000` | `dominant_src_port = 389` |
+| Chargen | Decoder `udp`, Unit `pps`, Value `1000` | `dominant_src_port = 19` |
+
+**Response actions:** For precisely identified reflection sources (external services that shouldn't be talking to your infrastructure), `drop` is safe. For cases where your servers might legitimately receive traffic from these ports (e.g., you run a DNS server), use `rate_limit` instead.
+
+**Example YAML:**
+```yaml
+threshold_template:
+  decoder: udp
+  unit: pps
+  value: 10000
+precondition:
+  - { attribute: dominant_src_port, operator: eq, value: "53" }
+actions:
+  - action_type: xdrop
+    xdrop_action: drop
+    xdrop_fields: [dst_ip, src_port]
+```
+
+### 8.2.2 Stateless ACK / RST / FIN Floods (v1.3)
+
+**Symptoms:** Waves of TCP ACK, RST, or FIN packets without prior SYN context. Bypasses simple SYN-flood defenses.
+
+**Setup:** v1.3 adds dedicated decoders — no precondition gymnastics needed:
+
+| Attack | Template Rule |
+|---|---|
+| Stateless ACK flood | Decoder `tcp_ack`, Unit `pps`, Value `100000` |
+| RST flood | Decoder `tcp_rst`, Unit `pps`, Value `50000` |
+| FIN flood / scan | Decoder `tcp_fin`, Unit `pps`, Value `10000` |
+
+xSight counts these independently of `tcp_syn` — a packet with `SYN+ACK` only increments `tcp` (not `tcp_syn` or `tcp_ack`), so the per-flag counters reflect true attack intent.
+
+### 8.2.3 Non-TCP/UDP/ICMP Protocol Floods (v1.3)
+
+**Symptoms:** GRE, ESP, or IGMP flood traffic volumes. These protocols have legitimate uses but can be weaponized for reflection or bandwidth exhaustion.
 
 **Setup:**
-1. **Template rule:** Decoder `tcp_syn`, Unit `pps`, Value `1000000`.
-2. **xDrop action** with Dst IP filter field checked.
 
-**Result:** When the attack decoder is `tcp_syn`, xSight automatically injects `protocol: tcp` and `tcp_flags: SYN,!ACK` into the xDrop rule. No manual flag configuration needed.
+| Attack | Template Rule |
+|---|---|
+| GRE flood | Decoder `gre`, Unit `pps`, Value `10000` |
+| ESP flood | Decoder `esp`, Unit `pps`, Value `5000` |
+| IGMP flood | Decoder `igmp`, Unit `pps`, Value `1000` |
+| Other IP protocol flood | Decoder `ip_other`, Unit `pps`, Value `1000` |
+
+Because xDrop's L4 filter matches on `protocol`, use `protocol=all` + precondition to catch these at the dataplane (or prefer BGP null-route for true floods of obscure protocols).
+
+### 8.2.4 Malformed / Anomalous Packets (v1.3 — `bad_fragment`, `invalid`)
+
+**Symptoms:** Attackers craft packets with illegal header combinations or exploit fragmentation mechanics. Examples: Ping of Death (oversized fragment reassembly), tiny fragment (first fragment too small to hold L4 header — used for IDS evasion), malformed IHL/doff.
+
+**Setup:** v1.3 adds two stateless anomaly decoders that count without tracking flow state:
+
+| Attack | Template Rule |
+|---|---|
+| Ping of Death + tiny fragment | Decoder `bad_fragment`, Unit `pps`, Value `100` |
+| Malformed IP/TCP headers (IHL<5 / doff<5 / total_length < header size) | Decoder `invalid`, Unit `pps`, Value `50` |
+
+**What these decoders detect (inspected in BPF, stateless):**
+
+| Decoder | Triggers on |
+|---|---|
+| `bad_fragment` | Offset×8 + payload > 65535 (PoD); first fragment (MF=1, offset=0) with payload < 20B for TCP or < 8B for UDP (tiny fragment) |
+| `invalid` | IP IHL < 5; IP total_length < IHL×4; TCP data offset < 5 |
+
+**Note: flag anomalies (NULL/XMAS/SYN+FIN/SYN+RST) are NOT in `invalid`** — express these via xdrop standing rules with `tcp_flags` match instead (e.g., rule with `tcp_flags: "SYN,FIN"` to drop SYN+FIN packets). Decoder's job is to count structurally malformed packets; flag combos are match targets, not count targets.
+
+**Relationship to existing `fragment` decoder:**
+- `fragment` = **any** IP fragmented packet (baseline, could be legitimate MTU-driven)
+- `bad_fragment` = fragmented packet with **attack-signature characteristics** (PoD or tiny frag)
+- A single bad-fragment packet increments **both** `fragment` **and** `bad_fragment` — useful ratio signal
+
+Teardrop-style overlap detection is intentionally out of scope for v1.3 (requires stateful per-flow tracking).
 
 ### 8.3 Carpet Bombing (Subnet Attack)
 

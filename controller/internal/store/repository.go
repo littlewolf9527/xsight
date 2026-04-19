@@ -522,9 +522,15 @@ type TimeseriesPoint struct {
 	TCPSynPPS int32     `json:"tcp_syn_pps"`
 	UDPPPS    int32     `json:"udp_pps"`
 	ICMPPPS   int32     `json:"icmp_pps"`
+	FragPPS   int32     `json:"frag_pps,omitempty"`
 	TCPBPS    int64     `json:"tcp_bps"`
 	UDPBPS    int64     `json:"udp_bps"`
 	ICMPBPS   int64     `json:"icmp_bps"`
+	FragBPS   int64     `json:"frag_bps,omitempty"`
+	// v1.3 Phase 1a: extra decoders (index >= StandardCount) live in JSONB.
+	// Only populated when the DB row has non-NULL values. Key = decoder.Names[i].
+	ExtraDecoderPPS map[string]int32 `json:"extra_decoder_pps,omitempty"`
+	ExtraDecoderBPS map[string]int64 `json:"extra_decoder_bps,omitempty"`
 }
 
 // P95Result holds percentile-95 values for a (node, prefix) pair.
