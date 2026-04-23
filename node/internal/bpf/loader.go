@@ -4,6 +4,8 @@
 package bpf
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -17,6 +19,72 @@ import (
 
 // PinBasePath is the base directory for BPF pin persistence.
 const PinBasePath = "/sys/fs/bpf/xsight"
+
+// bpfHashStateDir is where per-interface BPF hash stamps live. NOT under
+// /sys/fs/bpf/ — bpffs rejects regular-file creation with EPERM. /run is
+// a tmpfs that survives systemctl restart but clears on reboot, which is
+// exactly the lifecycle we want: BPF map pins also clear on reboot, so a
+// fresh boot needs no hash stamp (first Load just writes it).
+const bpfHashStateDir = "/run/xsight/bpf-hashes"
+
+// bpfHashFilePath returns the per-interface hash stamp path. The filename
+// is just the iface name — keep it flat so an operator tailing /run/xsight
+// can eyeball all stamps at once.
+func bpfHashFilePath(iface string) string {
+	return filepath.Join(bpfHashStateDir, iface+".sha256")
+}
+
+// currentBPFHash returns the SHA-256 of the embedded BPF ELF as a hex string.
+// Cheap enough to recompute each Load; cached not worth it.
+func currentBPFHash() string {
+	sum := sha256.Sum256(_XsightBytes)
+	return hex.EncodeToString(sum[:])
+}
+
+// readBPFHash returns the hash previously written for this iface, or empty
+// string if no stamp exists (first-boot case or /run cleared).
+func readBPFHash(iface string) string {
+	b, err := os.ReadFile(bpfHashFilePath(iface))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// writeBPFHash stamps the current BPF hash for this iface. Called after a
+// successful Load so subsequent restarts can compare. Creates the state
+// dir if missing. Failure is logged but non-fatal — the hash check just
+// degrades to "always rebuild never triggers", same behavior as pre-v1.3.4.
+func writeBPFHash(iface, hash string) {
+	if err := os.MkdirAll(bpfHashStateDir, 0700); err != nil {
+		log.Printf("warning: mkdir %s: %v", bpfHashStateDir, err)
+		return
+	}
+	p := bpfHashFilePath(iface)
+	if err := os.WriteFile(p, []byte(hash), 0600); err != nil {
+		log.Printf("warning: write %s: %v", p, err)
+	}
+}
+
+// detachPinnedXDP removes the pinned XDP link if present, which releases the
+// kernel's reference to the old program on the iface. Called during forced
+// rebuild so the stale program stops running before new maps are created.
+// Errors are logged but not fatal — if no pinned link exists, that's fine.
+func detachPinnedXDP(pinPath string) {
+	linkPinPath := filepath.Join(pinPath, "link")
+	oldLink, err := link.LoadPinnedLink(linkPinPath, nil)
+	if err != nil {
+		// No pinned link or unreadable — AttachXDP's own cleanup will retry.
+		return
+	}
+	if err := oldLink.Unpin(); err != nil {
+		log.Printf("forced rebuild: unpin old XDP link: %v", err)
+	}
+	if err := oldLink.Close(); err != nil {
+		log.Printf("forced rebuild: close old XDP link: %v", err)
+	}
+	_ = os.Remove(linkPinPath)
+}
 
 // XDPAttachment holds a single interface's XDP link and program reference.
 type XDPAttachment struct {
@@ -69,6 +137,27 @@ func Load(ifaceName string, maxEntries uint32) (*Manager, error) {
 		return nil, fmt.Errorf("create pin dir %s: %w", pinPath, err)
 	}
 
+	// BPF hash check (v1.3.4): if the embedded BPF ELF differs from what the
+	// existing pins were created with, those pinned maps + link reference a
+	// stale program. Force a clean rebuild so new bytecode actually takes
+	// effect on restart (previously required manual rm -rf + xdp off).
+	newHash := currentBPFHash()
+	pinnedHash := readBPFHash(ifaceName)
+	hashMismatch := pinnedHash != "" && pinnedHash != newHash
+	if hashMismatch {
+		log.Printf("BPF ELF hash changed (old=%s… new=%s…), forcing clean rebuild on %s",
+			shortHash(pinnedHash), shortHash(newHash), ifaceName)
+		// Detach pinned XDP link first so the stale program stops running
+		// before we drop its maps. Safe to call even if no link is pinned.
+		detachPinnedXDP(pinPath)
+		if rmErr := os.RemoveAll(pinPath); rmErr != nil {
+			log.Printf("forced rebuild: remove pin dir: %v", rmErr)
+		}
+		if mkErr := os.MkdirAll(pinPath, 0700); mkErr != nil {
+			return nil, fmt.Errorf("forced rebuild: recreate pin dir: %w", mkErr)
+		}
+	}
+
 	recovered := false
 	err := loadPinned(objs, pinPath, maxEntries)
 	if err != nil {
@@ -87,15 +176,36 @@ func Load(ifaceName string, maxEntries uint32) (*Manager, error) {
 		return nil, fmt.Errorf("load BPF objects: %w", err)
 	}
 
-	// Check if we recovered from existing pins
+	// Check if we recovered from existing pins (skipped on hash-mismatch
+	// rebuild — those pins were just created, Recovered=false is correct).
 	var gs GlobalStats
 	key := uint32(0)
-	if lookErr := objs.GlobalStats.Lookup(&key, &gs); lookErr == nil && gs.TotalPkts > 0 {
-		recovered = true
-		log.Printf("pin recovery: hot restored (total_pkts=%d)", gs.TotalPkts)
+	if !hashMismatch {
+		if lookErr := objs.GlobalStats.Lookup(&key, &gs); lookErr == nil && gs.TotalPkts > 0 {
+			recovered = true
+			log.Printf("pin recovery: hot restored (total_pkts=%d)", gs.TotalPkts)
+		}
 	}
 
+	// Stamp the hash so next restart can compare. Writing AFTER successful
+	// load is intentional: a failed load must not stamp a hash that claims
+	// the pins match the new bytecode.
+	writeBPFHash(ifaceName, newHash)
+
 	return &Manager{Objs: objs, PinPath: pinPath, Recovered: recovered}, nil
+}
+
+// shortHash returns the first 8 chars of a hex hash for log readability.
+// Empty input returns "(none)" so "old=(none)" reads cleanly in the "first
+// boot after upgrade" log line.
+func shortHash(h string) string {
+	if h == "" {
+		return "(none)"
+	}
+	if len(h) > 8 {
+		return h[:8]
+	}
+	return h
 }
 
 // loadPinned loads BPF objects with PinByName enabled on all maps.

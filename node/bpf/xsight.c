@@ -433,20 +433,46 @@ int xsight_main(struct xdp_md *ctx)
         return XDP_DROP;
 
     __u16 eth_type = bpf_ntohs(eth->h_proto);
-
-    // ARP pass-through
-    if (eth_type == ETH_P_ARP)
-        return XDP_PASS;
-
     void *l3_hdr = (void *)(eth + 1);
 
-    // Handle 802.1Q VLAN (single tag)
+    // Handle 802.1Q VLAN (single tag) FIRST so ARP/NDP pass-through below
+    // covers both untagged and single-VLAN-tagged mirror setups. Codex
+    // v1.3.4 audit P1: placing the pass-through before the VLAN decap left
+    // tagged ARP/NDP stranded, so any Juniper mirror on a tagged subint
+    // would silently stop forwarding after neighbor-cache TTL.
     if (eth_type == ETH_P_8021Q) {
         struct vlan_hdr *vhdr = l3_hdr;
         if ((void *)(vhdr + 1) > data_end)
             return XDP_DROP;
         eth_type = bpf_ntohs(vhdr->h_vlan_encapsulated_proto);
         l3_hdr   = (void *)(vhdr + 1);
+    }
+
+    // ARP pass-through — upstream router (e.g., Juniper port-mirroring with
+    // `next-hop`) needs to resolve node interface MAC via ARP to rewrite DMAC
+    // on mirrored frames. Without this, mirror traffic stops after ARP cache
+    // TTL expiry (~20min on Juniper). See node-development-plan.md §链路层保活例外.
+    if (eth_type == ETH_P_ARP)
+        return XDP_PASS;
+
+    // IPv6 NDP pass-through — symmetric with ARP above, for IPv6 mirror
+    // setups. Upstream uses ICMPv6 NS/NA (RFC 4861) instead of ARP to resolve
+    // node MAC when mirror next-hop is an IPv6 address. Without this, any
+    // Juniper `family inet6` mirror config would see zero traffic after
+    // initial NDP cache expiry. Passes RS(133)/RA(134)/NS(135)/NA(136)/
+    // Redirect(137). Missed when v1.3 added IPv6 parse support; moved
+    // below the VLAN decap in v1.3.4 so tagged mirrors work too.
+    if (eth_type == ETH_P_IPV6) {
+        struct ipv6hdr *ip6 = l3_hdr;
+        if ((void *)(ip6 + 1) <= data_end &&
+            ip6->nexthdr == IPPROTO_ICMPV6) {
+            void *icmp6 = (void *)(ip6 + 1);
+            if (icmp6 + 1 <= data_end) {
+                __u8 icmp6_type = *(__u8 *)icmp6;
+                if (icmp6_type >= 133 && icmp6_type <= 137)
+                    return XDP_PASS;
+            }
+        }
     }
 
     // ② ERSPAN mode: detect GRE encapsulation → decap to inner frame
