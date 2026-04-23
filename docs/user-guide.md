@@ -289,7 +289,7 @@ Click **+ Add Rule** in the template detail to create a rule. Each rule defines 
 |-----------|---------|-------------|
 | Domain | `internal_ip` / `subnet` | `internal_ip`: per-host detection (attack reported as /32 or /128). `subnet`: aggregate detection for the entire prefix. |
 | Direction | `Receives (Inbound)` / `Sends (Outbound)` | `Receives` for inbound DDoS. `Sends` for outbound attack/scan detection. |
-| Decoder | `ip` / `tcp` / `tcp_syn` / `udp` / `icmp` / `fragment` | Protocol filter. `ip` matches all. `tcp_syn` matches SYN-only TCP packets. |
+| Decoder | `ip` / `tcp` / `tcp_syn` / `tcp_ack` / `tcp_rst` / `tcp_fin` / `udp` / `icmp` / `fragment` / `gre` / `esp` / `igmp` / `ip_other` / `bad_fragment` / `invalid` | Protocol filter. `ip` matches all IP traffic (aggregate). TCP-flag decoders (`tcp_syn`/`tcp_ack`/`tcp_rst`/`tcp_fin`) count only packets with those specific flag combinations. `bad_fragment` and `invalid` detect malformed/anomalous packets stateless at BPF. |
 | Unit | `pps` / `bps` / `pct (%)` | Packets per second, bits per second, or percentage of total. |
 | Comparison | `Over` / `Under` | Trigger when traffic exceeds (Over) or drops below (Under) the threshold. |
 | Value | number | Threshold value. |
@@ -374,7 +374,7 @@ Click **+ Add Action** in either section. The Action Editor dialog has these fie
 | Target Nodes | Which xDrop connectors to target (empty = all) |
 | Unblock Delay (min) | Minutes to wait before removing the rule after attack expires (0-1440) |
 
-> **xDrop decoder scope (v1.2.1):** xDrop actions only run for attacks whose decoder is one of `tcp`, `tcp_syn`, `udp`, `icmp`, or `fragment`. Attacks with decoder `ip` (L3 aggregate) are skipped — use a BGP action for those. The skip is recorded in the action log with `skip_reason=decoder_not_xdrop_compatible`.
+> **xDrop decoder scope (v1.3.3):** xDrop actions run for attacks whose decoder is one of `tcp`, `tcp_syn`, `tcp_ack`, `tcp_rst`, `tcp_fin`, `udp`, `icmp`, `fragment`, `gre`, `esp`, `igmp`, `bad_fragment`, or `invalid` (13 decoders). Attacks with decoder `ip` or `ip_other` (L3 aggregates) are skipped — use a BGP action for those (`skip_reason=decoder_not_xdrop_compatible`). Anomaly decoders (`bad_fragment`, `invalid`) only support `action=drop`; pairing them with `rate_limit` is skipped (`skip_reason=xdrop_anomaly_requires_drop`).
 
 **BGP-specific fields:**
 

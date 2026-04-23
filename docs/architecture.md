@@ -298,7 +298,7 @@ The engine iterates over the response's actions, sorted by `(trigger_phase, prio
 3. **Run mode**: `once` (fire once per attack), `periodic` (fire every N seconds while active), `retry_until_success`.
 4. **Precondition evaluation**: Each action can have preconditions that filter by attributes such as `decoder`, `severity`, `domain`, `carpet_bomb` (alias for `domain eq subnet`), `cidr`, `node`, `pps`, `bps`, `attack_type`, dominant ports, unique source IPs. All conditions use AND logic — every condition must be satisfied.
 5. **First-match ACL**: For non-webhook types (xDrop, BGP, Shell), only the first matching action per type executes. Webhook actions all execute (multi-channel notification).
-6. **xDrop decoder gate (v1.2.1)**: After the first-match mark, if `action_type=xdrop` and the attack's `decoder_family` is not in the xDrop-compatible whitelist (`tcp`, `tcp_syn`, `udp`, `icmp`, `fragment`), the action is skipped with `skip_reason=decoder_not_xdrop_compatible`. The `ip` decoder is intentionally excluded — it is an L3 aggregate and would degrade to a full-prefix blackhole. Operators should use BGP null-route for L3-aggregate attacks.
+6. **xDrop decoder gate (v1.3.3)**: After the first-match mark, if `action_type=xdrop` and the attack's `decoder_family` is not in the xDrop-compatible set, the action is skipped with `skip_reason=decoder_not_xdrop_compatible`. Compatible decoders: `tcp`, `tcp_syn`, `tcp_ack`, `tcp_rst`, `tcp_fin`, `udp`, `icmp`, `fragment`, `gre`, `esp`, `igmp`, `bad_fragment`, `invalid` (13 total). Excluded: `ip` and `ip_other` (L3 aggregates — use BGP null-route instead). Anomaly decoders (`bad_fragment`, `invalid`) additionally require `action=drop`; pairing them with `rate_limit` is skipped with `skip_reason=xdrop_anomaly_requires_drop`.
 7. **Execution**: The action is dispatched to the appropriate handler (webhook POST, shell exec, xDrop API call, vtysh command).
 
 All skip outcomes are recorded in `action_execution_log` with `status=skipped` and a structured `skip_reason` column. The `xsight_action_skip_total{skip_reason}` Prometheus counter mirrors each log entry so operators can rate-monitor skips without pulling log rows.
@@ -307,8 +307,12 @@ All skip outcomes are recorded in `action_execution_log` with `status=skipped` a
 
 - **on_detected** (filter_l4 / rate_limit): POST to xDrop API with the rule payload. The response's `rule_id` is stored as `external_rule_id` in the execution log.
 - **on_expired** (unblock): Looks up all `external_rule_id` entries from on_detected logs for this attack and DELETEs each rule from the xDrop API. Each successfully deleted rule gets its own execution log entry.
-- **tcp_syn auto-injection**: When the attack decoder is `tcp_syn`, the engine automatically adds `protocol: tcp` and `tcp_flags: SYN,!ACK` to the xDrop rule payload.
-- **Custom payload**: Supports dynamic variable expansion — `{ip}`, `{dominant_src_port}`, `{dominant_dst_port}`, etc. Variables are resolved at execution time from the attack record and flow analysis data.
+- **Decoder-specific dispatch (v1.3.3)**: xSight selects the xDrop dispatch path based on decoder family:
+  - *TCP-flag family* (`tcp_syn`/`tcp_ack`/`tcp_rst`/`tcp_fin`): `protocol=tcp` + canonical `tcp_flags` pattern (`SYN,!ACK` / `ACK,!SYN` / `RST` / `FIN`).
+  - *Other IP protocols* (`gre`/`esp`/`igmp`): `protocol=<decoder>` set to IANA name; port fields are wildcards.
+  - *Anomaly family* (`bad_fragment`/`invalid`): `decoder` field set (xdrop translates to `match_anomaly` bitmap); protocol stays wildcard; `rate_limit` action rejected.
+  - *Standard* (`tcp`/`udp`/`icmp`/`fragment`): legacy path unchanged.
+- **Custom payload**: Supports dynamic variable expansion — `{dst_ip}`, `{dominant_src_port}`, `{dominant_dst_port}`, `{peak_pps}`, etc. Variables are resolved at execution time from the attack record and flow analysis data. Custom payloads also go through the normalization pipeline (protocol enum rewrite + tcp_flags auto-injection + anomaly decoder field).
 
 ### BGP Execution (Wanguard-Style Shared Announcement)
 
@@ -337,7 +341,7 @@ v1.2 treats a BGP announcement as a **refcounted resource keyed on `(prefix, rou
 - **on_detected** (filter_l4 / rate_limit): POST to xDrop API. The returned `rule_id` is stored as `external_rule_id` in `action_execution_log` and in a new row in `xdrop_active_rules` (v1.2 authoritative state table, see Section 6).
 - **on_expired** (unblock): Looks up all `xdrop_active_rules` rows for this attack and DELETEs each rule via the xDrop API. Each successful removal stamps `withdrawn_at` on the rule row and writes a per-artifact log entry.
 - **tcp_syn auto-injection**: When the attack decoder is `tcp_syn`, the engine automatically adds `protocol: tcp` and `tcp_flags: SYN,!ACK` to the xDrop rule payload.
-- **Protocol normalization (v1.2.1)**: xDrop accepts the enum `{all, tcp, udp, icmp, icmpv6}` for its `protocol` field. xSight normalizes `tcp_syn → tcp` and `fragment → all` at payload-emit time. The `ip` decoder is filtered out earlier by the decoder compatibility gate (see Action Dispatch step 6).
+- **Protocol normalization (v1.3.3)**: xDrop accepts `{all, tcp, udp, icmp, icmpv6, gre, esp, igmp}` for its `protocol` field. xSight normalizes at payload-emit time: `tcp_syn/ack/rst/fin → tcp`, `fragment/ip → all`, anomaly decoders move to `decoder` field. The `ip`/`ip_other` decoders are filtered out earlier by the decoder compatibility gate (see Action Dispatch step 6).
 - **Custom payload**: Supports dynamic variable expansion — `{ip}`, `{dominant_src_port}`, `{dominant_dst_port}`, etc. Variables are resolved at execution time from the attack record and flow analysis data.
 
 ### Delayed Execution (Persisted)
@@ -497,18 +501,27 @@ The engine instruments its `store.Store` via a thin decorator (`metrics.Instrume
 
 ### xDrop Decoder Compatibility Gate
 
-xDrop operates at L4 (protocol + 5-tuple). Decoders that are L3 aggregates (`ip`) cannot be safely translated to an xDrop rule — the resulting `protocol=all` with a `dst_ip` match would degrade into a full-prefix blackhole once flow analysis for `dominant_src_port` / `dominant_dst_port` fails to narrow it. v1.2.1 therefore enforces a compatibility whitelist:
+xDrop operates at L4 (protocol + 5-tuple + anomaly bitmap). Decoders that are L3 aggregates (`ip`, `ip_other`) cannot be safely translated — the resulting `protocol=all` with a `dst_ip` match would degrade into a full-prefix blackhole. v1.3.3 enforces:
 
-| Decoder | xDrop-compatible | Rationale |
-|---------|------------------|-----------|
-| `tcp` | yes | Maps to `protocol=tcp` |
-| `tcp_syn` | yes | Maps to `protocol=tcp` + `tcp_flags=SYN,!ACK` |
-| `udp` | yes | Maps to `protocol=udp` |
-| `icmp` | yes | Maps to `protocol=icmp` (or `icmpv6`) |
-| `fragment` | yes | Normalized to `protocol=all`; fragmented traffic is a clear attack signal |
-| `ip` | **no** | L3 aggregate — use BGP null-route instead |
+| Decoder | xDrop-compatible | Dispatch path | Notes |
+|---------|-----------------|---------------|-------|
+| `tcp` | yes | `protocol=tcp` | |
+| `tcp_syn` | yes | `protocol=tcp` + `tcp_flags=SYN,!ACK` | |
+| `tcp_ack` | yes | `protocol=tcp` + `tcp_flags=ACK,!SYN` | v1.3 |
+| `tcp_rst` | yes | `protocol=tcp` + `tcp_flags=RST` | v1.3 |
+| `tcp_fin` | yes | `protocol=tcp` + `tcp_flags=FIN` | v1.3 |
+| `udp` | yes | `protocol=udp` | |
+| `icmp` | yes | `protocol=icmp` | |
+| `fragment` | yes | `protocol=all` | fragmented traffic is a clear attack signal |
+| `gre` | yes | `protocol=gre` | v1.3 |
+| `esp` | yes | `protocol=esp` | v1.3 |
+| `igmp` | yes | `protocol=igmp` | v1.3 |
+| `bad_fragment` | yes (drop only) | `decoder=bad_fragment` → match_anomaly bitmap | v1.3; rate_limit skipped |
+| `invalid` | yes (drop only) | `decoder=invalid` → match_anomaly bitmap | v1.3; rate_limit skipped |
+| `ip` | **no** | — | L3 aggregate — use BGP null-route |
+| `ip_other` | **no** | — | L3 catch-all — use BGP null-route |
 
-Attacks whose `decoder_family` is not in the whitelist have their xDrop actions skipped with `skip_reason=decoder_not_xdrop_compatible`. BGP / webhook / shell are unaffected.
+Incompatible decoders skip with `skip_reason=decoder_not_xdrop_compatible`. Anomaly + rate_limit skips with `skip_reason=xdrop_anomaly_requires_drop`. BGP / webhook / shell are unaffected by either gate.
 
 ---
 

@@ -260,7 +260,7 @@ Actions within a response policy. Each action has a type, trigger phase, and run
 | `bgp_route_map` | string | BGP only: **Required for on_detected.** Route-map name for blackhole injection |
 | `bgp_withdraw_delay_minutes` | int | BGP only: delay before withdrawing route after attack expires (0-1440). Effective delay across multiple sharing attacks is MAX per announce cycle — see [architecture.md § BGP Execution](../docs/architecture.md#bgp-execution-wanguard-style-shared-announcement) |
 
-> **xDrop decoder compatibility (v1.2.1):** xDrop actions are only dispatched for attacks whose decoder is in the L4-compatible whitelist (`tcp`, `tcp_syn`, `udp`, `icmp`, `fragment`). Attacks with decoder `ip` are skipped with `skip_reason=decoder_not_xdrop_compatible` — use a BGP action for L3-aggregate attacks.
+> **xDrop decoder compatibility (v1.3.3):** xDrop actions are dispatched for attacks whose decoder is one of `tcp`, `tcp_syn`, `tcp_ack`, `tcp_rst`, `tcp_fin`, `udp`, `icmp`, `fragment`, `gre`, `esp`, `igmp`, `bad_fragment`, `invalid`. Attacks with decoder `ip` or `ip_other` are skipped with `skip_reason=decoder_not_xdrop_compatible` — use a BGP action for L3-aggregate attacks. Anomaly decoders (`bad_fragment`/`invalid`) are drop-only; `rate_limit` is skipped with `skip_reason=xdrop_anomaly_requires_drop`.
 
 > **Auto-paired actions:** Creating an xDrop (`filter_l4`/`rate_limit`) or BGP `on_detected` action automatically creates a matching `on_expired` child action (`unblock` / withdraw). The child cannot be edited directly; edit the parent. Creating an `xdrop` or `bgp` action with `trigger_phase=on_expired` is rejected with HTTP 400.
 
