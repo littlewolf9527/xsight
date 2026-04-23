@@ -3,11 +3,48 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/littlewolf9527/xsight/controller/internal/store"
+	"github.com/littlewolf9527/xsight/shared/decoder"
 )
+
+// validThresholdDecoders returns the set of decoder_family values accepted by
+// the threshold API. Built from shared/decoder.Names (the canonical registry
+// kept in sync with BPF) plus the meta-decoder "ip" — an aggregate over all
+// IP traffic that has no dedicated decoder slot but IS a valid threshold
+// target (whole-prefix total-pps thresholds). Empty-string entries in the
+// registry (reserved slots 14-15) are skipped.
+//
+// Built at package init so adding a new decoder to the registry auto-extends
+// the whitelist (v1.3 shipped with a stale hardcoded list — see codex v1.3.x
+// audit).
+func validThresholdDecoders() map[string]bool {
+	set := map[string]bool{"ip": true}
+	for _, n := range decoder.Names {
+		if n != "" {
+			set[n] = true
+		}
+	}
+	return set
+}
+
+// validThresholdDecoderList returns a sorted, human-readable list of accepted
+// decoder values for error messages. "ip" is listed first as the conventional
+// aggregate default; remaining entries are sorted alphabetically.
+func validThresholdDecoderList() string {
+	names := make([]string, 0)
+	for _, n := range decoder.Names {
+		if n != "" {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	return "ip, " + strings.Join(names, ", ")
+}
 
 func listThresholds(deps Dependencies) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -112,12 +149,9 @@ func updateThreshold(deps Dependencies) gin.HandlerFunc {
 
 // validateThreshold checks semantic constraints on threshold rules.
 func validateThreshold(t *store.Threshold) error {
-	// Decoder: must be a valid decoder family
-	validDecoders := map[string]bool{
-		"ip": true, "tcp": true, "tcp_syn": true, "udp": true, "icmp": true, "fragment": true,
-	}
-	if t.Decoder != "" && !validDecoders[t.Decoder] {
-		return fmt.Errorf("decoder must be one of: ip, tcp, tcp_syn, udp, icmp, fragment; got %q", t.Decoder)
+	// Decoder: must be a valid decoder family (dynamic from shared/decoder.Names + "ip").
+	if t.Decoder != "" && !validThresholdDecoders()[t.Decoder] {
+		return fmt.Errorf("decoder must be one of: %s; got %q", validThresholdDecoderList(), t.Decoder)
 	}
 	// Direction: must be receives or sends
 	if t.Direction != "" && t.Direction != "receives" && t.Direction != "sends" {

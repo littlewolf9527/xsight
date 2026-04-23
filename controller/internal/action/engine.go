@@ -30,11 +30,21 @@ const (
 	SkipReasonManualOverride         = "manual_override"
 	SkipReasonAlreadyExecuted        = "already_executed"
 	// SkipReasonDecoderNotSupported: attack's decoder_family is an L3
-	// aggregate (e.g. `ip`) that has no clean mapping to xDrop's L4 filter
-	// semantics. xDrop is gated at dispatch for these decoders to avoid
-	// silent broadening (protocol=all + absent src_port ⇒ full-prefix
+	// aggregate (e.g. `ip`, `ip_other`) that has no clean mapping to xDrop's
+	// L4 filter semantics. xDrop is gated at dispatch for these decoders to
+	// avoid silent broadening (protocol=all + absent src_port ⇒ full-prefix
 	// blackhole). Operators should mitigate L3 aggregates via BGP instead.
 	SkipReasonDecoderNotSupported = "decoder_not_xdrop_compatible"
+	// SkipReasonXDropAnomalyRequiresDrop: anomaly decoders (bad_fragment,
+	// invalid) are drop-only in xdrop v2.6.1 — Controller 400-rejects
+	// action=rate_limit + anomaly because the BPF data-plane maps
+	// ACTION_RATE_LIMIT to XDP_DROP for anomaly rules (safety net against
+	// stale SQLite). Fail-fast at dispatch instead of sending the request
+	// and recording a confusing "failed" row. Operator remedy: switch the
+	// xdrop_action to "filter_l4" (drop) for this response, or use a
+	// non-anomaly decoder. See xdrop v2.6.1-deploy-summary.md "已知限制 #4"
+	// and codex round 9 audit P1.1.
+	SkipReasonXDropAnomalyRequiresDrop = "xdrop_anomaly_requires_drop"
 )
 
 // writeSkipLog records a skip event in action_execution_log with structured
@@ -1034,6 +1044,18 @@ func (e *Engine) HandleEvent(event tracker.AttackEvent) {
 			writeSkipLog(ctx, e.store, event.DBID, act, resp.Name, "",
 				SkipReasonDecoderNotSupported,
 				fmt.Sprintf("decoder=%s is an L3 aggregate; xDrop is L4-only. Use BGP null-route for this attack class.",
+					attack.DecoderFamily))
+			continue
+		}
+		// xdrop v2.6.1 anomaly scope: anomaly decoders are drop-only. xdrop
+		// Controller would 400-reject rate_limit + anomaly; fail-fast here
+		// to avoid the wasted HTTP and a misleading "failed" row in
+		// xdrop_active_rules. Only the rate_limit branch is gated —
+		// filter_l4 (drop) and unblock paths pass through.
+		if act.ActionType == "xdrop" && isAnomalyDecoder(attack.DecoderFamily) && act.XDropAction == "rate_limit" {
+			writeSkipLog(ctx, e.store, event.DBID, act, resp.Name, "",
+				SkipReasonXDropAnomalyRequiresDrop,
+				fmt.Sprintf("decoder=%s + xdrop_action=rate_limit unsupported (xdrop v2.6.1 anomaly rules are drop-only). Switch xdrop_action to filter_l4.",
 					attack.DecoderFamily))
 			continue
 		}

@@ -78,6 +78,54 @@ func TestNormalizeXDropProtocol(t *testing.T) {
 			payload: `{"dst_ip":"192.0.2.0/24","protocol":"raw","action":"drop"}`,
 			want:    "raw",
 		},
+		// v1.3 TCP-flag family: all collapse to protocol=tcp (tcp_flags
+		// injected separately by injectTcpFlags).
+		{
+			name:    "tcp_ack decoder translates to tcp",
+			payload: `{"dst_ip":"192.0.2.0/24","protocol":"tcp_ack","action":"drop"}`,
+			want:    "tcp",
+		},
+		{
+			name:    "tcp_rst decoder translates to tcp",
+			payload: `{"dst_ip":"192.0.2.0/24","protocol":"tcp_rst","action":"drop"}`,
+			want:    "tcp",
+		},
+		{
+			name:    "tcp_fin decoder translates to tcp",
+			payload: `{"dst_ip":"192.0.2.0/24","protocol":"tcp_fin","action":"drop"}`,
+			want:    "tcp",
+		},
+		// v1.3 other IP protocols: accepted as-is by xdrop, no rewrite.
+		{
+			name:    "gre untouched (accepted by xdrop)",
+			payload: `{"dst_ip":"192.0.2.0/24","protocol":"gre","action":"drop"}`,
+			want:    "gre",
+		},
+		{
+			name:    "esp untouched",
+			payload: `{"dst_ip":"192.0.2.0/24","protocol":"esp","action":"drop"}`,
+			want:    "esp",
+		},
+		{
+			name:    "igmp untouched",
+			payload: `{"dst_ip":"192.0.2.0/24","protocol":"igmp","action":"drop"}`,
+			want:    "igmp",
+		},
+		// v1.3 anomaly family: {decoder}-expanded protocol gets moved to
+		// the `decoder` field (xdrop anomaly rules are proto-wildcard).
+		// The `want` here is empty because protocol is REMOVED; the
+		// TestNormalizeMovesAnomalyToDecoderField test below pins the
+		// decoder-field side.
+		{
+			name:    "bad_fragment decoder removed from protocol (moved to decoder field)",
+			payload: `{"dst_ip":"192.0.2.0/24","protocol":"bad_fragment","action":"drop"}`,
+			want:    "",
+		},
+		{
+			name:    "invalid decoder removed from protocol (moved to decoder field)",
+			payload: `{"dst_ip":"192.0.2.0/24","protocol":"invalid","action":"drop"}`,
+			want:    "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -93,6 +141,42 @@ func TestNormalizeXDropProtocol(t *testing.T) {
 			if proto != tt.want {
 				t.Errorf("protocol = %q, want %q (payload: %s → %s)",
 					proto, tt.want, tt.payload, string(got))
+			}
+		})
+	}
+}
+
+// TestNormalizeMovesAnomalyToDecoderField verifies the v1.3 behavior:
+// when a custom payload carries `protocol: bad_fragment|invalid` (e.g.
+// from {decoder} expansion), normalize MOVES the value to the xdrop
+// `decoder` field because anomaly rules are protocol-wildcard in xdrop
+// v2.6.1. Without this move xdrop would 400 the request.
+func TestNormalizeMovesAnomalyToDecoderField(t *testing.T) {
+	tests := []struct {
+		name        string
+		payload     string
+		wantDecoder string
+	}{
+		{"bad_fragment → decoder field", `{"dst_ip":"192.0.2.1","protocol":"bad_fragment","action":"drop"}`, "bad_fragment"},
+		{"invalid → decoder field", `{"dst_ip":"192.0.2.1","protocol":"invalid","action":"drop"}`, "invalid"},
+		{
+			"existing decoder field is preserved (no overwrite)",
+			`{"dst_ip":"192.0.2.1","protocol":"bad_fragment","decoder":"invalid","action":"drop"}`,
+			"invalid",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeXDropProtocol([]byte(tt.payload))
+			var m map[string]any
+			if err := json.Unmarshal(got, &m); err != nil {
+				t.Fatalf("result not valid JSON: %v", err)
+			}
+			if _, hasProto := m["protocol"]; hasProto {
+				t.Errorf("protocol field should be removed after anomaly rewrite; got %v", m["protocol"])
+			}
+			if m["decoder"] != tt.wantDecoder {
+				t.Errorf("decoder = %v, want %q", m["decoder"], tt.wantDecoder)
 			}
 		})
 	}

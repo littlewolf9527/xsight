@@ -462,6 +462,96 @@ func TestSkipReason_DecoderGateOrdering_WithFirstMatch(t *testing.T) {
 	_ = attack
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// S19 (v1.3.3): xdrop_anomaly_requires_drop — anomaly decoders (bad_fragment/
+// invalid) combined with xdrop_action=rate_limit are drop-only per xdrop
+// v2.6.1 (Controller 400-rejects rate_limit + anomaly; BPF data-plane maps
+// ACTION_RATE_LIMIT to XDP_DROP for anomaly rules). xSight fail-fasts at
+// dispatch to surface the mismatch with a specific skip_reason instead of
+// wasting an HTTP round-trip and recording a generic "failed" row.
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestSkipReason_XDropAnomalyRequiresDrop_BadFragmentRateLimit(t *testing.T) {
+	act := store.ResponseAction{
+		ID: 110, ActionType: "xdrop", XDropAction: "rate_limit",
+		TriggerPhase: "on_detected", RunMode: "once", Enabled: true,
+	}
+	ms, eng, attack := setupDispatchMock(t, "auto", []store.ResponseAction{act})
+	attack.DecoderFamily = "bad_fragment"
+
+	dispatch(eng, attack)
+
+	l := findSkipLog(ms, 110)
+	if l == nil {
+		t.Fatalf("expected skipped log for xdrop anomaly + rate_limit; got none: all=%+v", ms.actionExecLog.logs)
+	}
+	if l.SkipReason != action.SkipReasonXDropAnomalyRequiresDrop {
+		t.Errorf("skip_reason = %q, want %q", l.SkipReason, action.SkipReasonXDropAnomalyRequiresDrop)
+	}
+	if !strings.Contains(l.ErrorMessage, "bad_fragment") || !strings.Contains(l.ErrorMessage, "filter_l4") {
+		t.Errorf("error_message should name the decoder + suggest filter_l4; got %q", l.ErrorMessage)
+	}
+}
+
+func TestSkipReason_XDropAnomalyRequiresDrop_InvalidRateLimit(t *testing.T) {
+	act := store.ResponseAction{
+		ID: 111, ActionType: "xdrop", XDropAction: "rate_limit",
+		TriggerPhase: "on_detected", RunMode: "once", Enabled: true,
+	}
+	ms, eng, attack := setupDispatchMock(t, "auto", []store.ResponseAction{act})
+	attack.DecoderFamily = "invalid"
+
+	dispatch(eng, attack)
+
+	l := findSkipLog(ms, 111)
+	if l == nil {
+		t.Fatalf("expected skipped log for xdrop invalid + rate_limit; got none")
+	}
+	if l.SkipReason != action.SkipReasonXDropAnomalyRequiresDrop {
+		t.Errorf("skip_reason = %q, want %q", l.SkipReason, action.SkipReasonXDropAnomalyRequiresDrop)
+	}
+}
+
+// Positive control: anomaly + filter_l4 (drop) passes the gate. Only the
+// rate_limit branch is rejected; drop is the intended action for anomaly
+// decoders in xdrop v2.6.1.
+func TestSkipReason_XDropAnomalyRequiresDrop_BadFragmentFilterL4Allowed(t *testing.T) {
+	act := store.ResponseAction{
+		ID: 112, ActionType: "xdrop", XDropAction: "filter_l4",
+		TriggerPhase: "on_detected", RunMode: "once", Enabled: true,
+	}
+	ms, eng, attack := setupDispatchMock(t, "auto", []store.ResponseAction{act})
+	attack.DecoderFamily = "bad_fragment"
+
+	dispatch(eng, attack)
+
+	for _, l := range ms.actionExecLog.logs {
+		if l.ActionID == 112 && l.SkipReason == action.SkipReasonXDropAnomalyRequiresDrop {
+			t.Errorf("bad_fragment + filter_l4 should NOT be gated; got skip_reason=%q", l.SkipReason)
+		}
+	}
+}
+
+// Positive control: non-anomaly decoder + rate_limit passes the gate.
+// The gate is anomaly-specific — tcp/udp/icmp/etc. with rate_limit is
+// a legitimate configuration.
+func TestSkipReason_XDropAnomalyRequiresDrop_UDPRateLimitAllowed(t *testing.T) {
+	act := store.ResponseAction{
+		ID: 113, ActionType: "xdrop", XDropAction: "rate_limit",
+		TriggerPhase: "on_detected", RunMode: "once", Enabled: true,
+	}
+	ms, eng, attack := setupDispatchMock(t, "auto", []store.ResponseAction{act})
+	attack.DecoderFamily = "udp"
+
+	dispatch(eng, attack)
+
+	for _, l := range ms.actionExecLog.logs {
+		if l.ActionID == 113 && l.SkipReason == action.SkipReasonXDropAnomalyRequiresDrop {
+			t.Errorf("udp + rate_limit should NOT be gated; got skip_reason=%q", l.SkipReason)
+		}
+	}
+}
+
 // Control: BGP action with decoder=ip is NOT gated — the decoder
 // compatibility gate is xDrop-specific. BGP is the correct mitigation for
 // L3 aggregates; if BGP were also gated operators would have no response.

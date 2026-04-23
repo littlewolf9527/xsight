@@ -12,39 +12,66 @@ import (
 	"strings"
 	"time"
 
+	"github.com/littlewolf9527/xsight/controller/internal/metrics"
 	"github.com/littlewolf9527/xsight/controller/internal/store"
 )
 
 // xDropCompatibleDecoders is the set of xSight decoder_family values that
-// are allowed to produce xDrop rules. xDrop operates at L4 (filter on
-// protocol + src/dst ip/port + tcp_flags); decoders that map cleanly to
-// that model are included.
+// are allowed to produce xDrop rules. xDrop v2.6.1 supports three dispatch
+// paths on top of its 33-combo BPF lookup:
 //
-// Exclusion rationale:
-//   - `ip`: L3 aggregate meaning "any IP protocol". xDrop can only express
-//     this as `protocol=all`, which combined with absent flow-derived port
-//     fields (common when the attack source is diffuse) degrades into a
-//     full-prefix blackhole — silently broader than the operator usually
-//     intends. Aggregate L3 attacks should be mitigated by BGP null-route
-//     (which blackholes the whole prefix consciously).
+//   - Protocol + (optional) 5-tuple → L4 standard decoders (tcp/udp/icmp) +
+//     other IP protocols (gre/esp/igmp). fragment collapses to protocol=all.
+//   - Protocol=tcp + tcp_flags specialization → TCP flag family
+//     (tcp_syn/tcp_ack/tcp_rst/tcp_fin). tcp_flags is a single (mask,value)
+//     pair; each decoder has a canonical pattern (see tcpFlagDecoderMap).
+//   - decoder field → anomaly family (bad_fragment/invalid). xdrop
+//     Controller translates to match_anomaly bitmap internally; protocol
+//     is wildcard. See xdrop docs/v2.6.1-deploy-summary.md.
 //
-// Inclusion rationale (why `fragment` is here): fragment floods are a
-// clear attack signal by construction; dropping broadly at the xDrop
-// layer is an acceptable response. fragment → `all` in the xDrop payload
-// is a semantic downgrade but not a silent one because operators who
-// configure a fragment-decoder threshold have already accepted the
-// aggressive drop intent.
+// Exclusions:
+//
+//   - `ip`: L3 aggregate "any IP protocol". xDrop can only express this
+//     as protocol=all, which combined with absent flow-derived port fields
+//     (common when source is diffuse) degrades into a silent full-prefix
+//     blackhole. Use BGP null-route for L3 aggregates.
+//   - `ip_other`: operator-declared "none of tcp/udp/icmp/fragment/gre/
+//     esp/igmp" — collapses to a useless full-wildcard xDrop rule with no
+//     meaningful 5-tuple constraint. BGP null-route is the correct layer.
+//
+// fragment inclusion rationale: fragment floods are a clear attack signal
+// by construction; dropping broadly at the xDrop layer is an acceptable
+// response. fragment → `all` in the xDrop payload is a semantic downgrade
+// but not a silent one because operators who configure a fragment-decoder
+// threshold have already accepted the aggressive drop intent.
 //
 // Maintenance: to extend support to a new decoder, update this map + the
-// protocol mapping in decoderToXDropProtocol + UI help text + roadmap
+// protocol mapping in decoderToXDropProtocol (or isAnomalyDecoder if the
+// decoder goes through xdrop's `decoder` field) + UI help text + roadmap
 // compatibility matrix.
 var xDropCompatibleDecoders = map[string]bool{
+	// L4 standard
 	"tcp":      true,
 	"tcp_syn":  true,
 	"udp":      true,
 	"icmp":     true,
 	"fragment": true,
-	// "ip" intentionally excluded — use BGP null-route for L3 aggregate.
+	// TCP flag family (v1.3) — protocol=tcp + tcp_flags specialization
+	"tcp_ack": true,
+	"tcp_rst": true,
+	"tcp_fin": true,
+	// Other IP protocols (v1.3) — xdrop proto-agnostic lookup matches on
+	// IANA number; tcp_flags / ports degrade to wildcards.
+	"gre":  true,
+	"esp":  true,
+	"igmp": true,
+	// Anomaly family (v1.3 / xdrop v2.6.1) — dispatched via `decoder`
+	// field, translated to match_anomaly bitmap by xdrop Controller.
+	// Drop-only: xdrop 400-rejects rate_limit + anomaly (see
+	// SkipReasonXDropAnomalyRequiresDrop engine.go gate).
+	"bad_fragment": true,
+	"invalid":      true,
+	// "ip" / "ip_other" intentionally excluded — see doc comment above.
 }
 
 // IsXDropCompatibleDecoder reports whether an attack with the given
@@ -53,6 +80,145 @@ var xDropCompatibleDecoders = map[string]bool{
 // into xdrop.go internals.
 func IsXDropCompatibleDecoder(decoder string) bool {
 	return xDropCompatibleDecoders[decoder]
+}
+
+// isAnomalyRateLimitBody reports whether a final xdrop request body would
+// violate xdrop v2.6.1's anomaly-drop-only contract. True when the attack
+// decoder is anomaly (bad_fragment/invalid) AND the payload's top-level
+// `action` field is "rate_limit". Used by the late dispatch gate in
+// executeXDrop to catch custom payloads that set action=rate_limit even
+// when act.XDropAction=filter_l4. See codex v1.3.x audit P2.
+//
+// Malformed / unparseable bodies return false (non-JSON or JSON without
+// an `action` string) — those paths are handled by the downstream
+// rate_limit sanity check, which still fires and fails the dispatch.
+func isAnomalyRateLimitBody(body []byte, decoder string) bool {
+	if !isAnomalyDecoder(decoder) {
+		return false
+	}
+	var check map[string]any
+	if json.Unmarshal(body, &check) != nil {
+		return false
+	}
+	a, _ := check["action"].(string)
+	return a == "rate_limit"
+}
+
+// isAnomalyDecoder reports whether the decoder is an xdrop v2.6.1 anomaly
+// family member. Anomaly decoders have distinct dispatch semantics:
+//   - routed through xdrop's `decoder` field (not protocol)
+//   - translated to match_anomaly bitmap by xdrop Controller
+//   - drop-only (xdrop 400-rejects action=rate_limit + anomaly)
+//   - IPv6 bad_fragment rejected by xdrop (scope guard, v1.3 limitation);
+//     invalid allowed on both IPv4 and IPv6
+//
+// Used both by the default payload builder (to set Decoder field instead
+// of Protocol) and by the engine dispatch gate (to fail-fast on
+// action=rate_limit combos).
+func isAnomalyDecoder(decoder string) bool {
+	return decoder == "bad_fragment" || decoder == "invalid"
+}
+
+// tcpFlagDecoderMap maps TCP-flag family decoders to their canonical
+// tcp_flags pattern. Patterns chosen to minimize false positives:
+//   tcp_syn → "SYN,!ACK": pure SYN (handshake opener), excludes SYN+ACK
+//   tcp_ack → "ACK,!SYN": ACK-flood / established traffic, excludes handshake
+//   tcp_rst → "RST":       connection reset flood
+//   tcp_fin → "FIN":       half-open close flood
+//
+// Used by both the default payload builder and injectTcpFlags (custom
+// payload path).
+var tcpFlagDecoderMap = map[string]string{
+	"tcp_syn": "SYN,!ACK",
+	"tcp_ack": "ACK,!SYN",
+	"tcp_rst": "RST",
+	"tcp_fin": "FIN",
+}
+
+// specializeXDropDecoder mutates payload in place to add the fields that
+// depend on the attack's decoder_family, per the three xdrop dispatch
+// paths described on xDropCompatibleDecoders:
+//
+//   Anomaly (bad_fragment/invalid): set `decoder` field; xdrop Controller
+//     translates to match_anomaly bitmap. Protocol stays wildcard.
+//   TCP-flag family (tcp_syn/tcp_ack/tcp_rst/tcp_fin): protocol=tcp +
+//     canonical tcp_flags pattern from tcpFlagDecoderMap.
+//   Other IP protocols (gre/esp/igmp): set protocol only.
+//   tcp / udp / icmp / fragment / unknown: leave untouched. xdrop accepts
+//     an absent protocol as wildcard which is fine when dst_ip is set;
+//     keeping these branches empty preserves v1.2 behavior.
+//
+// Called by the default payload builder in executeXDrop. Exported
+// (lowercase within-package) so xdrop_flags_test.go can exercise the
+// switch directly without duplicating the logic.
+func specializeXDropDecoder(payload *xdropRuleRequest, decoder string) {
+	switch {
+	case isAnomalyDecoder(decoder):
+		payload.Decoder = decoder
+	case tcpFlagDecoderMap[decoder] != "":
+		payload.Protocol = "tcp"
+		flags := tcpFlagDecoderMap[decoder]
+		payload.TcpFlags = &flags
+	case decoder == "gre", decoder == "esp", decoder == "igmp":
+		payload.Protocol = decoder
+	}
+}
+
+// specializeXDropDecoderBody is the custom-payload counterpart of
+// specializeXDropDecoder. Auto-fills dispatch-specific fields in an
+// already-expanded custom payload body if the operator didn't specify
+// them — parallel to how injectTcpFlags auto-fills tcp_flags for TCP-flag-
+// family attacks. Runs AFTER normalizeXDropProtocol + injectTcpFlags
+// so it observes the final payload shape.
+//
+// Rules (idempotent, operator-supplied fields preserved):
+//
+//   anomaly attack (bad_fragment/invalid) + `decoder` absent → inject
+//     decoder=<family>. Also strips `protocol` if it still holds the
+//     anomaly decoder name (defense-in-depth; normalize usually clears
+//     this but a bare `"protocol":"bad_fragment"` in a payload that
+//     skipped normalize — e.g. via a future test harness — would still
+//     land here).
+//   gre/esp/igmp attack + `protocol` absent → inject protocol=<family>.
+//   TCP-flag family: handled by injectTcpFlags already — pass-through.
+//   tcp/udp/icmp/fragment: no auto-fill (operator-authored custom
+//     payloads are the spec; absent fields mean wildcard which is the
+//     operator's prerogative, preserves v1.2 behavior).
+//
+// Without this function, gre/esp/igmp custom payloads that omit protocol
+// would dispatch as wildcard rules (silent semantic downgrade), and
+// anomaly custom payloads that omit `decoder` would hit xdrop's 400
+// (no decoder-bit means no match_anomaly → xdrop rejects as "not an
+// anomaly rule on v2.6.1 path").
+func specializeXDropDecoderBody(body []byte, attack *store.Attack) []byte {
+	decoder := attack.DecoderFamily
+	isAnomaly := isAnomalyDecoder(decoder)
+	isIPProto := decoder == "gre" || decoder == "esp" || decoder == "igmp"
+	if !isAnomaly && !isIPProto {
+		return body
+	}
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	if isAnomaly {
+		if _, has := m["decoder"]; !has {
+			m["decoder"] = decoder
+		}
+		if proto, _ := m["protocol"].(string); isAnomalyDecoder(proto) {
+			delete(m, "protocol")
+		}
+	}
+	if isIPProto {
+		if _, has := m["protocol"]; !has {
+			m["protocol"] = decoder
+		}
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // xDropSyntheticFailedRuleIDPrefix is attached to a rule row when xDrop's
@@ -114,18 +280,23 @@ func CloseSyntheticXDropRuleLocal(
 // xdropRuleRequest is the default request body sent to xDrop API.
 // Matches xDrop's RuleRequest format — any field left empty/zero is treated as wildcard.
 type xdropRuleRequest struct {
-	DstIP     string  `json:"dst_ip,omitempty"`
-	DstCIDR   string  `json:"dst_cidr,omitempty"` // v1.3: subnet-scope rule (carpet bombing)
-	SrcIP     string  `json:"src_ip,omitempty"`
-	SrcCIDR   string  `json:"src_cidr,omitempty"`
-	DstPort   int     `json:"dst_port,omitempty"`
-	SrcPort   int     `json:"src_port,omitempty"`
-	Protocol  string  `json:"protocol,omitempty"`
-	TcpFlags  *string `json:"tcp_flags,omitempty"` // e.g. "SYN,!ACK"; requires protocol=tcp
-	Action    string  `json:"action"`              // "drop" or "rate_limit"
-	RateLimit int     `json:"rate_limit,omitempty"` // PPS, required if action=rate_limit
-	Source    string  `json:"source"`               // "xsight"
-	Comment   string  `json:"comment,omitempty"`
+	DstIP    string  `json:"dst_ip,omitempty"`
+	DstCIDR  string  `json:"dst_cidr,omitempty"` // v1.3: subnet-scope rule (carpet bombing)
+	SrcIP    string  `json:"src_ip,omitempty"`
+	SrcCIDR  string  `json:"src_cidr,omitempty"`
+	DstPort  int     `json:"dst_port,omitempty"`
+	SrcPort  int     `json:"src_port,omitempty"`
+	Protocol string  `json:"protocol,omitempty"`
+	TcpFlags *string `json:"tcp_flags,omitempty"` // e.g. "SYN,!ACK"; requires protocol=tcp
+	// Decoder (xdrop v2.6.1): set ONLY for anomaly decoders
+	// (bad_fragment / invalid). xdrop Controller translates to
+	// match_anomaly bitmap and protocol becomes wildcard. Non-anomaly
+	// decoders MUST leave this field empty and use Protocol + TcpFlags.
+	Decoder   string `json:"decoder,omitempty"`
+	Action    string `json:"action"`               // "drop" or "rate_limit"
+	RateLimit int    `json:"rate_limit,omitempty"` // PPS, required if action=rate_limit
+	Source    string `json:"source"`               // "xsight"
+	Comment   string `json:"comment,omitempty"`
 }
 
 // splitIPOrCIDR separates "10.0.0.1" vs "10.0.0.0/24".
@@ -213,10 +384,15 @@ func executeXDrop(
 		// (e.g. "ip" → "all") so custom payloads with `{decoder}` work
 		// across all threshold rule types without operator translation.
 		body = normalizeXDropProtocol(body)
-		// Auto-inject tcp_flags for tcp_syn attacks if not already specified.
-		// Runs AFTER normalize so its own protocol rewrite (tcp_syn → tcp)
-		// still wins when decoder=tcp_syn.
+		// Auto-inject tcp_flags for TCP-flag-family attacks if not already
+		// specified. Runs AFTER normalize so its protocol rewrite still
+		// wins when protocol=<tcp_flag_decoder> expanded from {decoder}.
 		body = injectTcpFlags(body, attack)
+		// Auto-fill decoder / protocol for anomaly + gre/esp/igmp attacks
+		// when operator's custom payload omitted them (parallel to
+		// specializeXDropDecoder on the default-payload path). Runs last
+		// so it sees the post-normalize + post-inject shape.
+		body = specializeXDropDecoderBody(body, attack)
 	} else {
 		// Default payload: dst_ip drop/rate_limit based on xdrop_action.
 		// v1.3 Phase 1c.1: subnet-scope attacks (carpet bombing) use dst_cidr
@@ -233,26 +409,69 @@ func executeXDrop(
 			Source:  "xsight",
 			Comment: fmt.Sprintf("attack #%d %s", attack.ID, attack.AttackType),
 		}
-		// Auto-inject tcp_flags for decoder-specific attacks
-		if attack.DecoderFamily == "tcp_syn" {
-			payload.Protocol = "tcp"
-			synFlags := "SYN,!ACK"
-			payload.TcpFlags = &synFlags
-		}
+		specializeXDropDecoder(&payload, attack.DecoderFamily)
 		body, err = json.Marshal(payload)
 		if err != nil {
 			return nil, fmt.Errorf("marshal xdrop payload: %w", err)
 		}
 	}
 
+	// Late anomaly fail-fast: the engine.go gate catches XDropAction=rate_limit
+	// + anomaly decoder combos when the action record is used directly. But a
+	// custom payload can inject `"action":"rate_limit"` in its JSON body even
+	// when act.XDropAction == "filter_l4" (operator mismatch). Check the
+	// final body here to catch that case with the same skip_reason —
+	// dispatch-time fail-fast on real body semantics, not just on the action
+	// record. See codex v1.3.x audit P2.
+	if isAnomalyRateLimitBody(body, attack.DecoderFamily) {
+		// Caller (engine.go xdrop branch) persists the returned execLog via
+		// ActionExecLog().Create — we must NOT write it ourselves here, or
+		// both rows + both status="skipped" counter increments would land
+		// (see codex v1.3.x re-audit finding). RecordSkip IS ours to call
+		// because the caller doesn't know the skip_reason.
+		skipLog := &store.ActionExecutionLog{
+			AttackID:     attackDBID,
+			ActionID:     action.ID,
+			ResponseName: responseName,
+			ActionType:   "xdrop",
+			TriggerPhase: triggerPhase,
+			Status:       "skipped",
+			SkipReason:   SkipReasonXDropAnomalyRequiresDrop,
+			ErrorMessage: fmt.Sprintf(
+				"decoder=%s + body action=rate_limit unsupported (xdrop v2.6.1 anomaly rules are drop-only); custom payload overrides XDropAction",
+				attack.DecoderFamily),
+			RequestBody: truncateStr(string(body), 1024),
+			ExecutedAt:  time.Now(),
+		}
+		metrics.RecordSkip(SkipReasonXDropAnomalyRequiresDrop)
+		return skipLog, nil
+	}
+
 	// Runtime sanity: rate_limit action must have a positive rate_limit in the payload.
 	// API validation should prevent this, but guard against malformed DB rows.
+	//
+	// v1.3.4: previously returned (nil, err), which caused the caller to skip
+	// writing an action_execution_log row — operator saw nothing in UI/timeline
+	// despite the dispatch being rejected. Now returns a populated failed log
+	// so the reason is visible in the execution history.
 	if xdropAction == "rate_limit" {
 		var check map[string]any
 		if json.Unmarshal(body, &check) == nil {
 			rl, _ := check["rate_limit"].(float64)
 			if rl <= 0 {
-				return nil, fmt.Errorf("xdrop rate_limit action has no valid rate_limit value in payload")
+				errMsg := "xdrop rate_limit action has no valid rate_limit value in payload"
+				failLog := &store.ActionExecutionLog{
+					AttackID:     attackDBID,
+					ActionID:     action.ID,
+					ResponseName: responseName,
+					ActionType:   "xdrop",
+					TriggerPhase: triggerPhase,
+					Status:       "failed",
+					ErrorMessage: errMsg,
+					RequestBody:  truncateStr(string(body), 1024),
+					ExecutedAt:   time.Now(),
+				}
+				return failLog, fmt.Errorf("%s", errMsg)
 			}
 		}
 	}
@@ -894,24 +1113,39 @@ func fixPayloadTypes(raw []byte) ([]byte, error) {
 	return json.Marshal(m)
 }
 
-// decoderToXDropProtocol maps xSight decoder_family values to the xDrop
-// API's narrower protocol enum.
+// decoderToXDropProtocol maps xSight decoder_family values to xDrop's
+// protocol field.
 //
-//	xSight decoder_family: ip, tcp, tcp_syn, udp, icmp, fragment, ""
-//	xDrop protocol enum:   all, tcp, udp, icmp, icmpv6
+//	xSight decoder_family (protocol path):
+//	  tcp / tcp_syn / tcp_ack / tcp_rst / tcp_fin → "tcp"
+//	  udp                                         → "udp"
+//	  icmp                                        → "icmp"
+//	  gre / esp / igmp                            → "gre" / "esp" / "igmp"
+//	  ip / fragment                               → "all"
+//	  "" / unknown                                → ""  (caller leaves field alone)
 //
-// Returns "" if the decoder doesn't map to anything meaningful (shouldn't
-// happen in practice; caller should treat "" as "leave protocol field
-// untouched"). tcp_syn collapses to tcp; xDrop differentiates via
-// tcp_flags. ip/fragment collapse to "all" (xSight-aggregate semantics).
+// Anomaly decoders (bad_fragment/invalid) do NOT appear here — they
+// dispatch through xdrop's `decoder` field (see isAnomalyDecoder +
+// default-payload builder); trying to set protocol would either collapse
+// to "all" (ambiguous) or duplicate the anomaly bit that Controller
+// derives from `decoder`.
+//
+// TCP-flag-family decoders collapse to "tcp"; the flag specialization
+// is injected separately by injectTcpFlags / the default payload builder.
 func decoderToXDropProtocol(decoder string) string {
 	switch decoder {
-	case "tcp", "tcp_syn":
+	case "tcp", "tcp_syn", "tcp_ack", "tcp_rst", "tcp_fin":
 		return "tcp"
 	case "udp":
 		return "udp"
 	case "icmp":
 		return "icmp"
+	case "gre":
+		return "gre"
+	case "esp":
+		return "esp"
+	case "igmp":
+		return "igmp"
 	case "ip", "fragment":
 		return "all"
 	default:
@@ -926,29 +1160,26 @@ func decoderToXDropProtocol(decoder string) string {
 //
 // Why this exists: operators configure payloads like
 // `"protocol": "{decoder}"` for convenience. `{decoder}` expands to xSight's
-// decoder_family name (e.g. "tcp_syn" for SYN-flood rules, "fragment" for
-// fragment floods), which xDrop rejects as-is because its protocol enum is
-// narrower. Without this normalization the rule create fails with HTTP 400
-// and the attack's xdrop_active_rules row goes to the failed state.
+// decoder_family name, which xDrop rejects as-is because its protocol enum
+// is narrower. Without this normalization the rule create fails with HTTP
+// 400 and the attack's xdrop_active_rules row goes to the failed state.
 //
-// Decoder → xDrop mapping:
-//   - "tcp_syn" → "tcp" (tcp_flags injected separately by injectTcpFlags)
-//   - "fragment" → "all" (fragment floods drop broadly; operator accepted
-//     the aggressive semantic by picking a fragment-decoder threshold)
+// Rewrite rules:
+//   - protocol already a valid xDrop value (all/tcp/udp/icmp/icmpv6/gre/
+//     esp/igmp) → no change
+//   - protocol is an anomaly decoder (bad_fragment/invalid): MOVE the
+//     value to the `decoder` field (anomaly rules are protocol-wildcard +
+//     decoder-bit in xdrop v2.6.1) and delete `protocol`. Idempotent if
+//     `decoder` is already set.
+//   - protocol maps via decoderToXDropProtocol (tcp_syn/tcp_ack/tcp_rst/
+//     tcp_fin → tcp, fragment → all, ip → all) → rewrite protocol
+//   - protocol is something else → no change (let xDrop surface error)
 //
-// Not reached paths (kept for defense-in-depth):
-//   - "ip" → "all" mapping exists in decoderToXDropProtocol but won't fire
-//     in normal flow because the action engine dispatch gate rejects
-//     decoder=ip BEFORE xDrop executeXDrop is called (see engine.go
-//     xdrop case + IsXDropCompatibleDecoder). The mapping is retained
-//     so an operator who hand-crafts a payload with literal "protocol":"ip"
-//     still gets a working rule instead of a 400 rejection.
-//
-// Behavior:
-//   - protocol matches xSight decoder → translate via decoderToXDropProtocol
-//   - protocol already a valid xDrop value (all/tcp/udp/icmp/icmpv6) → no change
-//   - protocol absent → no change (xDrop accepts as "all" implicitly)
-//   - protocol something else → no change (let xDrop reject and surface error)
+// Not reached paths (kept for defense-in-depth): `ip` / `ip_other` are
+// gated out at the engine dispatch layer before executeXDrop runs (see
+// IsXDropCompatibleDecoder), but decoderToXDropProtocol still maps `ip`
+// → `all` so an operator who hand-crafts a payload with literal
+// "protocol":"ip" gets a working rule instead of a 400.
 func normalizeXDropProtocol(body []byte) []byte {
 	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {
@@ -958,10 +1189,23 @@ func normalizeXDropProtocol(body []byte) []byte {
 	if !ok || proto == "" {
 		return body
 	}
-	// Already valid xDrop value — leave it alone even if it overlaps the
-	// xSight decoder_family (e.g., "tcp", "udp", "icmp" are fine in both).
+	// Already valid xDrop value — leave alone. Include gre/esp/igmp so
+	// custom payloads with literal `"protocol":"gre"` don't get rewritten.
 	switch proto {
-	case "all", "tcp", "udp", "icmp", "icmpv6":
+	case "all", "tcp", "udp", "icmp", "icmpv6", "gre", "esp", "igmp":
+		return body
+	}
+	// Anomaly decoder expanded from {decoder}: move to the xdrop `decoder`
+	// field. xdrop anomaly rules are protocol-wildcard + decoder-bit; keeping
+	// protocol set to a non-enum value would be rejected.
+	if isAnomalyDecoder(proto) {
+		delete(m, "protocol")
+		if _, has := m["decoder"]; !has {
+			m["decoder"] = proto
+		}
+		if out, err := json.Marshal(m); err == nil {
+			return out
+		}
 		return body
 	}
 	if mapped := decoderToXDropProtocol(proto); mapped != "" && mapped != proto {
@@ -973,30 +1217,33 @@ func normalizeXDropProtocol(body []byte) []byte {
 	return body
 }
 
-// injectTcpFlags auto-injects tcp_flags and normalizes protocol for tcp_syn attacks.
+// injectTcpFlags auto-injects tcp_flags and normalizes protocol for the
+// TCP-flag family (tcp_syn/tcp_ack/tcp_rst/tcp_fin). Pass-through for
+// non-TCP-flag decoders.
+//
 // Rules:
-//   - tcp_syn attack without tcp_flags → inject tcp_flags=SYN,!ACK + protocol=tcp
-//   - tcp_syn attack with tcp_flags already set → keep user's flags, still ensure protocol=tcp
-//   - tcp_syn attack with protocol=tcp_syn (from {decoder} expansion) → fix to tcp
-//   - non-tcp_syn attack → no changes
+//   - TCP-flag attack without tcp_flags → inject canonical pattern from
+//     tcpFlagDecoderMap + protocol=tcp
+//   - TCP-flag attack with tcp_flags already set → keep operator's flags,
+//     still ensure protocol=tcp
+//   - TCP-flag attack with protocol=<decoder> (from {decoder} expansion) → tcp
+//   - non-TCP-flag attack → no changes
 func injectTcpFlags(body []byte, attack *store.Attack) []byte {
-	if attack.DecoderFamily != "tcp_syn" {
+	canonicalFlags, ok := tcpFlagDecoderMap[attack.DecoderFamily]
+	if !ok {
 		return body
 	}
 	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {
 		return body
 	}
-	// Inject tcp_flags if not already set
 	if _, has := m["tcp_flags"]; !has {
-		m["tcp_flags"] = "SYN,!ACK"
+		m["tcp_flags"] = canonicalFlags
 	}
-	// Always normalize protocol for tcp_syn (fixes {decoder} → "tcp_syn" expansion)
+	// Always normalize protocol to tcp (covers bare + {decoder}-expanded cases)
 	proto, _ := m["protocol"].(string)
-	if correct := decoderToXDropProtocol(attack.DecoderFamily); correct != "" {
-		if proto == "" || proto == attack.DecoderFamily {
-			m["protocol"] = correct
-		}
+	if proto == "" || proto == attack.DecoderFamily {
+		m["protocol"] = "tcp"
 	}
 	out, err := json.Marshal(m)
 	if err != nil {

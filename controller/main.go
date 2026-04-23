@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"net"
@@ -17,6 +18,7 @@ import (
 	_ "net/http/pprof" // registers /debug/pprof/* on default mux
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -59,6 +61,14 @@ func main() {
 	}
 	log.Printf("config loaded: grpc=%s http=%s db=%s",
 		cfg.Listen.GRPC, cfg.Listen.HTTP, cfg.Database.Driver)
+
+	// Dump the decoder registry snapshot the binary was compiled against
+	// (v1.3.4). A deployment regression (controller built before shared/
+	// was updated) shows up here as a stale MaxDecoders or truncated
+	// known-decoder list, making the cause visible without digging through
+	// NULL extra_decoder_pps rows. See codex v1.3.x audit Gap 2.
+	log.Printf("decoder registry: MaxDecoders=%d StandardCount=%d known=%s",
+		decoder.MaxDecoders, decoder.StandardCount, knownDecoderList())
 
 	// pprof server on localhost only (not exposed externally)
 	go func() {
@@ -574,4 +584,20 @@ func reportToStatPoints(nodeID string, report *pb.StatsReport) []store.StatPoint
 	}
 
 	return points
+}
+
+// knownDecoderList returns a "count:idx=name,…" string listing all
+// non-empty decoder slots. Purely for the startup log in main() — when
+// stale shared/decoder bindings are embedded in the controller binary
+// (Gap 2 in the v1.3.3 test report), the log line prints a truncated list
+// so the operator can spot the drift without waiting for NULL columns to
+// appear in ts_stats rows.
+func knownDecoderList() string {
+	names := make([]string, 0, decoder.MaxDecoders)
+	for i, n := range decoder.Names {
+		if n != "" {
+			names = append(names, fmt.Sprintf("%d=%s", i, n))
+		}
+	}
+	return fmt.Sprintf("%d:[%s]", len(names), strings.Join(names, ","))
 }
