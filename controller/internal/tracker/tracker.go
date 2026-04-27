@@ -660,20 +660,57 @@ func (t *Tracker) ActiveCount() int {
 }
 
 
+// decoderToAttackType maps a decoder_family value to the human-readable
+// attack_type string stored on the attack record and surfaced in the UI /
+// API. The mapping follows two conventions:
+//
+//   - Protocol-specific decoders → "<short>_flood" (e.g. tcp_syn → syn_flood,
+//     tcp_ack → ack_flood, gre → gre_flood). The TCP-flag family drops the
+//     "tcp_" prefix so the name reads naturally ("ack_flood" not "tcp_ack_flood").
+//   - L3 aggregates (ip / ip_other) → "volumetric_*" because there is no
+//     concrete protocol to name; the attack is just "lots of packets".
+//   - Anomaly decoders (bad_fragment / invalid) → "<decoder>_flood" — the
+//     name carries the malformed-packet semantics already.
+//
+// Keep this list in sync with shared/decoder.Names. New decoders that aren't
+// added here render as "unknown" and break attack_type preconditions silently.
 func decoderToAttackType(decoder string) string {
 	switch decoder {
-	case "tcp_syn":
-		return "syn_flood"
+	// L4 standard
 	case "tcp":
 		return "tcp_flood"
+	case "tcp_syn":
+		return "syn_flood"
 	case "udp":
 		return "udp_flood"
 	case "icmp":
 		return "icmp_flood"
 	case "fragment":
 		return "fragment_flood"
+	// TCP flag family (v1.3)
+	case "tcp_ack":
+		return "ack_flood"
+	case "tcp_rst":
+		return "rst_flood"
+	case "tcp_fin":
+		return "fin_flood"
+	// Other IP protocols (v1.3)
+	case "gre":
+		return "gre_flood"
+	case "esp":
+		return "esp_flood"
+	case "igmp":
+		return "igmp_flood"
+	// L3 aggregates
 	case "ip":
 		return "volumetric_generic"
+	case "ip_other":
+		return "volumetric_other"
+	// Anomaly family (v1.3)
+	case "bad_fragment":
+		return "bad_fragment_flood"
+	case "invalid":
+		return "invalid_packet_flood"
 	default:
 		return "unknown"
 	}
