@@ -947,11 +947,36 @@ var migrations = []string{
 		CHECK (action_type IN ('xdrop_unblock','bgp_withdraw')),
 		CHECK (status IN ('pending','executing','completed','cancelled','failed'))
 	)`,
-	// Only one pending schedule allowed per (type, artifact). Partial index
-	// keyed on status='pending' — completed/cancelled rows stay for audit.
+	// Only one pending schedule per artifact (xDrop path: announcement_id IS NULL).
+	// Narrowed from the original all-rows predicate so BGP announcement-scoped
+	// schedules (announcement_id IS NOT NULL) are excluded — they have their own
+	// index below. See fix-plan-xdrop-port-bgp-schedule-2026-05-02.md Bug 2.
+	//
+	// The DO block is conditional: it only drops the old index when its predicate
+	// does not yet include the "announcement_id IS NULL" narrowing. This avoids
+	// an unconditional DROP + CREATE on every controller restart.
+	`DO $$ BEGIN
+	   IF EXISTS (
+	     SELECT 1
+	     FROM pg_class c
+	     JOIN pg_index i ON i.indexrelid = c.oid
+	     JOIN pg_namespace n ON n.oid = c.relnamespace
+	     WHERE c.relname = 'uq_scheduled_artifact_pending'
+	       AND n.nspname = current_schema()
+	       AND pg_get_expr(i.indpred, i.indrelid) NOT LIKE '%announcement_id IS NULL%'
+	   ) THEN
+	     DROP INDEX uq_scheduled_artifact_pending;
+	   END IF;
+	 END $$`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_artifact_pending
 	 ON scheduled_actions (action_type, attack_id, action_id, connector_id, external_rule_id)
-	 WHERE status = 'pending'`,
+	 WHERE status = 'pending' AND announcement_id IS NULL`,
+	// Only one pending schedule per BGP announcement. announcement_id is the
+	// identity for BGP delayed-withdraw; the old artifact four-tuple is all
+	// zeros for BGP rows, which caused collisions (Bug 2).
+	`CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_announcement_pending
+	 ON scheduled_actions (action_type, announcement_id)
+	 WHERE status = 'pending' AND announcement_id IS NOT NULL`,
 	// Recovery scans pending rows ordered by scheduled_for.
 	`CREATE INDEX IF NOT EXISTS idx_scheduled_pending_for
 	 ON scheduled_actions (scheduled_for) WHERE status = 'pending'`,

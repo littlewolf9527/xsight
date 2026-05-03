@@ -14,6 +14,7 @@ import (
 
 	"github.com/littlewolf9527/xsight/controller/internal/metrics"
 	"github.com/littlewolf9527/xsight/controller/internal/store"
+	"github.com/littlewolf9527/xsight/shared/decoder"
 )
 
 // xDropCompatibleDecoders is the set of xSight decoder_family values that
@@ -191,9 +192,10 @@ func specializeXDropDecoder(payload *xdropRuleRequest, decoder string) {
 // (no decoder-bit means no match_anomaly → xdrop rejects as "not an
 // anomaly rule on v2.6.1 path").
 func specializeXDropDecoderBody(body []byte, attack *store.Attack) []byte {
-	decoder := attack.DecoderFamily
-	isAnomaly := isAnomalyDecoder(decoder)
-	isIPProto := decoder == "gre" || decoder == "esp" || decoder == "igmp"
+	decoderName := attack.DecoderFamily
+	dc := decoder.GetDispatchClass(decoderName)
+	isAnomaly := dc == decoder.Anomaly
+	isIPProto := dc == decoder.PortlessProto && decoderName != "icmp" && decoderName != "fragment"
 	if !isAnomaly && !isIPProto {
 		return body
 	}
@@ -203,7 +205,7 @@ func specializeXDropDecoderBody(body []byte, attack *store.Attack) []byte {
 	}
 	if isAnomaly {
 		if _, has := m["decoder"]; !has {
-			m["decoder"] = decoder
+			m["decoder"] = decoderName
 		}
 		if proto, _ := m["protocol"].(string); isAnomalyDecoder(proto) {
 			delete(m, "protocol")
@@ -211,8 +213,49 @@ func specializeXDropDecoderBody(body []byte, attack *store.Attack) []byte {
 	}
 	if isIPProto {
 		if _, has := m["protocol"]; !has {
-			m["protocol"] = decoder
+			m["protocol"] = decoderName
 		}
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// sanitizeXDropPayloadForDecoder is the dispatch-boundary enforcement point:
+// it strips fields from the final xDrop HTTP body that are illegal for the
+// attack's decoder DispatchClass. Called as the LAST step in the custom-payload
+// pipeline (after specializeXDropDecoderBody) and after the default-payload
+// marshal, so it sees the final shape before POST.
+//
+// DispatchClass rules:
+//
+//	Ported       → no-op (src_port/dst_port/tcp_flags all legal)
+//	PortlessProto → delete src_port, dst_port, tcp_flags
+//	Anomaly      → delete protocol, src_port, dst_port, tcp_flags
+//	Unsupported  → no-op (engine.go gate prevents reaching here)
+//
+// See fix-plan-xdrop-port-bgp-schedule-2026-05-02.md §Bug 1.
+func sanitizeXDropPayloadForDecoder(body []byte, decoderFamily string) []byte {
+	dc := decoder.GetDispatchClass(decoderFamily)
+	if dc == decoder.Ported || dc == decoder.Unsupported {
+		return body
+	}
+	var m map[string]any
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	switch dc {
+	case decoder.PortlessProto:
+		delete(m, "src_port")
+		delete(m, "dst_port")
+		delete(m, "tcp_flags")
+	case decoder.Anomaly:
+		delete(m, "protocol")
+		delete(m, "src_port")
+		delete(m, "dst_port")
+		delete(m, "tcp_flags")
 	}
 	out, err := json.Marshal(m)
 	if err != nil {
@@ -393,6 +436,11 @@ func executeXDrop(
 		// specializeXDropDecoder on the default-payload path). Runs last
 		// so it sees the post-normalize + post-inject shape.
 		body = specializeXDropDecoderBody(body, attack)
+		// Final enforcement: strip fields illegal for this decoder's
+		// DispatchClass (e.g. src_port/dst_port on GRE attacks). Runs
+		// last so it catches any stray fields from expandParams or
+		// fixPayloadTypes that the earlier steps did not remove.
+		body = sanitizeXDropPayloadForDecoder(body, attack.DecoderFamily)
 	} else {
 		// Default payload: dst_ip drop/rate_limit based on xdrop_action.
 		// v1.3 Phase 1c.1: subnet-scope attacks (carpet bombing) use dst_cidr
@@ -414,6 +462,10 @@ func executeXDrop(
 		if err != nil {
 			return nil, fmt.Errorf("marshal xdrop payload: %w", err)
 		}
+		// Defense-in-depth: the typed struct never sets ports for non-L4
+		// decoders, but run the sanitizer anyway so the invariant holds
+		// regardless of future struct changes.
+		body = sanitizeXDropPayloadForDecoder(body, attack.DecoderFamily)
 	}
 
 	// Late anomaly fail-fast: the engine.go gate catches XDropAction=rate_limit

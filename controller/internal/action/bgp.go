@@ -512,12 +512,11 @@ func bgpDelayedWithdrawWorker(s store.Store, engine *Engine, conn *store.BGPConn
 
 	case <-cancelCtx.Done():
 		log.Printf("action: bgp delayed withdraw cancelled announcement_id=%d scheduled_id=%d", announcementID, schedID)
-		// Cancel context was triggered (re-breach / operator cancel) — the
-		// scheduled_actions row was already transitioned to cancelled by the
-		// caller (CancelAnnouncementDelay). Just clean up the in-memory map.
-		engine.delayMu.Lock()
-		delete(engine.pendingDelay, announcementDelayKey(announcementID))
-		engine.delayMu.Unlock()
+		// Cancel context was triggered by CancelAnnouncementDelay (re-breach)
+		// or by ScheduleDelayForAnnouncement (reschedule). The caller already
+		// manages the pendingDelay map entry — do NOT delete here, because a
+		// reschedule may have already stored a new cancel func under the same
+		// key, and deleting it would orphan the replacement timer.
 	}
 }
 

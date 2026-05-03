@@ -66,3 +66,59 @@ func Index(name string) int {
 	}
 	return -1
 }
+
+// DispatchClass categorizes decoders by which xDrop payload fields are legal.
+// Used by the xDrop dispatch-boundary sanitizer to strip illegal fields
+// before the HTTP POST — single source of truth so new decoders never need
+// a separate "strip list" update.
+//
+// See fix-plan-xdrop-port-bgp-schedule-2026-05-02.md §Bug 1.
+type DispatchClass int
+
+const (
+	// Ported — L4 protocols: src_port/dst_port allowed; tcp_flags allowed
+	// for the TCP-flag subfamily.
+	Ported DispatchClass = iota
+	// PortlessProto — IP protocols without ports (icmp, fragment, gre, esp, igmp):
+	// delete src_port, dst_port, tcp_flags before dispatch.
+	PortlessProto
+	// Anomaly — packet-level anomalies (bad_fragment, invalid):
+	// uses decoder= field; delete protocol, src_port, dst_port, tcp_flags.
+	Anomaly
+	// Unsupported — not dispatched to xDrop (ip, ip_other, empty/unknown).
+	// The engine.go gate blocks these before xdrop.go is reached; the class
+	// exists so the registry is complete and the sanitizer can no-op.
+	Unsupported
+)
+
+// decoderDispatchClass maps decoder name → DispatchClass.
+// ip/ip_other are Unsupported: the controller already excludes them from
+// xDrop dispatch (xDropCompatibleDecoders gate in engine.go) to avoid
+// broad L3-aggregate wildcard drops. Moving ip to PortlessProto would
+// accidentally make it xDrop-eligible through the registry path.
+var decoderDispatchClass = map[string]DispatchClass{
+	"tcp":          Ported,
+	"tcp_syn":      Ported,
+	"tcp_ack":      Ported,
+	"tcp_rst":      Ported,
+	"tcp_fin":      Ported,
+	"udp":          Ported,
+	"icmp":         PortlessProto,
+	"fragment":     PortlessProto,
+	"gre":          PortlessProto,
+	"esp":          PortlessProto,
+	"igmp":         PortlessProto,
+	"bad_fragment": Anomaly,
+	"invalid":      Anomaly,
+	"ip":           Unsupported,
+	"ip_other":     Unsupported,
+}
+
+// GetDispatchClass returns the DispatchClass for the given decoder name.
+// Unknown/empty decoders return Unsupported.
+func GetDispatchClass(decoder string) DispatchClass {
+	if dc, ok := decoderDispatchClass[decoder]; ok {
+		return dc
+	}
+	return Unsupported
+}

@@ -758,13 +758,27 @@ func (r *mockScheduledActionRepo) Schedule(_ context.Context, a *store.Scheduled
 	if r.scheduleErr != nil {
 		return 0, r.scheduleErr
 	}
-	bk := r.businessKey(a.ActionType, a.AttackID, a.ActionID, a.ConnectorID, a.ExternalRuleID)
-	// Partial UNIQUE (pending only) emulation
+	// Branched identity emulation — mirrors the two disjoint partial UNIQUE
+	// indexes in postgres.go (Bug 2 fix):
+	//   announcement_id != nil → match on (action_type, announcement_id)
+	//   announcement_id == nil → match on artifact four-tuple
 	for i := range r.records {
 		rec := &r.records[i]
-		if rec.Status == "pending" && r.businessKey(rec.ActionType, rec.AttackID, rec.ActionID, rec.ConnectorID, rec.ExternalRuleID) == bk {
-			rec.ScheduledFor = a.ScheduledFor
-			return rec.ID, nil
+		if rec.Status != "pending" {
+			continue
+		}
+		if a.AnnouncementID != nil {
+			if rec.AnnouncementID != nil && *rec.AnnouncementID == *a.AnnouncementID &&
+				rec.ActionType == a.ActionType {
+				rec.ScheduledFor = a.ScheduledFor
+				return rec.ID, nil
+			}
+		} else {
+			if r.businessKey(rec.ActionType, rec.AttackID, rec.ActionID, rec.ConnectorID, rec.ExternalRuleID) ==
+				r.businessKey(a.ActionType, a.AttackID, a.ActionID, a.ConnectorID, a.ExternalRuleID) {
+				rec.ScheduledFor = a.ScheduledFor
+				return rec.ID, nil
+			}
 		}
 	}
 	r.nextID++

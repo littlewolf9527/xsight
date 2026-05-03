@@ -121,8 +121,12 @@ func (e *Engine) ScheduleDelayForAnnouncement(ctx context.Context, announcementI
 	}
 	e.delayMu.Lock()
 	defer e.delayMu.Unlock()
+	key := announcementDelayKey(announcementID)
+	if oldCancel, ok := e.pendingDelay[key]; ok {
+		oldCancel() // cancel stale goroutine before overwriting
+	}
 	cancelCtx, cancel := context.WithCancel(context.Background())
-	e.pendingDelay[announcementDelayKey(announcementID)] = cancel
+	e.pendingDelay[key] = cancel
 	return id, cancelCtx, nil
 }
 
@@ -513,7 +517,11 @@ func (e *Engine) runRecoveredAction(sa store.ScheduledAction, delay time.Duratio
 	// recovered task same as a normal scheduled one.
 	e.delayMu.Lock()
 	cancelCtx, cancel := context.WithCancel(context.Background())
-	e.pendingDelay[delayKey(sa.AttackID, sa.ActionID, sa.ConnectorID, sa.ExternalRuleID)] = cancel
+	key := delayKey(sa.AttackID, sa.ActionID, sa.ConnectorID, sa.ExternalRuleID)
+	if sa.ActionType == "bgp_withdraw" && sa.AnnouncementID != nil {
+		key = announcementDelayKey(*sa.AnnouncementID)
+	}
+	e.pendingDelay[key] = cancel
 	e.delayMu.Unlock()
 
 	if delay > 0 {

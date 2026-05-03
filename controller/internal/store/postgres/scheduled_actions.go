@@ -16,25 +16,48 @@ import (
 type scheduledActionRepo struct{ pool *pgxpool.Pool }
 
 // Schedule inserts a new pending row or, if one already exists for the same
-// business key in pending status, returns the existing ID. The partial
-// UNIQUE index on (action_type, attack_id, action_id, connector_id,
-// external_rule_id) WHERE status='pending' enforces the uniqueness.
+// business key in pending status, returns the existing ID.
+//
+// Two disjoint identity paths:
+//   - AnnouncementID != nil (BGP): upserts on (action_type, announcement_id)
+//     via uq_scheduled_announcement_pending. The old artifact four-tuple is
+//     all zeros for BGP rows — without this branch they would all collide on
+//     a single row (Bug 2, see fix-plan-xdrop-port-bgp-schedule-2026-05-02).
+//   - AnnouncementID == nil (xDrop/legacy): upserts on the per-artifact
+//     four-tuple via uq_scheduled_artifact_pending (narrowed to
+//     announcement_id IS NULL).
 func (r *scheduledActionRepo) Schedule(ctx context.Context, a *store.ScheduledAction) (int, error) {
 	var id int
-	err := r.pool.QueryRow(ctx,
-		`INSERT INTO scheduled_actions
-		 (action_type, attack_id, action_id, connector_id, external_rule_id,
-		  announcement_id, scheduled_for, status)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-		 ON CONFLICT (action_type, attack_id, action_id, connector_id, external_rule_id)
-		   WHERE status = 'pending'
-		 DO UPDATE SET scheduled_for = EXCLUDED.scheduled_for
-		 RETURNING id`,
-		a.ActionType, a.AttackID, a.ActionID, a.ConnectorID, a.ExternalRuleID,
-		a.AnnouncementID, a.ScheduledFor).Scan(&id)
+	var err error
+	if a.AnnouncementID != nil {
+		// BGP announcement-scoped schedule
+		err = r.pool.QueryRow(ctx,
+			`INSERT INTO scheduled_actions
+			 (action_type, attack_id, action_id, connector_id, external_rule_id,
+			  announcement_id, scheduled_for, status)
+			 VALUES ($1, 0, 0, 0, '', $2, $3, 'pending')
+			 ON CONFLICT (action_type, announcement_id)
+			   WHERE status = 'pending' AND announcement_id IS NOT NULL
+			 DO UPDATE SET scheduled_for = EXCLUDED.scheduled_for
+			 RETURNING id`,
+			a.ActionType, a.AnnouncementID, a.ScheduledFor).Scan(&id)
+	} else {
+		// xDrop / legacy artifact-scoped schedule
+		err = r.pool.QueryRow(ctx,
+			`INSERT INTO scheduled_actions
+			 (action_type, attack_id, action_id, connector_id, external_rule_id,
+			  announcement_id, scheduled_for, status)
+			 VALUES ($1, $2, $3, $4, $5, NULL, $6, 'pending')
+			 ON CONFLICT (action_type, attack_id, action_id, connector_id, external_rule_id)
+			   WHERE status = 'pending' AND announcement_id IS NULL
+			 DO UPDATE SET scheduled_for = EXCLUDED.scheduled_for
+			 RETURNING id`,
+			a.ActionType, a.AttackID, a.ActionID, a.ConnectorID, a.ExternalRuleID,
+			a.ScheduledFor).Scan(&id)
+	}
 	if err != nil {
-		return 0, fmt.Errorf("schedule %s attack=%d action=%d conn=%d rule=%q: %w",
-			a.ActionType, a.AttackID, a.ActionID, a.ConnectorID, a.ExternalRuleID, err)
+		return 0, fmt.Errorf("schedule %s ann=%v attack=%d action=%d: %w",
+			a.ActionType, a.AnnouncementID, a.AttackID, a.ActionID, err)
 	}
 	return id, nil
 }
