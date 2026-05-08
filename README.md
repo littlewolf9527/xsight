@@ -202,6 +202,24 @@ The Web UI is available at `http://<controller-host>:8080`. Default login: **adm
 
 ---
 
+## Known Limitations
+
+### xDrop port-field dispatch on attack start (v1.3.6)
+
+When an xDrop action is configured with **Dst Port** or **Src Port** match fields, port values are derived from `flow_logs` via `analyzeFlows()` at action dispatch time. Because `flow_logs` is written asynchronously to PostgreSQL (no in-memory ring buffer), the first few ticks after attack detection may have insufficient flow records. In this case `{dominant_dst_port}` expands to empty, the port field is dropped, and the dispatched xDrop rule matches **all traffic for that protocol** on the target IP — broader than intended.
+
+**Mitigation** (until a flow_logs ring buffer is implemented): add a `dominant_dst_port_pct gte 40` precondition to any xDrop action that uses the Dst Port field. This causes the action to skip (fail-closed) until enough flow data has accumulated and the dominant port is statistically meaningful.
+
+```
+# Example: safe xDrop action preconditions for port-specific blocking
+dominant_dst_port_pct  gte  40
+cidr                   eq   32    # optional: single-host only
+```
+
+> Tracked as **F5** in `internal_docs/roadmap.md`. Fix planned: in-memory ring buffer for flow_logs, parallel to the existing ts_stats ring buffer.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
@@ -210,14 +228,21 @@ BPF/C kernel programs (`node/bpf/`) are licensed under GPL-2.0 as required by th
 
 ---
 
-## Sponsor
+## Sponsors
 
-This project is made possible by [Hytron](https://www.hytron.io/), who generously sponsors the development tooling.
-
+<a href="https://www.hytron.io/">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/sponsor-hytron-dark.png">
   <img src=".github/assets/sponsor-hytron.png" alt="Hytron" height="60">
 </picture>
+</a>
+&nbsp;&nbsp;&nbsp;&nbsp;
+<a href="https://www.yecaoyun.com/">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/sponsor-yecaoyun-dark.png">
+  <img src=".github/assets/sponsor-yecaoyun.png" alt="Yecaoyun" height="60">
+</picture>
+</a>
 
 ---
 

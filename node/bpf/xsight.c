@@ -10,7 +10,8 @@
 
 // ---------------------------------------------------------------------------
 // DECODER_SWITCH — single source of truth for protocol → decoder index mapping.
-// To add a new decoder: add one case here + one constant in xsight.h + one in shared/decoder/decoder.go.
+// To add a new decoder: add one case here + one constant in xsight.h + one in
+// shared/decoder/decoder.go + one case in node/internal/flow/decoder.go (flow mode mirror).
 // All 4 call sites (ip_stats, prefix_stats, global inbound, global outbound) use this macro.
 //
 // TCP flag bits (RFC 793): FIN=0x01, SYN=0x02, RST=0x04, PSH=0x08, ACK=0x10.

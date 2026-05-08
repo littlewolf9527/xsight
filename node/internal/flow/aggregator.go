@@ -116,7 +116,7 @@ func (a *FlowAggregator) Add(rec FlowRecord, source *Source) {
 	rate := source.ResolveSampleRate(rec.SampleRate)
 	realPkts := rec.Packets * uint64(rate)
 	realBytes := rec.Bytes * uint64(rate)
-	decoderIdx := ProtocolToDecoder(rec.Protocol, rec.TCPFlags)
+	decoderArr, decoderN := ProtocolToDecoders(rec.Protocol, rec.TCPFlags)
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -152,10 +152,10 @@ func (a *FlowAggregator) Add(rec FlowRecord, source *Source) {
 		// sFlow or short flow — single bucket at arrival time
 		b := a.getBucket(now)
 		if dstPrefix != "" {
-			a.addInbound(b, dstPrefix, rec.DstIP, decoderIdx, realPkts, realBytes)
+			a.addInbound(b, dstPrefix, rec.DstIP, decoderArr, decoderN, realPkts, realBytes)
 		}
 		if srcPrefix != "" {
-			a.addOutbound(b, srcPrefix, rec.SrcIP, decoderIdx, realPkts, realBytes)
+			a.addOutbound(b, srcPrefix, rec.SrcIP, decoderArr, decoderN, realPkts, realBytes)
 		}
 	} else {
 		// NetFlow/IPFIX — spread across [startTS, startTS+duration)
@@ -179,10 +179,10 @@ func (a *FlowAggregator) Add(rec FlowRecord, source *Source) {
 			}
 			b := a.getBucket(startTS + int64(i))
 			if dstPrefix != "" {
-				a.addInbound(b, dstPrefix, rec.DstIP, decoderIdx, p, by)
+				a.addInbound(b, dstPrefix, rec.DstIP, decoderArr, decoderN, p, by)
 			}
 			if srcPrefix != "" {
-				a.addOutbound(b, srcPrefix, rec.SrcIP, decoderIdx, p, by)
+				a.addOutbound(b, srcPrefix, rec.SrcIP, decoderArr, decoderN, p, by)
 			}
 		}
 	}
@@ -194,7 +194,7 @@ func (a *FlowAggregator) Add(rec FlowRecord, source *Source) {
 	}
 }
 
-func (a *FlowAggregator) addInbound(b *secondBucket, prefix string, ip net.IP, decoderIdx int, pkts, bytes uint64) {
+func (a *FlowAggregator) addInbound(b *secondBucket, prefix string, ip net.IP, decoders [MaxDecoderHits]int, nDecoders int, pkts, bytes uint64) {
 	ipStr := ip.String()
 	d, ok := b.ipStats[ipStr]
 	if !ok {
@@ -203,10 +203,6 @@ func (a *FlowAggregator) addInbound(b *secondBucket, prefix string, ip net.IP, d
 	}
 	d.Pkts += pkts
 	d.Bytes += bytes
-	if decoderIdx >= 0 && decoderIdx < decoder.MaxDecoders {
-		d.DecoderPkts[decoderIdx] += uint32(pkts)
-		d.DecoderBytes[decoderIdx] += bytes
-	}
 
 	pf, ok := b.prefixStats[prefix]
 	if !ok {
@@ -217,20 +213,24 @@ func (a *FlowAggregator) addInbound(b *secondBucket, prefix string, ip net.IP, d
 	pf.Pkts += pkts
 	pf.Bytes += bytes
 	pf.ActiveIPs[ipStr] = true
-	if decoderIdx >= 0 && decoderIdx < decoder.MaxDecoders {
-		pf.DecoderPkts[decoderIdx] += uint32(pkts)
-		pf.DecoderBytes[decoderIdx] += bytes
-	}
 
 	b.globalPkts += pkts
 	b.globalBytes += bytes
-	if decoderIdx >= 0 && decoderIdx < decoder.MaxDecoders {
-		b.globalDecoderPkts[decoderIdx] += uint32(pkts)
-		b.globalDecoderBytes[decoderIdx] += bytes
+
+	for i := 0; i < nDecoders; i++ {
+		idx := decoders[i]
+		if idx >= 0 && idx < decoder.MaxDecoders {
+			d.DecoderPkts[idx] += uint32(pkts)
+			d.DecoderBytes[idx] += bytes
+			pf.DecoderPkts[idx] += uint32(pkts)
+			pf.DecoderBytes[idx] += bytes
+			b.globalDecoderPkts[idx] += uint32(pkts)
+			b.globalDecoderBytes[idx] += bytes
+		}
 	}
 }
 
-func (a *FlowAggregator) addOutbound(b *secondBucket, prefix string, ip net.IP, decoderIdx int, pkts, bytes uint64) {
+func (a *FlowAggregator) addOutbound(b *secondBucket, prefix string, ip net.IP, decoders [MaxDecoderHits]int, nDecoders int, pkts, bytes uint64) {
 	ipStr := ip.String()
 	d, ok := b.srcIPStats[ipStr]
 	if !ok {
@@ -239,10 +239,6 @@ func (a *FlowAggregator) addOutbound(b *secondBucket, prefix string, ip net.IP, 
 	}
 	d.Pkts += pkts
 	d.Bytes += bytes
-	if decoderIdx >= 0 && decoderIdx < decoder.MaxDecoders {
-		d.DecoderPkts[decoderIdx] += uint32(pkts)
-		d.DecoderBytes[decoderIdx] += bytes
-	}
 
 	pf, ok := b.srcPrefixStats[prefix]
 	if !ok {
@@ -253,16 +249,20 @@ func (a *FlowAggregator) addOutbound(b *secondBucket, prefix string, ip net.IP, 
 	pf.Pkts += pkts
 	pf.Bytes += bytes
 	pf.ActiveIPs[ipStr] = true
-	if decoderIdx >= 0 && decoderIdx < decoder.MaxDecoders {
-		pf.DecoderPkts[decoderIdx] += uint32(pkts)
-		pf.DecoderBytes[decoderIdx] += bytes
-	}
 
 	b.srcGlobalPkts += pkts
 	b.srcGlobalBytes += bytes
-	if decoderIdx >= 0 && decoderIdx < decoder.MaxDecoders {
-		b.srcGlobalDecoderPkts[decoderIdx] += uint32(pkts)
-		b.srcGlobalDecoderBytes[decoderIdx] += bytes
+
+	for i := 0; i < nDecoders; i++ {
+		idx := decoders[i]
+		if idx >= 0 && idx < decoder.MaxDecoders {
+			d.DecoderPkts[idx] += uint32(pkts)
+			d.DecoderBytes[idx] += bytes
+			pf.DecoderPkts[idx] += uint32(pkts)
+			pf.DecoderBytes[idx] += bytes
+			b.srcGlobalDecoderPkts[idx] += uint32(pkts)
+			b.srcGlobalDecoderBytes[idx] += bytes
+		}
 	}
 }
 

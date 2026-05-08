@@ -212,12 +212,19 @@ BPF/C 内核程序（`node/bpf/`）遵循 GPL-2.0 协议，这是 Linux 内核 B
 
 ## 赞助商
 
-本项目由 [Hytron](https://www.hytron.io/) 赞助开发工具支持。
-
+<a href="https://www.hytron.io/">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/sponsor-hytron-dark.png">
   <img src=".github/assets/sponsor-hytron.png" alt="Hytron" height="60">
 </picture>
+</a>
+&nbsp;&nbsp;&nbsp;&nbsp;
+<a href="https://www.yecaoyun.com/">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/sponsor-yecaoyun-dark.png">
+  <img src=".github/assets/sponsor-yecaoyun.png" alt="野草云" height="60">
+</picture>
+</a>
 
 ---
 
