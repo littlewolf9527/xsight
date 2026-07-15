@@ -341,6 +341,7 @@ func main() {
 						attackTracker.UpgradeType(ip, result.AttackType, result.Confidence, result.Reasons)
 					}
 				}
+				attackClassifier.Sweep(time.Now())
 			}
 		}
 	}()
