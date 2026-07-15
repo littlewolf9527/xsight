@@ -38,11 +38,13 @@ ring:
 # Data retention — automatic cleanup of old data (0 = keep forever)
 # ts_stats compression/retention requires TimescaleDB; plain PostgreSQL uses cleaner.go
 retention:
-  ts_stats_days: 7           # raw ts_stats: drop chunks older than N days (high volume, 5s granularity)
+  ts_stats_days: 1           # raw ts_stats: drop chunks older than N days (high volume, 5s granularity — keep short, query the cagg for older data)
   ts_stats_compress_days: 1  # raw ts_stats: compress chunks older than N days (saves ~90% disk, TimescaleDB only)
   ts_stats_cagg_days: 90     # aggregated ts_stats_5min: drop older than N days (5min granularity, low volume)
-  flow_logs_days: 7          # flow_logs: drop chunks older than N days (compressed, 7d default)
+  ts_stats_chunk_days: 0     # chunk size in days (0 = auto: retention/7, min 1; clamped to <= ts_stats_days). Smaller = retention trims tighter. The 7-day default makes short retention ineffective — a chunk is only dropped once its whole span ages out
+  flow_logs_days: 1          # flow_logs: drop chunks older than N days (raw flow records are large — keep short)
   flow_logs_compress_days: 1 # flow_logs: compress chunks older than N days (saves ~90% disk)
+  flow_logs_chunk_days: 0    # chunk size in days (0 = auto: retention/7, min 1; clamped to <= flow_logs_days)
   attacks_days: 90           # ended attack records (active attacks are never deleted)
   audit_log_days: 180        # configuration change audit trail
   interval_hours: 24         # cleanup runs once per day

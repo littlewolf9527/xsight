@@ -129,8 +129,10 @@ type RetentionConfig struct {
 	TSStatsDays          int // ts_stats retention (default 7)
 	TSStatsCompressDays  int // ts_stats compression (default 1)
 	TSStatsCaggDays      int // ts_stats_5min cagg retention (default 90)
+	TSStatsChunkDays     int // ts_stats chunk size in days (0 = auto)
 	FlowLogsDays         int // flow_logs retention (default 7)
 	FlowLogsCompressDays int // flow_logs compression (default 1)
+	FlowLogsChunkDays    int // flow_logs chunk size in days (0 = auto)
 }
 
 // AutoMigrate creates all tables if they don't exist.
@@ -175,18 +177,26 @@ func (s *PGStore) AutoMigrate(ctx context.Context, ret RetentionConfig) error {
 		s.applyCompressionPolicy(ctx, "flow_logs", ret.FlowLogsCompressDays)
 	}
 
-	// Continuous aggregate refresh policy: keep last 12h materialized, refresh every 5min
-	_, _ = s.pool.Exec(ctx, `SELECT remove_continuous_aggregate_policy('ts_stats_5min', if_exists => TRUE)`)
-	_, err = s.pool.Exec(ctx, `SELECT add_continuous_aggregate_policy('ts_stats_5min',
-		start_offset => INTERVAL '12 hours',
-		end_offset   => INTERVAL '1 minute',
-		schedule_interval => INTERVAL '5 minutes',
-		if_not_exists => TRUE)`)
-	if err != nil {
-		log.Printf("WARNING: cagg refresh policy: %v", err)
-	} else {
-		log.Printf("cagg refresh policy: ts_stats_5min = 5min interval, 12h lookback")
+	// Chunk sizing. The default chunk_time_interval is 7 days, which makes short
+	// retention almost useless: a chunk can only be dropped once its ENTIRE span is
+	// past the retention window, so 1-day retention on 7-day chunks still keeps ~8-9
+	// days of data (the closing 7-day chunk + the current one). Observed in prod:
+	// ts_stats climbed back to 23 GB with retention "working". Operators can set the
+	// chunk size explicitly (retention.*_chunk_days); 0 = auto (~1/7 of retention,
+	// min 1 day) which keeps ~7 live chunks. resolveChunkDays clamps to <= retention
+	// so a misconfig can't re-break the lifecycle. Affects NEW chunks only — existing
+	// chunks keep their original span until they age out.
+	if ret.TSStatsDays > 0 || ret.TSStatsChunkDays > 0 {
+		s.applyChunkInterval(ctx, "ts_stats", resolveChunkDays(ret.TSStatsChunkDays, ret.TSStatsDays))
 	}
+	if ret.FlowLogsDays > 0 || ret.FlowLogsChunkDays > 0 {
+		s.applyChunkInterval(ctx, "flow_logs", resolveChunkDays(ret.FlowLogsChunkDays, ret.FlowLogsDays))
+	}
+
+	// Continuous aggregate refresh policy: keep last 12h materialized, refresh every 5min.
+	// Idempotent — skip recreate if the existing policy matches, otherwise the schedule
+	// clock would reset on every controller restart (next_start = now() + 5min).
+	s.applyCaggRefreshPolicy(ctx, "ts_stats_5min", "12 hours", "1 minute", "5 minutes")
 
 	// Continuous aggregate retention policy (separate from raw ts_stats retention)
 	if ret.TSStatsCaggDays > 0 {
@@ -200,27 +210,145 @@ func (s *PGStore) AutoMigrate(ctx context.Context, ret RetentionConfig) error {
 }
 
 // applyRetentionPolicy creates or updates a TimescaleDB retention policy.
+//
+// Skips the remove+re-add cycle when the existing policy already matches `days`,
+// because add_retention_policy with default initial_start sets
+// next_start = now() + schedule_interval. Frequent controller restarts would
+// keep pushing the next run forward indefinitely — observed in v1.3.x where
+// ts_stats grew to 24+ GB despite a 7-day retention being configured.
+//
+// Equality is compared as PG intervals (not strings) so that TimescaleDB's
+// normalization ("1 days" -> "1 day", "168 hours" -> "7 days") doesn't cause
+// spurious recreate.
 func (s *PGStore) applyRetentionPolicy(ctx context.Context, table string, days int) {
-	interval := fmt.Sprintf("%d days", days)
-	// Remove existing policy first, then re-add with new interval
+	desired := fmt.Sprintf("%d days", days)
+
+	var matches bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM timescaledb_information.jobs
+			WHERE proc_name = 'policy_retention'
+			  AND hypertable_name = $1
+			  AND (config->>'drop_after')::interval = $2::interval
+		)`, table, desired).Scan(&matches)
+	if err == nil && matches {
+		log.Printf("retention policy: %s = %s (unchanged, schedule preserved)", table, desired)
+		return
+	}
+
 	_, _ = s.pool.Exec(ctx, fmt.Sprintf("SELECT remove_retention_policy('%s', if_exists => TRUE)", table))
-	_, err := s.pool.Exec(ctx, fmt.Sprintf("SELECT add_retention_policy('%s', INTERVAL '%s', if_not_exists => TRUE)", table, interval))
+	_, err = s.pool.Exec(ctx, fmt.Sprintf("SELECT add_retention_policy('%s', INTERVAL '%s', if_not_exists => TRUE)", table, desired))
 	if err != nil {
 		log.Printf("WARNING: retention policy for %s: %v", table, err)
 	} else {
-		log.Printf("retention policy: %s = %s", table, interval)
+		log.Printf("retention policy: %s = %s (created/changed)", table, desired)
 	}
 }
 
 // applyCompressionPolicy creates or updates a TimescaleDB compression policy.
+// Idempotent for the same reason as applyRetentionPolicy.
 func (s *PGStore) applyCompressionPolicy(ctx context.Context, table string, days int) {
-	interval := fmt.Sprintf("%d days", days)
+	desired := fmt.Sprintf("%d days", days)
+
+	var matches bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM timescaledb_information.jobs
+			WHERE proc_name = 'policy_compression'
+			  AND hypertable_name = $1
+			  AND (config->>'compress_after')::interval = $2::interval
+		)`, table, desired).Scan(&matches)
+	if err == nil && matches {
+		log.Printf("compression policy: %s = %s (unchanged, schedule preserved)", table, desired)
+		return
+	}
+
 	_, _ = s.pool.Exec(ctx, fmt.Sprintf("SELECT remove_compression_policy('%s', if_exists => TRUE)", table))
-	_, err := s.pool.Exec(ctx, fmt.Sprintf("SELECT add_compression_policy('%s', INTERVAL '%s', if_not_exists => TRUE)", table, interval))
+	_, err = s.pool.Exec(ctx, fmt.Sprintf("SELECT add_compression_policy('%s', INTERVAL '%s', if_not_exists => TRUE)", table, desired))
 	if err != nil {
 		log.Printf("WARNING: compression policy for %s: %v", table, err)
 	} else {
-		log.Printf("compression policy: %s = %s", table, interval)
+		log.Printf("compression policy: %s = %s (created/changed)", table, desired)
+	}
+}
+
+// chunkDaysFor returns the auto chunk_time_interval (in days) for a hypertable
+// with the given retention window. Targets ~7 live chunks (interval = retention/7)
+// so retention can drop data at a useful granularity, with a floor of 1 day so a
+// short retention doesn't create excessively many chunks.
+func chunkDaysFor(retentionDays int) int {
+	d := retentionDays / 7
+	if d < 1 {
+		d = 1
+	}
+	return d
+}
+
+// resolveChunkDays picks the effective chunk size for a hypertable.
+//   - configured == 0 → auto-derive from retention (chunkDaysFor).
+//   - configured  > 0 → use it as-is.
+//
+// Either way the result is clamped to the retention window when retention is set:
+// a chunk wider than retention can never be dropped on schedule (its span never
+// fully ages out before new data lands), which is exactly the 7-day-chunk bug this
+// path exists to prevent. Floored to 1 day.
+func resolveChunkDays(configured, retentionDays int) int {
+	days := configured
+	if days <= 0 {
+		days = chunkDaysFor(retentionDays)
+	}
+	if retentionDays > 0 && days > retentionDays {
+		log.Printf("WARNING: chunk_days=%d exceeds retention=%d days; clamping to %d so retention stays effective", days, retentionDays, retentionDays)
+		days = retentionDays
+	}
+	if days < 1 {
+		days = 1
+	}
+	return days
+}
+
+// applyChunkInterval sets the chunk_time_interval for a hypertable. Unlike the
+// policy helpers this has no scheduling side effect, so it's safe to call on every
+// startup — set_chunk_time_interval to the same value is a no-op, and a changed
+// value only affects chunks created afterwards (existing chunks keep their span).
+func (s *PGStore) applyChunkInterval(ctx context.Context, table string, days int) {
+	_, err := s.pool.Exec(ctx, fmt.Sprintf("SELECT set_chunk_time_interval('%s', INTERVAL '%d days')", table, days))
+	if err != nil {
+		log.Printf("WARNING: chunk interval for %s: %v", table, err)
+	} else {
+		log.Printf("chunk interval: %s = %d days (applies to new chunks)", table, days)
+	}
+}
+
+// applyCaggRefreshPolicy creates or updates the refresh policy for a continuous aggregate.
+// Idempotent — skips recreate when start_offset / end_offset / schedule_interval all match.
+// Comparison uses PG interval equality to handle TimescaleDB normalization.
+func (s *PGStore) applyCaggRefreshPolicy(ctx context.Context, cagg, startOffset, endOffset, scheduleInterval string) {
+	var matches bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM timescaledb_information.jobs
+			WHERE proc_name = 'policy_refresh_continuous_aggregate'
+			  AND hypertable_name = $1
+			  AND (config->>'start_offset')::interval = $2::interval
+			  AND (config->>'end_offset')::interval   = $3::interval
+			  AND schedule_interval                   = $4::interval
+		)`, cagg, startOffset, endOffset, scheduleInterval).Scan(&matches)
+	if err == nil && matches {
+		log.Printf("cagg refresh policy: %s = %s interval, %s lookback (unchanged, schedule preserved)", cagg, scheduleInterval, startOffset)
+		return
+	}
+
+	_, _ = s.pool.Exec(ctx, fmt.Sprintf(`SELECT remove_continuous_aggregate_policy('%s', if_exists => TRUE)`, cagg))
+	_, err = s.pool.Exec(ctx, fmt.Sprintf(`SELECT add_continuous_aggregate_policy('%s',
+		start_offset => INTERVAL '%s',
+		end_offset   => INTERVAL '%s',
+		schedule_interval => INTERVAL '%s',
+		if_not_exists => TRUE)`, cagg, startOffset, endOffset, scheduleInterval))
+	if err != nil {
+		log.Printf("WARNING: cagg refresh policy for %s: %v", cagg, err)
+	} else {
+		log.Printf("cagg refresh policy: %s = %s interval, %s lookback (created/changed)", cagg, scheduleInterval, startOffset)
 	}
 }
 

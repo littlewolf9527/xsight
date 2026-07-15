@@ -100,8 +100,10 @@ func main() {
 		TSStatsDays:          cfg.Retention.TSStatsDays,
 		TSStatsCompressDays:  cfg.Retention.TSStatsCompressDays,
 		TSStatsCaggDays:      cfg.Retention.TSStatsCaggDays,
+		TSStatsChunkDays:     cfg.Retention.TSStatsChunkDays,
 		FlowLogsDays:         cfg.Retention.FlowLogsDays,
 		FlowLogsCompressDays: cfg.Retention.FlowLogsCompressDays,
+		FlowLogsChunkDays:    cfg.Retention.FlowLogsChunkDays,
 	}); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}

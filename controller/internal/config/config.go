@@ -32,8 +32,10 @@ type RetentionConfig struct {
 	TSStatsDays             int `yaml:"ts_stats_days"`              // delete ts_stats older than N days (0 = keep forever)
 	TSStatsCompressDays     int `yaml:"ts_stats_compress_days"`     // compress ts_stats older than N days (default 1)
 	TSStatsCaggDays         int `yaml:"ts_stats_cagg_days"`         // delete cagg (ts_stats_5min) older than N days (default 90)
+	TSStatsChunkDays        int `yaml:"ts_stats_chunk_days"`        // ts_stats chunk size in days (0 = auto: retention/7, floored to 1; clamped to <= retention)
 	FlowLogsDays            int `yaml:"flow_logs_days"`             // delete flow_logs older than N days (default 7)
 	FlowLogsCompressDays    int `yaml:"flow_logs_compress_days"`    // compress flow_logs older than N days (default 1)
+	FlowLogsChunkDays       int `yaml:"flow_logs_chunk_days"`       // flow_logs chunk size in days (0 = auto: retention/7, floored to 1; clamped to <= retention)
 	AttacksDays         int `yaml:"attacks_days"`           // delete ended attacks older than N days (0 = keep forever)
 	AuditLogDays        int `yaml:"audit_log_days"`         // delete audit logs older than N days (0 = keep forever)
 	IntervalHours       int `yaml:"interval_hours"`         // how often to run cleanup (default 24 = once/day)
@@ -163,6 +165,12 @@ func (c *Config) validate() error {
 	}
 	if c.Retention.FlowLogsCompressDays < 0 {
 		return fmt.Errorf("retention.flow_logs_compress_days must be >= 0, got %d", c.Retention.FlowLogsCompressDays)
+	}
+	if c.Retention.TSStatsChunkDays < 0 {
+		return fmt.Errorf("retention.ts_stats_chunk_days must be >= 0, got %d", c.Retention.TSStatsChunkDays)
+	}
+	if c.Retention.FlowLogsChunkDays < 0 {
+		return fmt.Errorf("retention.flow_logs_chunk_days must be >= 0, got %d", c.Retention.FlowLogsChunkDays)
 	}
 	if c.Retention.AttacksDays < 0 {
 		return fmt.Errorf("retention.attacks_days must be >= 0, got %d", c.Retention.AttacksDays)
