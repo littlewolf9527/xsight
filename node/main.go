@@ -233,6 +233,7 @@ func main() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
+			uniqueSources := batcher.ResetUniqueSources()
 			gs, err := mgr.GlobalStats()
 			if err != nil {
 				log.Printf("health check: %v", err)
@@ -248,7 +249,7 @@ func main() {
 			log.Printf("health: total_pkts=%d total_bytes=%d matched_pkts=%d samples=%d batches=%d decode_err=%d unique_src=%d grpc=%v iface=%s pin=%v workers=%d parsed=%d dispatch_drop=%d",
 				gs.TotalPkts, gs.TotalBytes, gs.MatchedPkts, s.TotalSamples.Load(),
 				batcher.Metrics.BatchesSent.Load(), batcher.Metrics.DecodeErrors.Load(),
-				batcher.UniqueSourceCount(), rpt.Connected(), ifaceStatus, mgr.PinPath != "",
+				uniqueSources, rpt.Connected(), ifaceStatus, mgr.PinPath != "",
 				pool.Workers(), pool.ParsedTotal.Load(), pool.DispatchDropped.Load())
 		}
 	}()

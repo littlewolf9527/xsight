@@ -54,7 +54,7 @@ type Batcher struct {
 	batchBytes int
 	timer      *time.Timer
 
-	// unique source IP tracking (reset per flush window)
+	// unique source IP tracking (reset per health-check window)
 	uniqueSrc map[string]struct{}
 
 	Metrics SamplingMetrics
